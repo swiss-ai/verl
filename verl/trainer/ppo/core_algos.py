@@ -468,29 +468,15 @@ def compute_rloo_outcome_advantage(
     """
     scores = token_level_rewards.sum(dim=-1)
 
-    id2score = defaultdict(list)
-    id2mean = {}
-
     with torch.no_grad():
-        bsz = scores.shape[0]
-        for i in range(bsz):
-            id2score[index[i]].append(scores[i])
-        for idx in id2score:
-            if len(id2score[idx]) == 1:
-                id2mean[idx] = torch.tensor(0.0)
-            elif len(id2score[idx]) > 1:
-                id2mean[idx] = torch.mean(torch.stack(id2score[idx]))
-            else:
-                raise ValueError(f"no score in prompt index: {idx}")
-        for i in range(bsz):
-            response_num = len(id2score[index[i]])
-            if response_num > 1:
-                scores[i] = scores[i] * response_num / (response_num - 1) - id2mean[index[i]] * response_num / (
-                    response_num - 1
-                )
-        scores = scores.unsqueeze(-1) * response_mask
+        inv = torch.from_numpy(np.unique(index, return_inverse=True)[1]).to(scores.device)
 
-    return scores, scores
+        c = torch.bincount(inv)[inv].to(scores.dtype)
+        adv = ((c * scores - torch.bincount(inv, weights=scores)[inv]) / (c - 1).clamp_min(1)) * (c > 1)
+
+        adv = adv.unsqueeze(-1) * response_mask
+
+    return adv, adv
 
 
 @register_adv_est(AdvantageEstimator.OPO)  # or simply: @register_adv_est("opo")
