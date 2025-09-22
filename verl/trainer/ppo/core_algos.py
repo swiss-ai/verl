@@ -1248,7 +1248,7 @@ def compute_entropy_loss(logits, response_mask, loss_agg_mode: str = "token-mean
     """
     # compute entropy
     token_entropy = verl_F.entropy_from_logits(logits)  # (bs, response_len)
-    entropy_loss = agg_loss(loss_mat=token_entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+    entropy_loss = verl_F.masked_mean(token_entropy, response_mask)
     return entropy_loss
 
 
