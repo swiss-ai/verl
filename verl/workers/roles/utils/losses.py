@@ -85,7 +85,7 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
 
     # add entropy loss
     if entropy is not None:
-        entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+        entropy_loss = masked_mean(entropy, response_mask)
         entropy_coeff = config.entropy_coeff
         policy_loss -= entropy_coeff * entropy_loss
 
