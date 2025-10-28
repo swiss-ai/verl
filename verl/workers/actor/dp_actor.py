@@ -377,6 +377,8 @@ class DataParallelPPOActor(BasePPOActor):
         # Weights are computed centrally in trainer and added to batch when algorithm.rollout_is=True
         if "rollout_is_weights" in data.batch.keys():
             select_keys.append("rollout_is_weights")
+        if "rollout_is_self_norm_flag" in data.batch.keys():
+            select_keys.append("rollout_is_self_norm_flag")
 
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
@@ -402,6 +404,74 @@ class DataParallelPPOActor(BasePPOActor):
                     micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
 
                 self.actor_optimizer.zero_grad()
+
+                # Compute a global SNIS denominator once per mini-batch (optionally across DP ranks)
+                global_snis_denom = None
+                try:
+                    if (
+                        "rollout_is_weights" in mini_batch.batch.keys()
+                        and "rollout_is_self_norm_flag" in mini_batch.batch.keys()
+                    ):
+                        with torch.no_grad():
+                            weights_full = mini_batch.batch["rollout_is_weights"]
+                            response_mask_full = mini_batch.batch["response_mask"]
+                            mask_float = response_mask_full.to(dtype=weights_full.dtype)
+
+                            loss_mode_batch = self.config.policy_loss.get("loss_mode", "vanilla")
+                            loss_agg_mode_batch = self.config.loss_agg_mode
+
+                            if loss_mode_batch == "geo_mean":
+                                # Per-sequence geometric mean, then global mean across sequences (SNIS denom)
+                                seq_token_counts = mask_float.sum(dim=-1)
+                                log_w = torch.log(weights_full + 1e-10)
+                                seq_gm = torch.exp((log_w.mul(mask_float).sum(dim=-1)) / (seq_token_counts + 1e-8))
+                                denom_sum = seq_gm.sum()
+                                denom_count = (
+                                    (seq_token_counts > 0).sum().to(dtype=denom_sum.dtype, device=denom_sum.device)
+                                )
+                                if torch.distributed.is_available() and torch.distributed.is_initialized():
+                                    torch.distributed.all_reduce(denom_sum, op=torch.distributed.ReduceOp.SUM)
+                                    torch.distributed.all_reduce(denom_count, op=torch.distributed.ReduceOp.SUM)
+                                global_snis_denom = denom_sum / (denom_count + 1e-8)
+                            else:
+                                lam = "seq-mean-token-mean" if loss_mode_batch == "gspo" else loss_agg_mode_batch
+                                if lam == "token-mean":
+                                    if torch.distributed.is_available() and torch.distributed.is_initialized():
+                                        global_snis_denom = verl_F.distributed_masked_mean(weights_full, mask_float)
+                                    else:
+                                        global_snis_denom = verl_F.masked_mean(weights_full, response_mask_full)
+                                elif lam == "seq-mean-token-sum":
+                                    seq_sums = (weights_full * mask_float).sum(dim=-1)
+                                    denom_sum = seq_sums.sum()
+                                    denom_count = (
+                                        (mask_float.sum(dim=-1) > 0)
+                                        .sum()
+                                        .to(dtype=denom_sum.dtype, device=denom_sum.device)
+                                    )
+                                    if torch.distributed.is_available() and torch.distributed.is_initialized():
+                                        torch.distributed.all_reduce(denom_sum, op=torch.distributed.ReduceOp.SUM)
+                                        torch.distributed.all_reduce(denom_count, op=torch.distributed.ReduceOp.SUM)
+                                    global_snis_denom = denom_sum / (denom_count + 1e-8)
+                                elif lam == "seq-mean-token-mean":
+                                    seq_token_counts = mask_float.sum(dim=-1)
+                                    seq_means = (weights_full * mask_float).sum(dim=-1) / (seq_token_counts + 1e-8)
+                                    denom_sum = seq_means.sum()
+                                    denom_count = (
+                                        (seq_token_counts > 0).sum().to(dtype=denom_sum.dtype, device=denom_sum.device)
+                                    )
+                                    if torch.distributed.is_available() and torch.distributed.is_initialized():
+                                        torch.distributed.all_reduce(denom_sum, op=torch.distributed.ReduceOp.SUM)
+                                        torch.distributed.all_reduce(denom_count, op=torch.distributed.ReduceOp.SUM)
+                                    global_snis_denom = denom_sum / (denom_count + 1e-8)
+                                elif lam == "seq-mean-token-sum-norm":
+                                    denom_sum = (weights_full * mask_float).sum()
+                                    if torch.distributed.is_available() and torch.distributed.is_initialized():
+                                        torch.distributed.all_reduce(denom_sum, op=torch.distributed.ReduceOp.SUM)
+                                    global_snis_denom = denom_sum / weights_full.shape[-1]
+                                else:
+                                    raise ValueError(f"Invalid loss_agg_mode: {lam}")
+                except Exception:
+                    global_snis_denom = None
 
                 for micro_batch in micro_batches:
                     micro_batch = micro_batch.to(get_device_id())
@@ -442,6 +512,13 @@ class DataParallelPPOActor(BasePPOActor):
                     # Extract pre-computed rollout importance sampling weights if present
                     # Weights are computed centrally in trainer and added when algorithm.rollout_is=True
                     rollout_is_weights = model_inputs.get("rollout_is_weights", None)
+
+                    if (
+                        rollout_is_weights is not None
+                        and model_inputs.get("rollout_is_self_norm_flag", None) is not None
+                        and global_snis_denom is not None
+                    ):
+                        rollout_is_weights /= global_snis_denom + 1e-8
 
                     # NOTE: Both mismatch diagnostic metrics (PPL, KL, etc.) and IS weight metrics
                     # are computed centrally in ray_trainer.py for consistency and efficiency.
