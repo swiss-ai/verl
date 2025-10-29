@@ -224,6 +224,74 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     return metrics
 
 
+def compute_rollout_metrics(batch: DataProto) -> dict[str, Any]:
+    """
+    Computes problem-wise accuracy metrics and histogram statistics from a batch.
+
+    This function aggregates accuracy scores by unique problem ID (uid), then computes
+    statistical metrics and histogram distributions of per-problem accuracies.
+
+    Args:
+        batch: A DataProto object containing:
+            - batch["token_level_scores"]: Tensor of accuracy values for each sample
+            - non_tensor_batch["uid"]: List of unique problem identifiers
+
+    Returns:
+        A dictionary containing:
+            - batch_info/problem_count: Number of unique problems
+            - batch_info/acc_mean: Mean accuracy across problems
+            - batch_info/acc_median: Median accuracy across problems
+            - batch_info/acc_std: Standard deviation of accuracies
+            - batch_info/acc_min: Minimum accuracy
+            - batch_info/acc_max: Maximum accuracy
+            - batch_info/acc_hist_*_frac: Fraction of problems in each histogram bin
+    """
+    # Aggregate accuracy by unique problem ID
+    uids = batch.non_tensor_batch["uid"]
+    acc_values = batch.batch["token_level_scores"].sum(dim=-1).detach().cpu().numpy()
+    
+    # Compute per-problem accuracy
+    unique_uids, inverse_indices = np.unique(uids, return_inverse=True)
+    counts = np.bincount(inverse_indices)
+    problem_acc = np.bincount(inverse_indices, weights=acc_values) / counts
+    
+    n_problems = len(problem_acc)
+    if n_problems == 0:
+        return {f"batch_info/{k}": 0.0 for k in [
+            "problem_count",
+            "acc_mean",
+            "acc_median",
+            "acc_std",
+            "acc_min",
+            "acc_max",
+            "acc_hist_0_frac",
+            "acc_hist_0_0.25_frac",
+            "acc_hist_0.25_0.5_frac",
+            "acc_hist_0.5_0.75_frac",
+            "acc_hist_0.75_1_frac",
+            "acc_hist_1_frac",
+        ]}
+    
+    # Compute histogram bins
+    eps = 1e-8
+    bins = np.array([0, eps, 0.25, 0.5, 0.75, 1.0 - eps, np.inf])
+    hist_fracs = np.histogram(problem_acc, bins=bins)[0] / n_problems
+    return {
+        "batch_info/problem_count": float(n_problems),
+        "batch_info/acc_mean": float(problem_acc.mean()),
+        "batch_info/acc_median": float(np.median(problem_acc)),
+        "batch_info/acc_std": float(problem_acc.std()),
+        "batch_info/acc_min": float(problem_acc.min()),
+        "batch_info/acc_max": float(problem_acc.max()),
+        "batch_info/acc_hist_0_frac": hist_fracs[0],
+        "batch_info/acc_hist_0_0.25_frac": hist_fracs[1],
+        "batch_info/acc_hist_0.25_0.5_frac": hist_fracs[2],
+        "batch_info/acc_hist_0.5_0.75_frac": hist_fracs[3],
+        "batch_info/acc_hist_0.75_1_frac": hist_fracs[4],
+        "batch_info/acc_hist_1_frac": hist_fracs[5],
+    }
+
+
 def compute_timing_metrics(batch: DataProto, timing_raw: dict[str, float]) -> dict[str, Any]:
     """
     Computes timing metrics for different processing stages in PPO training.

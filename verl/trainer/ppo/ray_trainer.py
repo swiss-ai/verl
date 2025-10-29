@@ -45,6 +45,7 @@ from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
 from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
+    compute_rollout_metrics,
     compute_throughout_metrics,
     compute_timing_metrics,
     process_validation_metrics,
@@ -1170,6 +1171,9 @@ class RayPPOTrainer:
                         if self.config.reward_model.launch_reward_fn_async:
                             reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
                         batch.batch["token_level_scores"] = reward_tensor
+
+                        # log problem difficulty metrics
+                        metrics.update(compute_rollout_metrics(batch))
 
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
