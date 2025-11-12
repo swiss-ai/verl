@@ -328,7 +328,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             torch_dtype = PrecisionType.to_dtype(torch_dtype)
 
         # override model kwargs
-        attn_implementation = override_model_config.get("attn_implementation", "flash_attention_2")
+        attn_implementation = override_model_config.get("attn_implementation", "flash_attention_3")
         actor_model_config = AutoConfig.from_pretrained(
             local_path, trust_remote_code=trust_remote_code, attn_implementation=attn_implementation
         )
@@ -1292,7 +1292,7 @@ class CriticWorker(Worker, DistProfilerExtension):
         from transformers import AutoConfig
 
         # override model kwargs
-        attn_implementation = override_config.get("attn_implementation", "flash_attention_2")
+        attn_implementation = override_config.get("attn_implementation", "flash_attention_3")
         critic_model_config = AutoConfig.from_pretrained(
             local_path,
             attn_implementation=attn_implementation,
@@ -1711,7 +1711,7 @@ class RewardModelWorker(Worker, DistProfilerExtension):
         model_config = AutoConfig.from_pretrained(
             local_path,
             trust_remote_code=trust_remote_code,
-            attn_implementation=override_config.get("attn_implementation", "flash_attention_2"),
+            attn_implementation=override_config.get("attn_implementation", "flash_attention_3"),
         )
         model_config.num_labels = 1
 
