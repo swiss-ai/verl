@@ -224,17 +224,15 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     return metrics
 
 
-def compute_rollout_metrics(batch: DataProto) -> dict[str, Any]:
+def compute_rollout_metrics(problem_acc: np.ndarray) -> dict[str, Any]:
     """
-    Computes problem-wise accuracy metrics and histogram statistics from a batch.
+    Computes problem-wise accuracy metrics and histogram statistics from pre-computed problem accuracies.
 
-    This function aggregates accuracy scores by unique problem ID (uid), then computes
+    This function takes an array of per-problem accuracy scores and computes
     statistical metrics and histogram distributions of per-problem accuracies.
 
     Args:
-        batch: A DataProto object containing:
-            - batch["token_level_scores"]: Tensor of accuracy values for each sample
-            - non_tensor_batch["uid"]: List of unique problem identifiers
+        problem_acc: NumPy array of accuracy values, one per unique problem.
 
     Returns:
         A dictionary containing:
@@ -246,15 +244,6 @@ def compute_rollout_metrics(batch: DataProto) -> dict[str, Any]:
             - batch_info/acc_max: Maximum accuracy
             - batch_info/acc_hist_*_frac: Fraction of problems in each histogram bin
     """
-    # Aggregate accuracy by unique problem ID
-    uids = batch.non_tensor_batch["uid"]
-    acc_values = batch.batch["token_level_scores"].sum(dim=-1).detach().cpu().numpy()
-    
-    # Compute per-problem accuracy
-    unique_uids, inverse_indices = np.unique(uids, return_inverse=True)
-    counts = np.bincount(inverse_indices)
-    problem_acc = np.bincount(inverse_indices, weights=acc_values) / counts
-    
     n_problems = len(problem_acc)
     if n_problems == 0:
         return {f"batch_info/{k}": 0.0 for k in [
@@ -445,7 +434,6 @@ def calc_maj_val(data: list[dict[str, Any]], vote_key: str, val_key: str) -> flo
     maj_val = vote2vals[maj_vote][0]
 
     return maj_val
-
 
 def process_validation_metrics(
     data_sources: list[str], sample_uids: list[str], infos_dict: dict[str, list[Any]], seed: int = 42

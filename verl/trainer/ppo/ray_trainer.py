@@ -1132,6 +1132,31 @@ class RayPPOTrainer:
                         else:
                             reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
 
+                    with marked_timer("group_average_filtering", timing_raw, color="blue"):
+                        # we combine with rule-based rm
+                        reward_extra_infos_dict: dict[str, list]
+                        if self.config.reward_model.launch_reward_fn_async:
+                            reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
+                        batch.batch["token_level_scores"] = reward_tensor
+
+                        # Aggregate accuracy by unique problem ID
+                        uids = batch.non_tensor_batch["uid"]
+                        acc_values = batch.batch["token_level_scores"].sum(dim=-1).detach().cpu().numpy()
+                        
+                        # Compute per-problem accuracy
+                        unique_uids, inverse_indices = np.unique(uids, return_inverse=True)
+                        counts = np.bincount(inverse_indices)
+                        problem_acc = np.bincount(inverse_indices, weights=acc_values) / counts
+
+                        # log problem difficulty metrics
+                        metrics.update(compute_rollout_metrics(problem_acc))
+
+                        # Filter problems based on their group average
+                        problem_acc_per_sample = problem_acc[inverse_indices]
+                        mask = (self.config.algorithm.group_average_low < problem_acc_per_sample) & (problem_acc_per_sample < self.config.algorithm.group_average_high)
+                        batch = batch.select_idxs(np.where(mask)[0].tolist())
+                        batch, _ = pad_dataproto_to_divisor(batch, self.actor_rollout_wg.world_size)
+
                     # recompute old_log_probs
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
                         old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
@@ -1166,15 +1191,6 @@ class RayPPOTrainer:
                             batch = batch.union(values)
 
                     with marked_timer("adv", timing_raw, color="brown"):
-                        # we combine with rule-based rm
-                        reward_extra_infos_dict: dict[str, list]
-                        if self.config.reward_model.launch_reward_fn_async:
-                            reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
-                        batch.batch["token_level_scores"] = reward_tensor
-
-                        # log problem difficulty metrics
-                        metrics.update(compute_rollout_metrics(batch))
-
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
 
@@ -1208,7 +1224,7 @@ class RayPPOTrainer:
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
-
+                    
                     # update critic
                     if self.use_critic:
                         with marked_timer("update_critic", timing_raw, color="pink"):
