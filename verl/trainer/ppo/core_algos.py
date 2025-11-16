@@ -1752,3 +1752,90 @@ def compute_policy_loss_rollout_correction_wrapper(
         rollout_token_veto_threshold=rollout_token_veto_threshold,
         rollout_is_batch_normalize=rollout_is_batch_normalize,
     )
+
+
+@register_policy_loss("lcrc_geo_mean")
+def compute_policy_loss_lcrc_geo_mean(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str = "token-mean",
+    config: Optional[DictConfig | AlgoConfig] = None,
+    rollout_is_weights: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """GMPO with Log-Centered Rollout Correction (LCRC-GMPO).
+
+    This loss starts from the standard GMPO sequence-level objective and applies a small,
+    centered correction in log-space using rollout correction weights when available.
+
+    Key behavior:
+        - When rollout_is_weights is None, it reduces to standard GMPO.
+        - When rollout_is_weights is provided, it computes a per-sequence mean log weight,
+          centers it across the batch, and adds a scaled version to the GMPO log-ratio
+          before exponentiation. This acts as a soft, variance-controlled off-policy
+          correction aligned with the geometric nature of GMPO.
+
+    Args:
+        old_log_prob: Log-probabilities under the old policy, shape (batch_size, response_length).
+        log_prob: Log-probabilities under the current policy, shape (batch_size, response_length).
+        advantages: Advantage estimates, shape (batch_size, response_length).
+        response_mask: Valid token mask, shape (batch_size, response_length).
+        loss_agg_mode: Unused (kept for API compatibility).
+        config: ActorConfig (must not be AlgoConfig).
+        rollout_is_weights: Optional IS weights, shape (batch_size, response_length).
+    """
+
+    assert config is not None
+    assert not isinstance(config, AlgoConfig)
+
+    clip_ratio = config.clip_ratio
+    clip_ratio_low = config.clip_ratio_low if config.clip_ratio_low is not None else clip_ratio
+    clip_ratio_high = config.clip_ratio_high if config.clip_ratio_high is not None else clip_ratio
+
+    cliprange = clip_ratio
+    cliprange_low = clip_ratio_low
+    cliprange_high = clip_ratio_high
+    if cliprange_low is None:
+        cliprange_low = cliprange
+    if cliprange_high is None:
+        cliprange_high = cliprange
+
+    negative_approx_kl = log_prob - old_log_prob
+    ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
+
+    sgn_advantage = torch.sign(advantages)
+    negative_approx_kl_clamp = torch.clamp(negative_approx_kl, -cliprange_low, cliprange_high)
+    negative_approx_kl_min = torch.min(sgn_advantage * negative_approx_kl, sgn_advantage * negative_approx_kl_clamp)
+    negative_approx_kl_min = sgn_advantage * negative_approx_kl_min
+
+    response_mask_sum = response_mask.sum(dim=-1)
+    base_log_ratio = (negative_approx_kl_min * response_mask).sum(dim=-1) / (response_mask_sum + 1e-8)
+
+    if rollout_is_weights is not None:
+        log_w = torch.log(rollout_is_weights.clamp_min(1e-10))
+        log_w_mean = (log_w * response_mask).sum(dim=-1) / (response_mask_sum + 1e-8)
+
+        log_w_centered = log_w_mean - log_w_mean.mean()
+
+        lcrc_lambda = getattr(config.policy_loss, "lcrc_lambda", 0.1)
+
+        base_log_ratio = base_log_ratio + lcrc_lambda * log_w_centered
+
+    ratio = torch.exp(base_log_ratio)
+
+    advantage = (advantages * response_mask).sum(dim=-1) / (response_mask_sum + 1e-8)
+    pg_losses = -advantage * ratio
+
+    pg_loss = torch.mean(pg_losses)
+
+    clipped = torch.ne(negative_approx_kl, negative_approx_kl_clamp)
+    pg_clipfrac = verl_F.masked_mean((clipped * (advantages > 0)).float(), response_mask)
+    pg_clipfrac_lower = verl_F.masked_mean((clipped * (advantages < 0)).float(), response_mask)
+    pg_metrics = {
+        "actor/pg_clipfrac": pg_clipfrac.detach().item(),
+        "actor/ppo_kl": ppo_kl.detach().item(),
+        "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
+        "actor/lcrc_lambda": float(getattr(config.policy_loss, "lcrc_lambda", 0.1)),
+    }
+    return pg_loss, pg_metrics
