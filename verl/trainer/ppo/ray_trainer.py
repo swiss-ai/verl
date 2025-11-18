@@ -251,6 +251,8 @@ def compute_advantage(
             adv_kwargs["index"] = data.non_tensor_batch["uid"]
         if "reward_baselines" in data.batch:  # optional
             adv_kwargs["reward_baselines"] = data.batch["reward_baselines"]
+        if "rollout_is_weights" in data.batch:  # optional IS weights for SNIS-style estimators
+            adv_kwargs["rollout_is_weights"] = data.batch["rollout_is_weights"]
 
         # calculate advantage estimator
         advantages, returns = adv_estimator_fn(**adv_kwargs)

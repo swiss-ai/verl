@@ -722,6 +722,7 @@ def compute_rloo_vectorized_outcome_advantage(
     index: np.ndarray,
     epsilon: float = 1e-6,
     config: Optional[AlgoConfig] = None,
+    rollout_is_weights: torch.Tensor | None = None,
     **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
@@ -739,14 +740,35 @@ def compute_rloo_vectorized_outcome_advantage(
             shape: (bs, response_length)
         Returns: `(torch.Tensor)`
             shape: (bs, response_length)
+    If rollout_is_weights is provided, apply a per-prompt SNIS-style RLOO:
+    use self-normalized IS within each prompt to form the leave-one-out baseline.
     """
     scores = token_level_rewards.sum(dim=-1)
 
     with torch.no_grad():
         inv = torch.from_numpy(np.unique(index, return_inverse=True)[1]).to(scores.device)
 
-        c = torch.bincount(inv)[inv].to(scores.dtype)
-        adv = ((c * scores - torch.bincount(inv, weights=scores)[inv]) / (c - 1).clamp_min(1)) * (c > 1)
+        if rollout_is_weights is None:
+            c = torch.bincount(inv)[inv].to(scores.dtype)
+            adv = ((c * scores - torch.bincount(inv, weights=scores)[inv]) / (c - 1).clamp_min(1)) * (c > 1)
+        else:
+            seq_weights = verl_F.masked_mean(rollout_is_weights, response_mask, axis=-1)
+
+            weight_sum_per_group = torch.bincount(inv, weights=seq_weights)
+            weighted_score_sum_per_group = torch.bincount(inv, weights=seq_weights * scores)
+
+            W_total = weight_sum_per_group[inv]
+            S_total = weighted_score_sum_per_group[inv]
+
+            W_minus = W_total - seq_weights
+            S_minus = S_total - seq_weights * scores
+
+            mu_minus = S_minus / W_minus.clamp_min(epsilon)
+
+            c = torch.bincount(inv)[inv].to(scores.dtype)
+            valid = (c > 1) & (W_minus > 0)
+            adv = seq_weights * (scores - mu_minus)
+            adv = adv * valid.to(adv.dtype)
 
         adv = adv.unsqueeze(-1) * response_mask
 
@@ -1325,16 +1347,6 @@ def compute_policy_loss_geo_mean(
     # otherwise, below would be not consistent with the paper
     advantage = (advantages * response_mask).sum(dim=-1) / (response_mask_sum + 1e-8)
     pg_losses = -advantage * ratio
-
-    # Apply rollout correction weights if provided
-    # For geo_mean, IS weights are 2D (batch_size, seq_length) and need to be aggregated to sequence level
-    if rollout_is_weights is not None:
-        # Aggregate token-level weights to sequence level using geometric mean for consistency
-        # Note: rollout_is_weights is always 2D regardless of aggregation mode
-        seq_is_weights = torch.exp(
-            (torch.log(rollout_is_weights + 1e-10) * response_mask).sum(dim=-1) / (response_mask_sum + 1e-8)
-        )
-        pg_losses = pg_losses * seq_is_weights
 
     pg_loss = torch.mean(pg_losses)
 
