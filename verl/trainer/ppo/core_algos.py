@@ -1083,6 +1083,66 @@ def compute_policy_loss_gpg(
     return pg_loss, {}
 
 
+@register_policy_loss("reinforce_geo_seq")
+def compute_policy_loss_reinforce_geo_seq(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str = "token-mean",  # ignored, sequence level aggregation
+    config: Optional[DictConfig | AlgoConfig] = None,
+    rollout_is_weights: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """REINFORCE-derived sequence-level geometric objective.
+
+        For each sequence i with length T_i and mask m_{i,t}:
+          - Sequence advantage A_i is the mean over valid tokens (works whether A is
+            sequence-level broadcast or token-wise):
+
+                A_i = (1 / T_i) * sum_t m_{i,t} * advantages_{i,t}
+
+          - Geometric-mean probability G_i is length-normalized:
+
+                G_i = exp( (1 / T_i) * sum_t m_{i,t} * log_prob_{i,t} )
+
+          - Sequence loss: L_i = -A_i * G_i
+
+        The final loss is the mean of L_i over the batch.
+
+    This stays REINFORCE-derived while introducing a sequence-level
+    geometric factor and explicit length normalization.
+    """
+
+    mask = response_mask.to(dtype=log_prob.dtype)
+
+    # Sequence lengths T_i
+    seq_len = mask.sum(dim=-1).clamp(min=1.0)
+
+    # Sequence-level advantage A_i: average over valid tokens
+    # This recovers the scalar RLOO advantages when they are broadcast per token.
+    seq_adv = (advantages * mask).sum(dim=-1) / seq_len
+
+    # Geometric-mean probability per sequence: G_i = exp( mean_t log_prob_{i,t} )
+    log_prob_sum = (log_prob * mask).sum(dim=-1)
+    geom_prob = torch.exp(log_prob_sum / seq_len)
+
+    # Base sequence loss: -A_i * G_i
+    seq_loss = -seq_adv * geom_prob
+
+    # Optional: incorporate rollout IS weights if provided.
+    if rollout_is_weights is not None:
+        log_w = torch.log(rollout_is_weights.clamp(min=1e-10)) * mask
+        seq_w = torch.exp(log_w.sum(dim=-1) / seq_len)
+        seq_loss = seq_loss * seq_w
+
+    pg_loss = seq_loss.mean()
+
+    pg_metrics = {
+        "actor/pg_loss": pg_loss.detach().item(),
+    }
+    return pg_loss, pg_metrics
+
+
 @register_policy_loss("clip_cov")
 def compute_policy_loss_clip_cov(
     old_log_prob: torch.Tensor,
