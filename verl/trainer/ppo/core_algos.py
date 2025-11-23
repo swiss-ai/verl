@@ -1350,6 +1350,55 @@ def compute_policy_loss_geo_mean(
     return pg_loss, pg_metrics
 
 
+@register_policy_loss("geo_pg")
+def compute_policy_loss_geo_pg(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str = "token-mean",
+    config: Optional[DictConfig | AlgoConfig] = None,
+    rollout_is_weights: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Sequence-level geometric-mean policy gradient
+
+    Builds a geometric-mean statistic from current-policy log-probs
+    """
+
+    assert log_prob.shape == advantages.shape == response_mask.shape
+
+    seq_len = response_mask.sum(dim=-1).clamp_min(1)
+
+    # Sequence-level advantage A_i: arithmetic mean over response tokens
+    # This recovers the sequence scalar even if advantages are broadcast per token
+    seq_adv = (advantages * response_mask).sum(dim=-1) / seq_len
+
+    # Geometric-mean of current-policy probabilities over the response tokens
+    # mean_logp_i = (1/T_i) sum_t log pi(a_{i,t} | s_{i,t})
+    mean_logp = (log_prob * response_mask).sum(dim=-1) / seq_len
+    # mean_logp = torch.clamp(mean_logp, min=-40.0, max=40.0)
+    geo_prob = torch.exp(mean_logp)
+
+    # Base sequence loss: L_i = -A_i * geo_prob_i
+    seq_loss = -seq_adv * geo_prob
+
+    # Optional: incorporate rollout IS weights if provided (sequence-level geometric aggregation)
+    if rollout_is_weights is not None:
+        # rollout_is_weights: (bs, T); aggregate to sequence-level geometric mean
+        seq_is_weights = torch.exp(
+            (torch.log(rollout_is_weights.clamp_min(1e-8)) * response_mask).sum(dim=-1) / seq_len
+        )
+        seq_loss = seq_loss * seq_is_weights
+
+    pg_loss = seq_loss.mean()
+
+    pg_metrics = {
+        "actor/geo_pg_loss": pg_loss.detach().item(),
+        "actor/geo_pg_prob_mean": geo_prob.detach().mean().item(),
+    }
+    return pg_loss, pg_metrics
+
+
 def compute_entropy_loss(logits, response_mask, loss_agg_mode: str = "token-mean"):
     """Compute categorical entropy loss (For backward compatibility)
 
