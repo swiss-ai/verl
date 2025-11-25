@@ -396,6 +396,12 @@ class RLHFDataset(Dataset):
         row_dict["index"] = index
         row_dict["tools_kwargs"] = tools_kwargs
         row_dict["interaction_kwargs"] = interaction_kwargs
+
+        # Create unique ID
+        data_source = row_dict.get("data_source", "unknown")
+        split = row_dict.get("extra_info", {}).get("split", "unknown")
+        row_dict["uid"] = f"{data_source}_{split}_{index}"
+        
         return row_dict
 
     def __getstate__(self):

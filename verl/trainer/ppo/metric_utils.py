@@ -47,6 +47,41 @@ def reduce_metrics(metrics: dict[str, list[Any]]) -> dict[str, Any]:
     return reduce_metrics(metrics)
 
 
+def compute_dynamic_rollout_metrics(
+    batch: DataProto,
+    training_accumulator: Any,
+) -> dict[str, Any]:
+    """
+    Computes metrics related to dynamic rollout generation.
+
+    Args:
+        train_dataloader: The training dataloader containing the sampler.
+        training_accumulator: The accumulator managing rollout buffers.
+        problem_states: Dictionary tracking state of active problems.
+
+    Returns:
+        A dictionary containing:
+            - sampler/active_problems: Number of problems currently being sampled
+            - sampler/completed_problems: Number of problems completed so far
+            - accumulator/training_buffer_size: Number of problems in training buffer
+            - accumulator/incomplete_buffer_size: Number of problems in incomplete buffer
+            - problem/avg_generations: Average generations per active problem
+            - problem/avg_correct: Average correct solutions per active problem
+    """
+    metrics = {}
+
+    metrics["accumulator/training_buffer_size"] = len(training_accumulator.training_buffer)
+    metrics["accumulator/incomplete_buffer_size"] = len(training_accumulator.incomplete_rollouts_buffer)
+
+    if "uid" in batch.non_tensor_batch:
+        _, counts = np.unique(batch.non_tensor_batch["uid"], return_counts=True)
+        metrics["samples_per_group/min"] = counts.min()
+        metrics["samples_per_group/max"] = counts.max()
+        metrics["samples_per_group/mean"] = counts.mean()
+        
+    return metrics
+
+
 def _compute_response_info(batch: DataProto) -> dict[str, Any]:
     """
     Computes information about prompts and responses from a batch.
@@ -379,6 +414,25 @@ def calc_maj_val(data: list[dict[str, Any]], vote_key: str, val_key: str) -> flo
     return maj_val
 
 
+import math
+def _compute_pass_at_k(rewards: list[float], k: int) -> float:
+    """
+    Compute the pass@k metric using the unbiased estimator.
+    """
+    n = len(rewards)
+    if n < k:
+        raise ValueError(f"Number of samples {n} must be at least k={k} to compute pass@k.")
+
+    rewards = np.array(rewards)
+    num_success = np.sum(rewards > 0)
+
+    if num_success == 0:
+        return 0.0
+
+    pass_at_k = 1.0 - math.comb(n - num_success, k) / math.comb(n, k)
+    return pass_at_k
+
+
 def process_validation_metrics(
     data_sources: list[str], sample_uids: list[str], infos_dict: dict[str, list[Any]], seed: int = 42
 ) -> dict[str, dict[str, dict[str, float]]]:
@@ -454,6 +508,7 @@ def process_validation_metrics(
                     ns.append(n_resps)
 
                     for n in ns:
+                        metric[f"pass@{n}"] = _compute_pass_at_k(rewards=var_vals, k=n)
                         [(bon_mean, bon_std), (won_mean, won_std)] = bootstrap_metric(
                             data=var_vals, subset_size=n, reduce_fns=[np.max, np.min], seed=seed
                         )

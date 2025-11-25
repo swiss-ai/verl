@@ -103,6 +103,11 @@ class RolloutConfig(BaseConfig):
     top_k: int = -1
     top_p: float = 1.0
     do_sample: bool = True
+    
+    # Generation stopping criteria
+    max_gen_budget: int = 1
+    k_correct: int = 1
+    k_incorrect: int = 0
     n: int = 1
 
     # Early termination threshold for multi-turn rollout in sglang.

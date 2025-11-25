@@ -38,3 +38,52 @@ class AbstractCurriculumSampler(AbstractSampler):
     @abstractmethod
     def update(self, batch: DataProto) -> None:
         pass
+
+
+class AbstractDynamicSampler(AbstractSampler):
+    """Abstract interface for dynamic samplers that track active problems.
+    
+    This sampler supports adaptive problem selection where problems can be:
+    - Added to the active pool when they need more work
+    - Removed from the active pool when they complete
+    """
+
+    @abstractmethod
+    def add_active(self, batch: DataProto) -> None:
+        """Add problems to the active pool that need more rollouts.
+        
+        Args:
+            batch: DataProto containing problems to mark as active
+        """
+        pass
+
+    @abstractmethod
+    def remove_active(self, batch: DataProto) -> None:
+        """Remove completed problems from the active pool.
+        
+        Args:
+            batch: DataProto containing problems to remove from active pool
+        """
+        pass
+
+    @abstractmethod
+    def get_next_batch_indices(self) -> list[int]:
+        """Get the next batch of indices directly (bypasses iterator protocol).
+        
+        This method provides direct access to batch indices without going through
+        the iterator protocol, which is useful for dynamic sampling scenarios
+        where the sampler state changes between batches.
+        
+        Returns:
+            List of dataset indices for the next batch (may be empty if complete)
+        """
+        pass
+
+    @abstractmethod
+    def has_next_batch(self) -> bool:
+        """Check if the sampler can yield another non-empty batch.
+        
+        Returns:
+            True if a call to get_next_batch_indices() would return a non-empty list
+        """
+        pass
