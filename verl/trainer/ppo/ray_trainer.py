@@ -1414,45 +1414,79 @@ class RayVerticalGenTrainer(RayPPOTrainer):
         self.k_correct = self.config.actor_rollout_ref.rollout.get("k_correct", 3)
         self.k_incorrect = self.config.actor_rollout_ref.rollout.get("k_incorrect", 3)
         self.max_gen_budget = self.config.actor_rollout_ref.rollout.get("max_gen_budget", 32)
-        
-        # Store collate_fn for direct batch fetching
-        self._collate_fn = None
     
-    def _get_next_batch_direct(self) -> dict | None:
-        """Fetch the next batch directly from sampler + dataset, bypassing DataLoader iterator.
+    def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
+        from verl.trainer.main_ppo import create_rl_dataset, create_rl_sampler
+        from verl.experimental.dataset.sampler import AbstractBatchSampler
+
+        if train_dataset is None:
+            train_dataset = create_rl_dataset(
+                self.config.data.train_files,
+                self.config.data,
+                self.tokenizer,
+                self.processor,
+                max_samples=self.config.data.get("train_max_samples", -1),
+            )
+        if val_dataset is None:
+            val_dataset = create_rl_dataset(
+                self.config.data.val_files,
+                self.config.data,
+                self.tokenizer,
+                self.processor,
+                max_samples=self.config.data.get("val_max_samples", -1),
+            )
+        self.train_dataset, self.val_dataset = train_dataset, val_dataset
+
+        if train_sampler is None:
+            train_sampler = create_rl_sampler(self.config.data, self.train_dataset)
+        if collate_fn is None:
+            from verl.utils.dataset.rl_dataset import collate_fn as default_collate_fn
+            collate_fn = default_collate_fn
+
+        num_workers = self.config.data["dataloader_num_workers"]
         
-        This method provides reliable batch fetching for dynamic sampling scenarios where
-        the sampler state changes between batches (active problems added/removed).
-        
-        Returns:
-            Collated batch dict, or None if no data available
-        """
-        from verl.experimental.dataset.sampler import AbstractDynamicSampler
-        
-        sampler = self.train_dataloader.sampler
-        
-        # For dynamic samplers, use direct index fetching
-        if isinstance(sampler, AbstractDynamicSampler):
-            indices = sampler.get_next_batch_indices()
-            
-            if not indices:
-                return None
-            
-            # Fetch data items from dataset
-            data_list = [self.train_dataset[idx] for idx in indices]
-            
-            # Apply collate function
-            if self._collate_fn is None:
-                from verl.utils.dataset.rl_dataset import collate_fn
-                self._collate_fn = collate_fn
-            
-            return self._collate_fn(data_list)
+        print(f"DEBUG: Using DynamicRolloutSampler as batch_sampler")
+        print(f"DEBUG: Dataset size: {len(self.train_dataset)}, gen_batch_size: {train_sampler.gen_batch_size}")
+        print(f"DEBUG: Sampler len (num batches): {len(train_sampler)}")
+
+        if isinstance(train_sampler, AbstractBatchSampler):
+            self.train_dataloader = StatefulDataLoader(
+                dataset=self.train_dataset,
+                batch_sampler=train_sampler,
+                num_workers=num_workers,
+                collate_fn=collate_fn,
+            )
         else:
-            # Fallback to standard DataLoader iteration for non-dynamic samplers
-            try:
-                return next(iter(self.train_dataloader))
-            except StopIteration:
-                return None
+            raise ValueError("train_sampler must be an AbstractBatchSampler for dynamic rollout training")
+
+        val_batch_size = self.config.data.val_batch_size
+        if val_batch_size is None:
+            val_batch_size = len(self.val_dataset)
+
+        self.val_dataloader = StatefulDataLoader(
+            dataset=self.val_dataset,
+            batch_size=val_batch_size,
+            num_workers=num_workers,
+            shuffle=self.config.data.get("validation_shuffle", True),
+            drop_last=False,
+            collate_fn=collate_fn,
+        )
+
+        assert len(self.train_dataloader) >= 1, "Train dataloader is empty!"
+        assert len(self.val_dataloader) >= 1, "Validation dataloader is empty!"
+
+        print(
+            f"Size of train dataloader: {len(self.train_dataloader)}, Size of val dataloader: "
+            f"{len(self.val_dataloader)}"
+        )
+
+        total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
+
+        if self.config.trainer.total_training_steps is not None:
+            total_training_steps = self.config.trainer.total_training_steps
+
+        self.total_training_steps = total_training_steps
+        print(f"Total training steps: {self.total_training_steps}")
     
     def fit(self):
         """
@@ -1512,17 +1546,18 @@ class RayVerticalGenTrainer(RayPPOTrainer):
 
         for epoch in range(self.config.trainer.total_epochs):
             print(f"DEBUG: epoch {epoch}")
-            # Use while loop with direct batch fetching for dynamic sampling
-            # This bypasses DataLoader's iterator to avoid StopIteration issues
-            while self.train_dataloader.sampler.has_next_batch():
-                # Fetch batch directly from sampler + dataset
-                batch_dict = self._get_next_batch_direct()
+            # # Use while loop with direct batch fetching for dynamic sampling
+            # # This bypasses DataLoader's iterator to avoid StopIteration issues
+            # while self.train_dataloader.sampler.has_next_batch():
+            #     # Fetch batch directly from sampler + dataset
+            #     batch_dict = self._get_next_batch_direct()
                 
-                if batch_dict is None:
-                    # No data available (shouldn't happen if has_next_batch is correct)
-                    print("WARNING: has_next_batch() returned True but no batch available")
-                    break
-                    
+            #     if batch_dict is None:
+            #         # No data available (shouldn't happen if has_next_batch is correct)
+            #         print("WARNING: has_next_batch() returned True but no batch available")
+            #         break
+            
+            for batch_dict in self.train_dataloader:
                 print(f"DEBUG: global step {self.global_steps}")
                 
                 intermediate_steps += 1
@@ -1632,7 +1667,6 @@ class RayVerticalGenTrainer(RayPPOTrainer):
                     # Split rollouts based on completion criteria
                     with marked_timer("split_rollouts", timing_raw, color="magenta"):
                         from verl.trainer.ppo.rollout_utils import split_rollouts_by_completion, update_problem_states
-                        from verl.experimental.dataset.sampler import AbstractDynamicSampler
                         
                         # Update problem states based on rollout results
                         self.problem_states = update_problem_states(batch, self.problem_states)
@@ -1646,23 +1680,19 @@ class RayVerticalGenTrainer(RayPPOTrainer):
                             max_gen_budget=self.max_gen_budget,
                         )
 
-                        # Update sampler state
-                        if isinstance(self.train_dataloader.sampler, AbstractDynamicSampler):
-                            # Add incomplete problems to active pool for re-sampling
-                            if continue_gen_batch is not None:
-                                self.train_dataloader.sampler.add_active(batch=continue_gen_batch)
-                            
-                            # Remove completed problems from active pool
-                            if training_batch is not None:
-                                self.train_dataloader.sampler.remove_active(batch=training_batch)
-
+                        # Add incomplete problems to active pool for re-sampling
                         # Accumulate incomplete rollouts (will continue generating)
                         if continue_gen_batch is not None:
+                            self.train_dataloader.batch_sampler.add_active(batch=continue_gen_batch)
+                            print(f"DEBUG: After add_active - active_count={self.train_dataloader.batch_sampler.active_count}, has_more={self.train_dataloader.batch_sampler.has_more_batches()}")
                             print(f"DEBUG: Accumulating {len(continue_gen_batch)}")
                             self.training_accumulator.add_incomplete(continue_gen_batch)
-
+                        
+                        # Remove completed problems from active pool
                         # Add directly completed rollouts to training buffer
                         if training_batch is not None:
+                            self.train_dataloader.batch_sampler.remove_active(batch=training_batch)
+                            print(f"DEBUG: After remove_active - active_count={self.train_dataloader.batch_sampler.active_count}")
                             print(f"DEBUG: Adding {len(training_batch)}")
                             self.training_accumulator.add_complete(training_batch)
                             batch = self.training_accumulator.get_training_batch()
@@ -1868,5 +1898,4 @@ class RayVerticalGenTrainer(RayPPOTrainer):
             # On epoch end
             self.problem_states = {}
             self.training_accumulator.on_epoch_end()
-            if hasattr(self.train_dataloader.sampler, "on_epoch_end"):
-                self.train_dataloader.sampler.on_epoch_end()
+            self.train_dataloader.batch_sampler.on_epoch_end()

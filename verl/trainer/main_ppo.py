@@ -22,7 +22,7 @@ import hydra
 import ray
 from omegaconf import OmegaConf
 
-from verl.experimental.dataset.sampler import AbstractSampler
+from verl.experimental.dataset.sampler import AbstractSampler, AbstractBatchSampler
 from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer, RayVerticalGenTrainer
 from verl.trainer.ppo.reward import load_reward_manager
@@ -408,7 +408,7 @@ def create_rl_sampler(data_config, dataset):
             data_source=dataset,
             data_config=data_config,
         )
-        assert isinstance(sampler, AbstractSampler)
+        assert isinstance(sampler, AbstractSampler) or isinstance(sampler, AbstractBatchSampler)
         assert data_config.get("dataloader_num_workers", 8) == 0, (
             "If using curriculum, num_workers must be 0 to prevent data caching. "
             "If the dataloader caches data before the batch is done the "
