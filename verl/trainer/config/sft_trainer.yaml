@@ -2,8 +2,8 @@ data:
   train_batch_size: 256
   micro_batch_size: null # will be deprecated, use micro_batch_size_per_gpu
   micro_batch_size_per_gpu: 4  # this is also val batch size
-  train_files: ~/data/gsm8k/train.parquet
-  val_files: ~/data/gsm8k/test.parquet
+  train_files: ~/scratch/data/gsm8k/train.parquet
+  val_files: ~/scratch/data/gsm8k/test.parquet
   # Single-turn settings
   prompt_key: question
   response_key: answer
@@ -25,7 +25,7 @@ data:
   use_shm: False
   apply_chat_template_kwargs: {}
 model:
-  partial_pretrain: ~/models/gemma-1.1-7b-it
+  partial_pretrain: swiss-ai/Apertus-8B-Instruct-2509
   use_shm: False
   fsdp_config:
     model_dtype: fp32

@@ -19,9 +19,9 @@ data:
   micro_batch_size_per_gpu: 4  # this is also val batch size
   max_token_len_per_gpu: 8192
   use_dynamic_bsz: True
-  train_files: ~/data/gsm8k/train.parquet
-  val_files: ~/data/gsm8k/test.parquet
-  rollout_files: ~/data/gsm8k/rollout.parquet
+  train_files: ~/scratch/data/gsm8k/train_chat.parquet
+  val_files: ~/scratch/data/gsm8k/test_chat.parquet
+  # rollout_files: ~/scratch/data/gsm8k/rollout.parquet
   # Multi-turn settings
   messages_key: messages  # Key for messages list in multi-turn mode
   tools_key: tools  # Key for tools list in multi-turn mode
@@ -39,6 +39,7 @@ data:
     name: null
   use_shm: False
   apply_chat_template_kwargs: {}
+  add_generation_prompt: False
 
 # Checkpoint configuration
 checkpoint:

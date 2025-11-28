@@ -151,6 +151,27 @@ class SFTTrainer:
     def _build_dataset(self):
         config = self.config
         tokenizer = self.model_config.tokenizer
+        
+        
+        if not tokenizer.chat_template:
+            if self.rank == 0:
+                print("WARNING: Tokenizer has no chat_template. Setting default ChatML template.")
+            
+            # This is the standard ChatML template (used by Qwen, newer models, etc)
+            tokenizer.chat_template = (
+                "{% for message in messages %}"
+                "{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n'}}"
+                "{% endfor %}"
+                "{% if add_generation_prompt %}"
+                "{{ '<|im_start|>assistant\n' }}"
+                "{% endif %}"
+            )
+            
+            # Ensure the tokenizer knows about these special tokens if they aren't standard
+            # (Most tokenizers handle raw strings fine, but adding special tokens is safer)
+            # if "<|im_start|>" not in tokenizer.all_special_tokens:
+                # tokenizer.add_special_tokens({"additional_special_tokens": ["<|im_start|>", "<|im_end|>"]})
+        
         train_dataset = create_sft_dataset(config.data.train_files, config.data, tokenizer)
         val_dataset = create_sft_dataset(config.data.val_files, config.data, tokenizer)
 
@@ -238,7 +259,7 @@ class SFTTrainer:
             torch.distributed.all_reduce(
                 total_tokens, op=torch.distributed.ReduceOp.SUM, group=self.engine.get_data_parallel_group()
             )
-            val_data.pop("rollout_params")
+            # val_data.pop("rollout_params")
             with self.engine.eval_mode():
                 # construct tensordict
                 val_data = tu.get_tensordict(
@@ -344,7 +365,7 @@ class SFTTrainer:
                 global_step += 1
 
                 # construct tensordict
-                data.pop("rollout_params")
+                # data.pop("rollout_params")
                 data = tu.get_tensordict(tensor_dict=data, non_tensor_dict=meta_info)
 
                 total_tokens = data["response_mask"].sum().to(self.device_name)
@@ -381,7 +402,7 @@ class SFTTrainer:
                     metrics = {}
                     metrics["train/loss"] = loss.item()
                     metrics["train/grad_norm"] = output_metrics["grad_norm"]
-                    metrics["train/lr"] = lr.item()
+                    metrics["train/lr"] = lr #.item()
                     metrics["train/global_tokens"] = total_tokens.item()
                     metrics["train/cumulative_tokens"] = self.cumulative_tokens
                     # mfu
@@ -442,6 +463,7 @@ def create_sft_dataset(data_paths, data_config, tokenizer):
         dataset_cls = MultiTurnSFTDataset
 
     # Create datasets based on the selected class
+    
     dataset = dataset_cls(parquet_files=data_paths, tokenizer=tokenizer, config=data_config)
     return dataset
 
