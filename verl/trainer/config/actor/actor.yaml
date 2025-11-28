@@ -50,6 +50,9 @@ policy_loss:
   # Loss function mode: vanilla / clip-cov / kl-cov /gpg from https://arxiv.org/abs/2505.22617
   loss_mode: "vanilla"
 
+  # Whether to normalize gradients by group size (e.g. for dynamic rollout generation)
+  normalize_group: false
+
   # Ratio of tokens to be clipped for clip-cov loss
   clip_cov_ratio: 0.0002
 

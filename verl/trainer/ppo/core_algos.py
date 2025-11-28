@@ -41,6 +41,7 @@ PolicyLossFn = Callable[
         torch.Tensor,  # advantages
         torch.Tensor,  # response_mask
         str,  # loss_agg_mode
+        torch.Tensor | None,  # group_norm_weights
         Optional[DictConfig | AlgoConfig],  # config
         torch.Tensor | None,  # rollout_log_probs
     ],
@@ -888,6 +889,7 @@ def compute_policy_loss_vanilla(
     advantages: torch.Tensor,
     response_mask: torch.Tensor,
     loss_agg_mode: str = "token-mean",
+    group_norm_weights: torch.Tensor | None = None,
     config: Optional[DictConfig | AlgoConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -908,6 +910,9 @@ def compute_policy_loss_vanilla(
             Mask indicating which tokens to include in the loss, shape (batch_size, response_length).
         loss_agg_mode (str, optional):
             Aggregation mode for `agg_loss`. Defaults to "token-mean".
+        group_norm_weights: `(torch.Tensor | None)`:
+            per-sequence weights for group normalization in dynamic rollout generation,
+            shape (batch_size,). Weight = n_generations / max_gen_budget.
         config: `(verl.trainer.config.ActorConfig)`:
             config for the actor.
         rollout_log_probs: `(torch.Tensor)`:
@@ -959,6 +964,10 @@ def compute_policy_loss_vanilla(
 
     pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
 
+    # Apply group normalization first
+    if group_norm_weights is not None:
+        pg_losses = pg_losses * group_norm_weights.unsqueeze(-1)
+
     # Apply rollout importance sampling weights if provided
     if rollout_is_weights is not None:
         pg_losses = pg_losses * rollout_is_weights
@@ -975,6 +984,7 @@ def compute_policy_loss_gspo(
     advantages: torch.Tensor,
     response_mask: torch.Tensor,
     loss_agg_mode: str = "seq-mean-token-mean",
+    group_norm_weights: torch.Tensor | None = None,
     config: Optional[DictConfig | ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -994,6 +1004,9 @@ def compute_policy_loss_gspo(
             Mask indicating which tokens to include in the loss, shape (batch_size, response_length).
         loss_agg_mode (str, optional):
             Aggregation mode for `agg_loss`. For GSPO, it is recommended to use "seq-mean-token-mean".
+        group_norm_weights: `(torch.Tensor | None)`:
+            per-sequence weights for group normalization in dynamic rollout generation,
+            shape (batch_size,). Weight = n_generations / max_gen_budget.
     """
 
     assert config is not None
@@ -1022,6 +1035,10 @@ def compute_policy_loss_gspo(
     pg_losses2 = -advantages * torch.clamp(seq_importance_ratio, 1 - clip_ratio_low, 1 + clip_ratio_high)
     pg_losses = torch.maximum(pg_losses1, pg_losses2)
 
+    # Apply group normalization first
+    if group_norm_weights is not None:
+        pg_losses = pg_losses * group_norm_weights.unsqueeze(-1)
+
     # Apply rollout importance sampling weights if provided
     if rollout_is_weights is not None:
         pg_losses = pg_losses * rollout_is_weights
@@ -1045,6 +1062,7 @@ def compute_policy_loss_gpg(
     advantages: torch.Tensor,
     response_mask: torch.Tensor,
     loss_agg_mode: str = "token-mean",
+    group_norm_weights: torch.Tensor | None = None,
     config: Optional[DictConfig | AlgoConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -1057,11 +1075,17 @@ def compute_policy_loss_gpg(
             shape: (bs, response_length)
         response_mask: `(torch.Tensor)`
             shape: (bs, response_length)
+        group_norm_weights: `(torch.Tensor | None)`:
+            per-sequence weights for group normalization in dynamic rollout generation.
     return:
         pg_loss: `a scalar torch.Tensor`
             policy gradient loss computed via GPG
     """
     pg_losses = -log_prob * advantages
+
+    # Apply group normalization first
+    if group_norm_weights is not None:
+        pg_losses = pg_losses * group_norm_weights.unsqueeze(-1)
 
     # Apply rollout importance sampling weights if provided
     if rollout_is_weights is not None:
@@ -1078,6 +1102,7 @@ def compute_policy_loss_clip_cov(
     advantages: torch.Tensor,
     response_mask: torch.Tensor,
     loss_agg_mode: str = "token-mean",
+    group_norm_weights: torch.Tensor | None = None,
     config: Optional[DictConfig | AlgoConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -1105,6 +1130,9 @@ def compute_policy_loss_clip_cov(
             Upper clip range for dual-clip PPO. Defaults to same as `cliprange`.
         loss_agg_mode (str, optional):
             Aggregation mode for `agg_loss`. Defaults to "token-mean".
+        group_norm_weights: `(torch.Tensor | None)`:
+            per-sequence weights for group normalization in dynamic rollout generation,
+            shape (batch_size,). Weight = n_generations / max_gen_budget.
         clip_cvo_ratio (float, optional):
             Ratio for clipping the covariance. Defaults to 0.0002.
         clip_cov_lb (float, optional):
@@ -1162,6 +1190,10 @@ def compute_policy_loss_clip_cov(
 
     pg_losses = torch.maximum(pg_losses1, pg_losses2) * corr
 
+    # Apply group normalization first
+    if group_norm_weights is not None:
+        pg_losses = pg_losses * group_norm_weights.unsqueeze(-1)
+
     # Apply rollout importance sampling weights if provided
     if rollout_is_weights is not None:
         pg_losses = pg_losses * rollout_is_weights
@@ -1178,6 +1210,7 @@ def compute_policy_loss_kl_cov(
     advantages: torch.Tensor,
     response_mask: torch.Tensor,
     loss_agg_mode: str = "token-mean",
+    group_norm_weights: torch.Tensor | None = None,
     config: Optional[DictConfig | AlgoConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -1198,6 +1231,9 @@ def compute_policy_loss_kl_cov(
             Mask indicating which tokens to include in the loss, shape (batch_size, response_length).
         loss_agg_mode (str, optional):
             Aggregation mode for `agg_loss`. Defaults to "token-mean".
+        group_norm_weights: `(torch.Tensor | None)`:
+            per-sequence weights for group normalization in dynamic rollout generation,
+            shape (batch_size,). Weight = n_generations / max_gen_budget.
         kl_cov_ratio (float, optional):
             Ratio for selecting the top-k covariance values. Defaults to 0.0002.
         ppo_kl_coef (float, optional):
@@ -1238,6 +1274,10 @@ def compute_policy_loss_kl_cov(
                 large_cov_idxs // advantages.shape[1], large_cov_idxs % advantages.shape[1]
             ]
 
+    # Apply group normalization first
+    if group_norm_weights is not None:
+        pg_losses = pg_losses * group_norm_weights.unsqueeze(-1)
+
     # Apply rollout importance sampling weights if provided
     if rollout_is_weights is not None:
         pg_losses = pg_losses * rollout_is_weights
@@ -1254,6 +1294,7 @@ def compute_policy_loss_geo_mean(
     advantages: torch.Tensor,
     response_mask: torch.Tensor,
     loss_agg_mode: str = "token-mean",
+    group_norm_weights: torch.Tensor | None = None,
     config: Optional[DictConfig | AlgoConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -1274,6 +1315,9 @@ def compute_policy_loss_geo_mean(
             Mask indicating which tokens to include in the loss, shape (batch_size, response_length).
         loss_agg_mode (str, optional):
             not used
+        group_norm_weights: `(torch.Tensor | None)`:
+            per-sequence weights for group normalization in dynamic rollout generation,
+            shape (batch_size,). Weight = n_generations / max_gen_budget.
     """
 
     assert config is not None
@@ -1308,6 +1352,10 @@ def compute_policy_loss_geo_mean(
     # otherwise, below would be not consistent with the paper
     advantage = (advantages * response_mask).sum(dim=-1) / (response_mask_sum + 1e-8)
     pg_losses = -advantage * ratio
+
+    # Apply group normalization (geo_mean already has seq-level losses, so multiply directly)
+    if group_norm_weights is not None:
+        pg_losses = pg_losses * group_norm_weights
 
     # Apply rollout importance sampling weights if provided
     # For geo_mean, IS weights are 2D (batch_size, seq_length) and need to be aggregated to sequence level

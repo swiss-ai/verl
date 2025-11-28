@@ -61,3 +61,7 @@ class AbstractDynamicBatchSampler(AbstractBatchSampler):
     @abstractmethod
     def remove_active(self, batch: DataProto) -> None:
         pass
+
+    @abstractmethod
+    def on_epoch_end(self) -> None:
+        pass

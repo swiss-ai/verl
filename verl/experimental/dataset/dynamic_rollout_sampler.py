@@ -1,74 +1,39 @@
 from collections.abc import Iterator, Sized
-from typing import (
-    Iterator,
-    List,
-    Sized,
-)
+from typing import List
 
 import numpy as np
 from omegaconf import DictConfig
-from torch.utils.data import Sampler
 
 from verl import DataProto
 from verl.experimental.dataset.sampler import AbstractDynamicBatchSampler
 
 
 class _DynamicBatchIterator(Iterator[List[int]]):
-    """Iterator that fetches batch indices from the sampler on each __next__ call.
-    
-    This design allows the sampler state to be modified between batches while
-    still using the standard `for batch in dataloader:` pattern. Each call to
-    __next__ checks the current sampler state to build the next batch.
-    """
+    """Iterator that fetches batch indices from the sampler on each __next__ call."""
     
     def __init__(self, sampler: "DynamicRolloutSampler"):
         self.sampler = sampler
-        self._batch_count = 0
     
     def __next__(self) -> list[int]:
         """Get the next batch of indices, checking sampler state each time."""
-        self._batch_count += 1
-        has_more = self.sampler.has_more_batches()
-        print(f"DEBUG Iterator.__next__ #{self._batch_count}: has_more_batches={has_more}")
-        
-        if not has_more:
-            print(f"DEBUG Iterator: Stopping - no more batches")
+        if not self.sampler.has_more_batches():
             raise StopIteration
         
         batch = self.sampler._build_next_batch()
-        print(f"DEBUG Iterator: Built batch with {len(batch)} indices")
-        
         if not batch:
-            print(f"DEBUG Iterator: Stopping - empty batch")
             raise StopIteration
         
         return batch
 
 
 class DynamicRolloutSampler(AbstractDynamicBatchSampler):
-    """A batch sampler for dynamic rollout generation that works with for-loops.
+    """A batch sampler for dynamic rollout generation.
     
-    This sampler is designed as a **batch sampler** (yields list[int], not int) which
-    gives full control over batch composition. The key insight is that the iterator
-    checks sampler state on each __next__ call, so state modifications between batches
-    (via add_active/remove_active) affect subsequent iterations.
-    
-    The sampler maintains:
-    - Active problems: Problems that need more rollouts (priority for next batch)
-    - Used indices: Indices that have been sampled this epoch (prevents duplicates)
-    - Shuffled indices: Randomized order for sampling new problems
-    
-    Each batch is built by:
+    Batches are built by:
     1. First including active problems (up to gen_batch_size)
     2. Then filling remaining slots with new problems from the shuffled pool
     
-    The iteration ends when there are no more active problems AND no more new problems.
-    
-    Args:
-        data_source: The underlying dataset to sample from
-        data_config: Configuration containing:
-            - gen_batch_size: Number of problems per generation batch
-            - seed: Random seed for reproducibility
+    Iteration ends when there are no more active problems AND no more new problems.
     """
     
     def __init__(self, data_source: Sized, data_config: DictConfig):
@@ -105,33 +70,18 @@ class DynamicRolloutSampler(AbstractDynamicBatchSampler):
         self._used_indices.clear()
     
     def __len__(self) -> int:
-        """Return upper bound on number of batches per epoch.
-        
-        Note: Actual number may differ due to dynamic re-sampling of active problems.
-        With dynamic sampling, some problems may require multiple batches, so actual
-        batch count could exceed this value.
-        """
+        """Return upper bound on number of batches per epoch."""
         if self.drop_last:
             return len(self.data_source) // self.gen_batch_size
         else:
             return (len(self.data_source) + self.gen_batch_size - 1) // self.gen_batch_size
     
     def __iter__(self) -> Iterator[List[int]]:
-        """Return an iterator that yields batches of indices.
-        
-        The iterator checks sampler state on each __next__ call, allowing
-        add_active/remove_active to affect subsequent batches within the same
-        for-loop iteration.
-        """
+        """Return an iterator that yields batches of indices."""
         return _DynamicBatchIterator(self)
     
     def _build_next_batch(self) -> list[int]:
-        """Build the next batch of indices from active + new problems.
-        
-        Returns:
-            List of dataset indices for the next batch (may be smaller than
-            gen_batch_size if not enough problems remain)
-        """
+        """Build the next batch of indices from active + new problems."""
         batch_indices = []
         
         # Priority 1: Active problems that need more rollouts
@@ -160,10 +110,7 @@ class DynamicRolloutSampler(AbstractDynamicBatchSampler):
         return batch_indices
     
     def has_more_batches(self) -> bool:
-        """Check if more non-empty batches can be produced.
-        
-        Returns True if there are active problems OR unused new problems.
-        """
+        """Check if more non-empty batches can be produced."""
         if self._active_problems:
             return True
         
@@ -175,47 +122,25 @@ class DynamicRolloutSampler(AbstractDynamicBatchSampler):
         return False
     
     def add_active(self, batch: DataProto) -> None:
-        """Mark problems as needing more rollouts.
-        
-        These problems will be prioritized in the next batch.
-        
-        Args:
-            batch: DataProto containing problems that need more generations.
-                   Must have 'uid' and 'index' in non_tensor_batch.
-        """
+        """Mark problems as needing more rollouts (prioritized in next batch)."""
         uids = batch.non_tensor_batch["uid"]
         indices = batch.non_tensor_batch["index"]
         
-        added_count = 0
-        # Add unique UIDs to active pool
         seen = set()
         for uid, idx in zip(uids, indices):
             if uid not in seen and uid not in self._active_problems:
                 self._active_problems[uid] = idx
-                # Also mark as used to prevent duplicate sampling from new pool
                 self._used_indices.add(idx)
                 seen.add(uid)
-                added_count += 1
-        
-        print(f"DEBUG add_active: Added {added_count} unique problems, total active now: {len(self._active_problems)}")
     
     def remove_active(self, batch: DataProto) -> None:
-        """Mark problems as complete (no more rollouts needed).
-        
-        Args:
-            batch: DataProto containing completed problems.
-                   Must have 'uid' in non_tensor_batch.
-        """
+        """Mark problems as complete (no more rollouts needed)."""
         completed_uids = np.unique(batch.non_tensor_batch["uid"])
         for uid in completed_uids:
             self._active_problems.pop(uid, None)
     
     def on_epoch_end(self) -> None:
-        """Reset state for a new epoch.
-        
-        Should only be called when all active problems have been completed.
-        Raises RuntimeError if called with active problems remaining.
-        """
+        """Reset state for a new epoch."""
         if self._active_problems:
             raise RuntimeError(
                 f"Cannot end epoch with {len(self._active_problems)} active problems. "
@@ -225,7 +150,7 @@ class DynamicRolloutSampler(AbstractDynamicBatchSampler):
         self._epoch += 1
         self._prepare_epoch()
     
-    # StatefulDataLoader compatibility methods
+    # StatefulDataLoader compatibility
     def state_dict(self) -> dict:
         """Return sampler state for checkpointing."""
         return {

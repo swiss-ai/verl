@@ -48,6 +48,7 @@ from verl.trainer.ppo.metric_utils import (
     compute_dynamic_rollout_metrics,
     compute_throughout_metrics,
     compute_timing_metrics,
+    compute_rollout_metrics,
     process_validation_metrics,
 )
 from verl.trainer.ppo.mismatch_helper import compute_rollout_importance_weights
@@ -1401,23 +1402,18 @@ class RayVerticalGenTrainer(RayPPOTrainer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         
+        # Track problem states for completion criteria
+        self.problem_states: dict[str, dict] = {}
+
         # Initialize training accumulator
         from verl.trainer.ppo.training_accumulator import TrainingAccumulator
         self.training_accumulator = TrainingAccumulator(
             train_batch_size=self.config.data.train_batch_size,
         )
-        
-        # Track problem states for completion criteria
-        self.problem_states: dict[str, dict] = {}
-        
-        # Get dynamic rollout config
-        self.k_correct = self.config.actor_rollout_ref.rollout.get("k_correct", 3)
-        self.k_incorrect = self.config.actor_rollout_ref.rollout.get("k_incorrect", 3)
-        self.max_gen_budget = self.config.actor_rollout_ref.rollout.get("max_gen_budget", 32)
     
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         from verl.trainer.main_ppo import create_rl_dataset, create_rl_sampler
-        from verl.experimental.dataset.sampler import AbstractBatchSampler
+        from verl.experimental.dataset.sampler import AbstractDynamicBatchSampler
 
         if train_dataset is None:
             train_dataset = create_rl_dataset(
@@ -1445,11 +1441,7 @@ class RayVerticalGenTrainer(RayPPOTrainer):
 
         num_workers = self.config.data["dataloader_num_workers"]
         
-        print(f"DEBUG: Using DynamicRolloutSampler as batch_sampler")
-        print(f"DEBUG: Dataset size: {len(self.train_dataset)}, gen_batch_size: {train_sampler.gen_batch_size}")
-        print(f"DEBUG: Sampler len (num batches): {len(train_sampler)}")
-
-        if isinstance(train_sampler, AbstractBatchSampler):
+        if isinstance(train_sampler, AbstractDynamicBatchSampler):
             self.train_dataloader = StatefulDataLoader(
                 dataset=self.train_dataset,
                 batch_sampler=train_sampler,
@@ -1457,7 +1449,7 @@ class RayVerticalGenTrainer(RayPPOTrainer):
                 collate_fn=collate_fn,
             )
         else:
-            raise ValueError("train_sampler must be an AbstractBatchSampler for dynamic rollout training")
+            raise ValueError("train_sampler must be an AbstractDynamicBatchSampler for dynamic rollout training")
 
         val_batch_size = self.config.data.val_batch_size
         if val_batch_size is None:
@@ -1546,17 +1538,6 @@ class RayVerticalGenTrainer(RayPPOTrainer):
 
         for epoch in range(self.config.trainer.total_epochs):
             print(f"DEBUG: epoch {epoch}")
-            # # Use while loop with direct batch fetching for dynamic sampling
-            # # This bypasses DataLoader's iterator to avoid StopIteration issues
-            # while self.train_dataloader.sampler.has_next_batch():
-            #     # Fetch batch directly from sampler + dataset
-            #     batch_dict = self._get_next_batch_direct()
-                
-            #     if batch_dict is None:
-            #         # No data available (shouldn't happen if has_next_batch is correct)
-            #         print("WARNING: has_next_batch() returned True but no batch available")
-            #         break
-            
             for batch_dict in self.train_dataloader:
                 print(f"DEBUG: global step {self.global_steps}")
                 
@@ -1572,10 +1553,10 @@ class RayVerticalGenTrainer(RayPPOTrainer):
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
 
                 # TODO JUAN: debug
-                # batch.non_tensor_batch["uid"]
                 # Check for duplicate UIDs
                 uids = batch.non_tensor_batch["uid"]
                 unique_uids = set(uids)
+                # print(f"DEBUG: Unique UIDs {unique_uids}")
                 if len(unique_uids) < len(uids):
                     from collections import Counter
                     uid_counts = Counter(uids)
@@ -1662,8 +1643,6 @@ class RayVerticalGenTrainer(RayPPOTrainer):
                         batch.batch["token_level_scores"] = reward_tensor
                         batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
 
-                    print(f"DEBUG: Processing batch of size {len(batch)}")
-                    # print(f"DEBUG: unique uids in batch: {set(batch.non_tensor_batch['uid'].tolist())}")
                     # Split rollouts based on completion criteria
                     with marked_timer("split_rollouts", timing_raw, color="magenta"):
                         from verl.trainer.ppo.rollout_utils import split_rollouts_by_completion, update_problem_states
@@ -1675,25 +1654,23 @@ class RayVerticalGenTrainer(RayPPOTrainer):
                         continue_gen_batch, training_batch = split_rollouts_by_completion(
                             batch=batch,
                             problem_states=self.problem_states,
-                            k_correct=self.k_correct,
-                            k_incorrect=self.k_incorrect,
-                            max_gen_budget=self.max_gen_budget,
+                            k_correct=self.config.actor_rollout_ref.rollout.k_correct,
+                            k_incorrect=self.config.actor_rollout_ref.rollout.k_incorrect,
+                            max_gen_budget=self.config.actor_rollout_ref.rollout.max_gen_budget,
                         )
 
                         # Add incomplete problems to active pool for re-sampling
                         # Accumulate incomplete rollouts (will continue generating)
                         if continue_gen_batch is not None:
                             self.train_dataloader.batch_sampler.add_active(batch=continue_gen_batch)
-                            print(f"DEBUG: After add_active - active_count={self.train_dataloader.batch_sampler.active_count}, has_more={self.train_dataloader.batch_sampler.has_more_batches()}")
-                            print(f"DEBUG: Accumulating {len(continue_gen_batch)}")
+                            # print(f"DEBUG: Accumulating {len(continue_gen_batch)}")
                             self.training_accumulator.add_incomplete(continue_gen_batch)
                         
                         # Remove completed problems from active pool
                         # Add directly completed rollouts to training buffer
                         if training_batch is not None:
                             self.train_dataloader.batch_sampler.remove_active(batch=training_batch)
-                            print(f"DEBUG: After remove_active - active_count={self.train_dataloader.batch_sampler.active_count}")
-                            print(f"DEBUG: Adding {len(training_batch)}")
+                            # print(f"DEBUG: Adding {len(training_batch)}")
                             self.training_accumulator.add_complete(training_batch)
                             batch = self.training_accumulator.get_training_batch()
 
@@ -1709,7 +1686,6 @@ class RayVerticalGenTrainer(RayPPOTrainer):
                         old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
                         entropys = old_log_prob.batch["entropys"]
                         response_masks = batch.batch["response_mask"]
-                        loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
                         entropy_agg = masked_mean(entropys, response_masks)
                         old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
                         metrics.update(old_log_prob_metrics)
@@ -1771,6 +1747,19 @@ class RayVerticalGenTrainer(RayPPOTrainer):
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
+
+                    with marked_timer("group_norm_weights", timing_raw, color="teal"):
+                        from verl.trainer.ppo.rollout_utils import compute_group_norm_weights
+                        group_norm_weights = compute_group_norm_weights(
+                            batch=batch,
+                            problem_states=self.problem_states,
+                            n_rollouts=self.config.actor_rollout_ref.rollout.n,
+                        )
+                        # print(f"DEBUG: batch UIDs {batch.non_tensor_batch['uid']}")
+                        # Move to same device as other batch tensors
+                        device = batch.batch["attention_mask"].device
+                        batch.batch["group_norm_weights"] = group_norm_weights.to(device)
+                        
 
                     # update critic
                     if self.use_critic:
@@ -1854,7 +1843,11 @@ class RayVerticalGenTrainer(RayPPOTrainer):
                 )
                 
                 # collect metrics
-                metrics.update(compute_dynamic_rollout_metrics(batch=batch, training_accumulator=self.training_accumulator))
+                metrics.update(compute_dynamic_rollout_metrics(
+                    training_accumulator=self.training_accumulator,
+                    sampler=self.train_dataloader.batch_sampler,
+                ))
+                metrics.update(compute_rollout_metrics(batch=batch, problem_states=self.problem_states))
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
                 # TODO: implement actual tflpo and theoretical tflpo

@@ -1,11 +1,17 @@
-"""
-Utilities for splitting rollout batches based on completion criteria.
-"""
-from typing import Optional
+"""Utilities for splitting rollout batches based on completion criteria."""
 
 import numpy as np
+import torch
 
 from verl import DataProto
+
+
+def _is_problem_complete(state: dict, k_correct: int, k_incorrect: int, max_gen_budget: int) -> bool:
+    """Check if a problem has met completion criteria."""
+    n_incorrect = state["n_generations"] - state["n_correct"]
+    has_enough_samples = state["n_correct"] >= k_correct and n_incorrect >= k_incorrect
+    reached_budget = state["n_generations"] >= max_gen_budget
+    return has_enough_samples or reached_budget
 
 
 def split_rollouts_by_completion(
@@ -14,112 +20,95 @@ def split_rollouts_by_completion(
     k_correct: int,
     k_incorrect: int,
     max_gen_budget: int,
-) -> tuple[Optional[DataProto], Optional[DataProto]]:
-    """Split rollout batch into problems that need more rollouts vs ready for training.
-    
-    This function examines each problem in the batch and categorizes it based on
-    completion criteria. Problems are split into two groups:
-    1. Those needing more rollouts (not yet meeting criteria)
-    2. Those ready for training (meeting k_correct or max_gen_budget)
-    
-    Args:
-        batch: DataProto containing rollout results
-        problem_states: Dictionary mapping UID to problem state containing:
-            - n_generations: Total generations so far
-            - n_correct: Number of correct solutions
-        k_correct: Minimum correct solutions required
-        k_incorrect: Minimum incorrect solutions allowed
-        max_gen_budget: Maximum generations allowed per problem
+) -> tuple[DataProto | None, DataProto | None]:
+    """Split batch into problems needing more rollouts vs ready for training.
     
     Returns:
-        Tuple of (continue_generation_batch, training_ready_batch)
-        - continue_generation_batch: Rollouts needing more generations (or None)
-        - training_ready_batch: Rollouts ready for training (or None)
+        (continue_batch, training_batch) - either may be None if empty
     """
-    if "uid" not in batch.non_tensor_batch:
-        raise ValueError("Batch must contain 'uid' in non_tensor_batch")
+    unique_uids, inverse = np.unique(batch.non_tensor_batch["uid"], return_inverse=True)
     
-    unique_uids, inverse_indices = np.unique(batch.non_tensor_batch["uid"], return_inverse=True)
+    # Check completion for each unique UID
+    is_complete_per_uid = np.array([
+        _is_problem_complete(problem_states.get(uid, {}), k_correct, k_incorrect, max_gen_budget)
+        if uid in problem_states else False
+        for uid in unique_uids
+    ])
     
-    # Determine completion status for each unique UID
-    unique_is_complete = []
-    for uid in unique_uids:
-        if uid in problem_states:
-            state = problem_states[uid]
-            unique_is_complete.append(
-                (state["n_correct"] >= k_correct and state["n_generations"] - state["n_correct"] >= k_incorrect)
-                or state["n_generations"] >= max_gen_budget
-            )
-            # TODO JUAN: logs
-            if state["n_generations"] > max_gen_budget:
-                print(f"DEBUG: UID {uid} reached max_gen_budget {max_gen_budget} with n_generations {state['n_generations']}")
-        else:
-            unique_is_complete.append(False)
-            
-    unique_is_complete = np.array(unique_is_complete, dtype=bool)
-            
-    # Broadcast status back to all rollouts
-    is_complete = unique_is_complete[inverse_indices]
-
-    # Get indices
-    continue_indices = np.where(~is_complete)[0].tolist()
-    training_indices = np.where(is_complete)[0].tolist()
+    # Broadcast to all rollouts and split
+    is_complete = is_complete_per_uid[inverse]
+    continue_idx = np.where(~is_complete)[0].tolist()
+    training_idx = np.where(is_complete)[0].tolist()
     
-    # Create split batches
-    continue_batch = batch[continue_indices] if continue_indices else None
-    training_batch = batch[training_indices] if training_indices else None
-    
-    return continue_batch, training_batch
+    return (
+        batch[continue_idx] if continue_idx else None,
+        batch[training_idx] if training_idx else None,
+    )
 
 
-def update_problem_states(
-    batch: DataProto,
-    problem_states: dict[str, dict],
-) -> dict[str, dict]:
-    """Update problem states based on rollout results using vectorized operations.
-    
-    Args:
-        batch: DataProto containing rollout results with:
-            - batch["token_level_scores"]: Token-level scores per rollout
-            - non_tensor_batch["uid"]: Problem UIDs
-            - non_tensor_batch["index"]: Original dataset index
-        problem_states: Existing problem states dictionary to update
-    
-    Returns:
-        Updated problem_states dictionary
-    """
-    if "uid" not in batch.non_tensor_batch:
-        raise ValueError("Batch must contain 'uid' in non_tensor_batch for tracking")
-    
+def update_problem_states(batch: DataProto, problem_states: dict[str, dict]) -> dict[str, dict]:
+    """Update problem states based on rollout results using vectorized operations."""
     uids = np.array(batch.non_tensor_batch["uid"])
     is_correct = (batch.batch["token_level_scores"].sum(dim=-1) > 0).cpu().numpy()
     dataset_indices = batch.non_tensor_batch["index"]
     
-    # Get unique UIDs and inverse indices to aggregate counts
-    unique_uids, inverse_indices = np.unique(uids, return_inverse=True)
+    # Single np.unique call for all needed outputs
+    unique_uids, first_indices, inverse_indices = np.unique(
+        uids, return_index=True, return_inverse=True
+    )
     
-    # Use bincount for O(N) aggregation instead of O(N*M) loop
+    # Vectorized aggregation
     counts = np.bincount(inverse_indices, minlength=len(unique_uids))
     correct_counts = np.bincount(inverse_indices, weights=is_correct, minlength=len(unique_uids))
     
-    # Get first occurrence indices to retrieve dataset_indices for new problems
-    _, first_indices = np.unique(uids, return_index=True)
-    
-    # Update each problem's state
     for i, uid in enumerate(unique_uids):
-        count = counts[i]
-        n_correct = correct_counts[i]
-        
-        if uid not in problem_states:
-            # Initialize new problem
-            problem_states[uid] = {
+        state = problem_states.get(uid)
+        if state is None:
+            state = {
                 "n_generations": 0,
                 "n_correct": 0,
                 "index": dataset_indices[first_indices[i]] if dataset_indices is not None else None,
             }
+            problem_states[uid] = state
         
-        state = problem_states[uid]
-        state["n_generations"] += int(count)
-        state["n_correct"] += int(n_correct)
+        state["n_generations"] += int(counts[i])
+        state["n_correct"] += int(correct_counts[i])
     
     return problem_states
+
+
+def compute_group_norm_weights(
+    batch: DataProto,
+    problem_states: dict[str, dict],
+    n_rollouts: int,
+) -> torch.Tensor:
+    """Compute group normalization weights for each sample in batch.
+    
+    For dynamic rollout generation where different problems have different 
+    numbers of rollouts, we need to normalize by group size to ensure each
+    problem contributes equally to the gradient.
+    
+    Args:
+        batch: DataProto containing the batch of samples with UIDs
+        problem_states: Dictionary mapping UID -> {n_generations, n_correct, ...}
+        n_rollouts: Number of rollouts per gen batch
+        
+    Returns:
+        torch.Tensor of shape (batch_size,) with normalization weights.
+        Weight = n_rollouts / n_generations for each sample.
+    """
+    uids = np.array(batch.non_tensor_batch["uid"])
+    
+    # Get unique UIDs and inverse mapping
+    unique_uids, inverse_indices = np.unique(uids, return_inverse=True)
+    
+    # Compute weight for each unique UID once
+    unique_weights = np.array([
+        n_rollouts / problem_states[uid]["n_generations"]
+        for uid in unique_uids
+    ], dtype=np.float32)
+    
+    # Broadcast back to all samples
+    weights = unique_weights[inverse_indices]
+    
+    return torch.from_numpy(weights)

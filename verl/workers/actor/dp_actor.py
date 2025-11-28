@@ -370,6 +370,7 @@ class DataParallelPPOActor(BasePPOActor):
             "position_ids",
             "old_log_probs",
             "advantages",
+            "group_norm_weights",
         ]
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
@@ -479,6 +480,9 @@ class DataParallelPPOActor(BasePPOActor):
                     loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
                     # vanilla -> verl.trainer.ppo.core_algos.compute_policy_loss_vanilla
 
+                    # Extract group normalization weights from batch
+                    group_norm_weights = model_inputs.get("group_norm_weights", None) if self.config.policy_loss.get("normalize_group", False) else None
+
                     # Extract pre-computed rollout importance sampling weights if present
                     # Weights are computed centrally in trainer and added when algorithm.rollout_is=True
                     rollout_is_weights = model_inputs.get("rollout_is_weights", None)
@@ -546,6 +550,7 @@ class DataParallelPPOActor(BasePPOActor):
                         advantages=advantages,
                         response_mask=response_mask,
                         loss_agg_mode=loss_agg_mode,
+                        group_norm_weights=group_norm_weights,
                         config=self.config,
                         rollout_is_weights=rollout_is_weights,
                     )

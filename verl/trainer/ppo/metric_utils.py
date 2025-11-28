@@ -48,38 +48,86 @@ def reduce_metrics(metrics: dict[str, list[Any]]) -> dict[str, Any]:
 
 
 def compute_dynamic_rollout_metrics(
-    batch: DataProto,
     training_accumulator: Any,
+    sampler: Any = None,
 ) -> dict[str, Any]:
     """
     Computes metrics related to dynamic rollout generation.
 
     Args:
-        train_dataloader: The training dataloader containing the sampler.
         training_accumulator: The accumulator managing rollout buffers.
-        problem_states: Dictionary tracking state of active problems.
+        sampler: The DynamicRolloutSampler instance (optional).
+        problem_states: Dictionary tracking state of active problems (optional).
 
     Returns:
-        A dictionary containing:
-            - sampler/active_problems: Number of problems currently being sampled
-            - sampler/completed_problems: Number of problems completed so far
-            - accumulator/training_buffer_size: Number of problems in training buffer
-            - accumulator/incomplete_buffer_size: Number of problems in incomplete buffer
-            - problem/avg_generations: Average generations per active problem
-            - problem/avg_correct: Average correct solutions per active problem
+        A dictionary containing metrics about the dynamic rollout state.
     """
     metrics = {}
 
+    # Accumulator state
     metrics["accumulator/training_buffer_size"] = len(training_accumulator.training_buffer)
     metrics["accumulator/incomplete_buffer_size"] = len(training_accumulator.incomplete_rollouts_buffer)
+    
+    # # Sampler state (if available)
+    # if sampler is not None and hasattr(sampler, "_active_problems"):
+    #     metrics["sampler/active_problems"] = len(sampler._active_problems)
+    #     metrics["sampler/used_indices"] = len(sampler._used_indices)
+    #     metrics["sampler/epoch_progress"] = sampler._index_ptr / max(len(sampler._shuffled_indices), 1)
 
-    if "uid" in batch.non_tensor_batch:
-        _, counts = np.unique(batch.non_tensor_batch["uid"], return_counts=True)
-        metrics["samples_per_group/min"] = counts.min()
-        metrics["samples_per_group/max"] = counts.max()
-        metrics["samples_per_group/mean"] = counts.mean()
-        
     return metrics
+
+
+def compute_rollout_metrics(batch: DataProto, problem_states: dict[str, dict]) -> dict[str, Any]:
+    """
+    Compute rollout metrics from problem states for problems in the current batch.
+
+    Args:
+        batch: DataProto containing the current batch with UIDs.
+        problem_states: Dictionary mapping problem UIDs to their state containing
+            'n_generations' and 'n_correct' counts.
+
+    Returns:
+        Dictionary of batch info metrics including accuracy statistics and histograms.
+    """
+    # Get unique UIDs from the current batch and compute accuracy in one pass
+    batch_uids, counts = np.unique(batch.non_tensor_batch["uid"], return_counts=True)
+    
+    # Vectorized extraction: only lookup states that exist
+    problem_acc = np.array([
+        problem_states[uid]["n_correct"] / problem_states[uid]["n_generations"]
+        for uid in batch_uids
+        if uid in problem_states and problem_states[uid]["n_generations"] > 0
+    ])
+    
+    n_problems = len(problem_acc)
+    if n_problems == 0:
+        return {f"batch_info/{k}": 0.0 for k in [
+            "problem_count", "acc_mean", "acc_median", "acc_std", "acc_min", "acc_max",
+            "acc_hist_0_frac", "acc_hist_0_0.25_frac", "acc_hist_0.25_0.5_frac",
+            "acc_hist_0.5_0.75_frac", "acc_hist_0.75_1_frac", "acc_hist_1_frac",
+        ]}
+
+    # Histogram bins: [0], (0, 0.25], (0.25, 0.5], (0.5, 0.75], (0.75, 1), [1]
+    eps = 1e-8
+    hist_fracs = np.histogram(problem_acc, bins=[0, eps, 0.25, 0.5, 0.75, 1.0 - eps, np.inf])[0] / n_problems
+
+    return {
+        "batch_info/problem_count": float(n_problems),
+        "batch_info/acc_mean": float(problem_acc.mean()),
+        "batch_info/acc_median": float(np.median(problem_acc)),
+        "batch_info/acc_std": float(problem_acc.std()),
+        "batch_info/acc_min": float(problem_acc.min()),
+        "batch_info/acc_max": float(problem_acc.max()),
+        "batch_info/acc_hist_0_frac": hist_fracs[0],
+        "batch_info/acc_hist_0_0.25_frac": hist_fracs[1],
+        "batch_info/acc_hist_0.25_0.5_frac": hist_fracs[2],
+        "batch_info/acc_hist_0.5_0.75_frac": hist_fracs[3],
+        "batch_info/acc_hist_0.75_1_frac": hist_fracs[4],
+        "batch_info/acc_hist_1_frac": hist_fracs[5],
+        "batch_info/group_size_min": float(counts.min()),
+        "batch_info/group_size_max": float(counts.max()),
+        "batch_info/group_size_mean": float(counts.mean()),
+    }
 
 
 def _compute_response_info(batch: DataProto) -> dict[str, Any]:

@@ -36,6 +36,7 @@ class PolicyLossConfig(BaseConfig):
 
     Args:
         loss_mode (str): Loss function mode. Options: 'vanilla', 'clip-cov', 'kl-cov', 'gpg'.
+        normalize_group (bool): Whether to normalize loss within each group.
         clip_cov_ratio (float): Ratio of tokens to be clipped for clip-cov loss.
         clip_cov_lb (float): Lower bound for clip-cov loss.
         clip_cov_ub (float): Upper bound for clip-cov loss.
@@ -44,6 +45,7 @@ class PolicyLossConfig(BaseConfig):
     """
 
     loss_mode: str = "vanilla"
+    normalize_group: bool = False
     clip_cov_ratio: float = 0.0002
     clip_cov_lb: float = 1.0
     clip_cov_ub: float = 5.0
