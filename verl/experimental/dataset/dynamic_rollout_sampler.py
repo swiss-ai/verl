@@ -124,7 +124,7 @@ class DynamicRolloutSampler(AbstractDynamicBatchSampler):
     def add_active(self, batch: DataProto) -> None:
         """Mark problems as needing more rollouts (prioritized in next batch)."""
         uids = batch.non_tensor_batch["uid"]
-        indices = batch.non_tensor_batch["index"]
+        indices = batch.non_tensor_batch["dataset_idx"]
         
         seen = set()
         for uid, idx in zip(uids, indices):

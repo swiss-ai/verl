@@ -1537,9 +1537,9 @@ class RayVerticalGenTrainer(RayPPOTrainer):
         next_step_profile = False
 
         for epoch in range(self.config.trainer.total_epochs):
-            print(f"DEBUG: epoch {epoch}")
+            # print(f"DEBUG: epoch {epoch}")
             for batch_dict in self.train_dataloader:
-                print(f"DEBUG: global step {self.global_steps}")
+                # print(f"DEBUG: global step {self.global_steps}")
                 
                 intermediate_steps += 1
                 metrics = {}
@@ -1552,18 +1552,18 @@ class RayVerticalGenTrainer(RayPPOTrainer):
                     )
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
 
-                # TODO JUAN: debug
-                # Check for duplicate UIDs
-                uids = batch.non_tensor_batch["uid"]
-                unique_uids = set(uids)
-                # print(f"DEBUG: Unique UIDs {unique_uids}")
-                if len(unique_uids) < len(uids):
-                    from collections import Counter
-                    uid_counts = Counter(uids)
-                    duplicates = {uid: count for uid, count in uid_counts.items() if count > 1}
-                    print(f"WARNING: Found {len(uids) - len(unique_uids)} duplicate UIDs in batch:")
-                    for uid, count in duplicates.items():
-                        print(f"  UID {uid} appears {count} times")
+                # # TODO JUAN: debug
+                # # Check for duplicate UIDs
+                # uids = batch.non_tensor_batch["uid"]
+                # unique_uids = set(uids)
+                # # print(f"DEBUG: Unique UIDs {unique_uids}")
+                # if len(unique_uids) < len(uids):
+                #     from collections import Counter
+                #     uid_counts = Counter(uids)
+                #     duplicates = {uid: count for uid, count in uid_counts.items() if count > 1}
+                #     print(f"WARNING: Found {len(uids) - len(unique_uids)} duplicate UIDs in batch:")
+                #     for uid, count in duplicates.items():
+                #         print(f"  UID {uid} appears {count} times")
 
                 gen_batch = self._get_gen_batch(batch)
 
@@ -1619,13 +1619,6 @@ class RayVerticalGenTrainer(RayPPOTrainer):
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
-                    # Balance the number of valid tokens across DP ranks.
-                    # NOTE: This usually changes the order of data in the `batch`,
-                    # which won't affect the advantage calculation (since it's based on uid),
-                    # but might affect the loss calculation (due to the change of mini-batching).
-                    # TODO: Decouple the DP balancing and mini-batching.
-                    if self.config.trainer.balance_batch:
-                        self._balance_batch(batch, metrics=metrics)
 
                     with marked_timer("reward", timing_raw, color="yellow"):
                         # compute reward model score
@@ -1677,6 +1670,14 @@ class RayVerticalGenTrainer(RayPPOTrainer):
                     if training_batch is None or batch is None:
                         # Not enough data yet for a training step
                         continue
+
+                    # Balance the number of valid tokens across DP ranks.
+                    # NOTE: This must happen AFTER get_training_batch() creates the final training batch.
+                    # This usually changes the order of data in the `batch`,
+                    # which won't affect the advantage calculation (since it's based on uid),
+                    # but might affect the loss calculation (due to the change of mini-batching).
+                    if self.config.trainer.balance_batch:
+                        self._balance_batch(batch, metrics=metrics)
 
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()

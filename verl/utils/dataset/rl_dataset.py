@@ -397,6 +397,9 @@ class RLHFDataset(Dataset):
         row_dict["tools_kwargs"] = tools_kwargs
         row_dict["interaction_kwargs"] = interaction_kwargs
 
+        # Keep track of real dataset index
+        row_dict["dataset_idx"] = item
+
         # Create unique ID
         data_source = row_dict.get("data_source", "unknown")
         split = row_dict.get("extra_info", {}).get("split", "unknown")
