@@ -18,7 +18,12 @@ The function implemented in this file should be used by trainer with different d
 implement PPO-like algorithms.
 """
 
-__all__ = ["register_adv_est", "get_adv_estimator_fn", "AdvantageEstimator"]
+__all__ = [
+    "register_adv_est",
+    "get_adv_estimator_fn",
+    "AdvantageEstimator",
+    "compute_adaptive_grpo_outcome_advantage",
+]
 
 from collections import defaultdict
 from enum import Enum
@@ -328,6 +333,46 @@ def compute_grpo_outcome_advantage(
         scores = scores.unsqueeze(-1) * response_mask
 
     return scores, scores
+
+
+def compute_adaptive_grpo_outcome_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    group_mean: torch.Tensor,
+    group_std: torch.Tensor,
+    group_pass_rate: torch.Tensor,
+    epsilon: float = 1e-6,
+    norm_adv_by_std_in_grpo: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute GRPO outcome advantages using provided group statistics computed with adaptive group size.
+    NOTE: to compensate for the downsampling, we scale the advantage by 1/p, where p is the pass rate of the group. If the pass rate is zero, we use weight 1 by design.
+
+    Args:
+        token_level_rewards: shape (bs, response_length)
+        response_mask: shape (bs, response_length)
+        group_mean: mean reward for each group, shape (num_groups,)
+        group_std: std of reward for each group, shape (num_groups,)
+        group_pass_rate: pass rate for each group, shape (num_groups,)
+        epsilon: small value to avoid division by zero
+        norm_adv_by_std_in_grpo: whether to normalize advantage by std within group
+    """
+    scores = token_level_rewards.sum(dim=-1)
+
+    group_mean = group_mean.to(device=scores.device, dtype=scores.dtype)
+    group_std = group_std.to(device=scores.device, dtype=scores.dtype)
+    group_pass_rate = group_pass_rate.to(device=scores.device, dtype=scores.dtype)
+
+    if norm_adv_by_std_in_grpo:
+        scalar_advantages = (scores - group_mean) / (group_std + epsilon)
+    else:
+        scalar_advantages = scores - group_mean
+
+    # Scale the advantage by 1/p to upweight prompts with low pass rate
+    adaptive_weights = torch.where(group_pass_rate > 0, 1.0 / group_pass_rate, torch.ones_like(group_pass_rate))
+    scalar_advantages = scalar_advantages * adaptive_weights
+    
+    advantages = scalar_advantages.unsqueeze(-1) * response_mask
+    return advantages, advantages, adaptive_weights
 
 
 @register_adv_est(AdvantageEstimator.GRPO_VECTORIZED)

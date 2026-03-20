@@ -41,6 +41,11 @@ from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup, ResourcePoolManager
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.config import AlgoConfig
+from verl.trainer.ppo.adaptive_rl_utils import (
+    extract_reward_extra_info_row,
+    finalize_prompt_rollouts,
+    prune_prompt_caches,
+)
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
 from verl.trainer.ppo.metric_utils import (
@@ -549,6 +554,310 @@ class RayPPOTrainer:
             gen_batch.non_tensor_batch.update(batch.non_tensor_batch)
 
         return gen_batch
+
+    
+    def _get_adaptive_group_sampling_config(self) -> dict[str, Any]:
+        """Resolve adaptive group sampling config with backward-compatible key support."""
+        algo_cfg = self.config.algorithm
+        adaptive_cfg = algo_cfg.get("adaptive_group_sampling", None)
+
+        legacy_enable = bool(algo_cfg.get("multiround_adaptive_downsampling", False))
+        adaptive_enable = bool(adaptive_cfg.get("enable", False)) if adaptive_cfg is not None else False
+        enable = adaptive_enable or legacy_enable
+
+        def _read_int(field: str, legacy_field: str, default: int) -> int:
+            if adaptive_cfg is not None and adaptive_cfg.get(field, None) is not None:
+                return int(adaptive_cfg.get(field))
+            if algo_cfg.get(legacy_field, None) is not None:
+                return int(algo_cfg.get(legacy_field))
+            return int(default)
+
+        def _read_float(field: str, legacy_field: str, default: float) -> float:
+            if adaptive_cfg is not None and adaptive_cfg.get(field, None) is not None:
+                return float(adaptive_cfg.get(field))
+            if algo_cfg.get(legacy_field, None) is not None:
+                return float(algo_cfg.get(legacy_field))
+            return float(default)
+
+        return {
+            "enable": enable,
+            "min_positive_samples": _read_int("min_positive_samples", "n_pos", 1),
+            "min_negative_samples": _read_int("min_negative_samples", "n_neg", 1),
+            "max_rounds": _read_int("max_rounds", "max_rounds", 1),
+            "rollouts_per_round": _read_int("rollouts_per_round", "n_per_round", 1),
+            "positive_threshold": _read_float("positive_threshold", "positive_threshold", 0.0),
+        }
+
+
+    def _validate_adaptive_group_sampling_config(self, adaptive_cfg: dict[str, Any]) -> None:
+        if not adaptive_cfg["enable"]:
+            return
+
+        if self.config.algorithm.adv_estimator != AdvantageEstimator.GRPO:
+            raise ValueError(
+                "algorithm.adaptive_group_sampling.enable=True is only supported with algorithm.adv_estimator=grpo."
+            )
+        if self.config.algorithm.use_kl_in_reward:
+            raise ValueError(
+                "Adaptive group sampling currently does not support algorithm.use_kl_in_reward=True."
+            )
+
+        min_positive_samples = adaptive_cfg["min_positive_samples"]
+        min_negative_samples = adaptive_cfg["min_negative_samples"]
+        max_rounds = adaptive_cfg["max_rounds"]
+        rollouts_per_round = adaptive_cfg["rollouts_per_round"]
+
+        if min_positive_samples < 0 or min_negative_samples < 0:
+            raise ValueError("Adaptive group sampling requires non-negative min_positive_samples/min_negative_samples.")
+        if max_rounds <= 0:
+            raise ValueError("Adaptive group sampling requires max_rounds > 0.")
+        if rollouts_per_round <= 0:
+            raise ValueError("Adaptive group sampling requires rollouts_per_round > 0.")
+
+        target_rollouts = int(self.config.actor_rollout_ref.rollout.n)
+        if max_rounds * rollouts_per_round < target_rollouts:
+            raise ValueError(
+                "Adaptive group sampling requires max_rounds * rollouts_per_round >= actor_rollout_ref.rollout.n, "
+                f"but got {max_rounds} * {rollouts_per_round} < {target_rollouts}."
+            )
+
+
+    def _generate_batch_with_adaptive_group_sampling(
+        self,
+        batch: DataProto,
+        gen_batch: DataProto,
+        adaptive_cfg: dict[str, Any],
+        curr_step_profile: bool,
+        timing_raw: dict[str, float],
+    ) -> tuple[DataProto, dict[str, list[Any]], dict[str, float]]:
+        """Generate adaptive group rollouts, then downsample to fixed-size per prompt."""
+        target_rollouts = int(self.config.actor_rollout_ref.rollout.n)
+        rollouts_per_round = int(adaptive_cfg["rollouts_per_round"])
+        max_rounds = int(adaptive_cfg["max_rounds"])
+        min_positive_samples = int(adaptive_cfg["min_positive_samples"])
+        min_negative_samples = int(adaptive_cfg["min_negative_samples"])
+        positive_threshold = float(adaptive_cfg["positive_threshold"])
+
+        num_prompts = len(batch)
+        prompt_uids = [str(uid) for uid in batch.non_tensor_batch["uid"].tolist()]
+        if len(set(prompt_uids)) != num_prompts:
+            raise ValueError("Adaptive group sampling requires unique prompt uids per prompt.")
+        # Route sampled rollouts back to prompt states by uid (instead of relying on positional layout).
+        prompt_uid_to_idx = {uid: idx for idx, uid in enumerate(prompt_uids)}
+        prompt_states: list[dict[str, Any]] = []
+        for _ in range(num_prompts):
+            prompt_states.append(
+                {
+                    "total": 0,
+                    "pos": 0,
+                    "neg": 0,
+                    "sum": 0.0,
+                    "sumsq": 0.0,
+                    "positive_cache": [],
+                    "negative_cache": [],
+                    "selected": [],
+                    "selected_pos": 0,
+                    "selected_neg": 0,
+                    "finalized": False,
+                }
+            )
+
+        active_mask = np.ones(num_prompts, dtype=bool)
+        prompts_completed_early = 0
+        rounds_executed = 0
+
+        for i in range(max_rounds):
+            # print progress and number of active prompts for this round
+            print(
+                f"[Adaptive Sampling] Round {i+1}/{max_rounds} - Executing rollouts for active prompts ({active_mask.sum()})"
+            )
+
+            active_indices = np.where(active_mask)[0]
+            if active_indices.size == 0:
+                break
+            rounds_executed += 1
+
+            active_prompt_batch = batch.select_idxs(active_indices.tolist())
+            active_gen_batch = gen_batch.select_idxs(active_indices.tolist())
+
+            round_prompt_batch = active_prompt_batch.repeat(repeat_times=rollouts_per_round, interleave=True)
+            round_gen_batch = active_gen_batch.repeat(repeat_times=rollouts_per_round, interleave=True)
+            round_gen_batch.meta_info["global_steps"] = self.global_steps
+            # Generation backends split the batch across workers/ranks, so make the batch divisible.
+            size_divisor = (
+                self.actor_rollout_wg.world_size
+                if not self.async_rollout_mode
+                else self.config.actor_rollout_ref.rollout.agent.num_workers
+            )
+            round_gen_batch_padded, round_pad_size = pad_dataproto_to_divisor(round_gen_batch, size_divisor)
+
+            if not self.async_rollout_mode:
+                round_gen_output_padded = self.actor_rollout_wg.generate_sequences(round_gen_batch_padded)
+            else:
+                if curr_step_profile:
+                    self.async_rollout_manager.start_profile(global_step=self.global_steps)
+                round_gen_output_padded = self.async_rollout_manager.generate_sequences(round_gen_batch_padded)
+                if curr_step_profile:
+                    self.async_rollout_manager.stop_profile()
+            round_gen_output = unpad_dataproto(round_gen_output_padded, pad_size=round_pad_size)
+
+            round_timing = round_gen_output.meta_info.get("timing", {})
+            for key, value in round_timing.items():
+                timing_raw[key] = timing_raw.get(key, 0.0) + value
+            round_gen_output.meta_info.pop("timing", None)
+
+            round_batch = round_prompt_batch.union(round_gen_output)
+
+            # Reward path mirrors regular trainer logic, but done round-by-round.
+            if self.use_rm and "rm_scores" not in round_batch.batch.keys():
+                if not self.use_reward_loop:
+                    round_rm_scores = self.rm_wg.compute_rm_score(round_batch)
+                else:
+                    assert self.reward_loop_manager is not None, "RewardLoopManager is None"
+                    round_rm_scores = self.reward_loop_manager.compute_rm_score(round_batch)
+                round_batch = round_batch.union(round_rm_scores)
+
+            if self.config.reward_model.launch_reward_fn_async:
+                round_reward_tensor, round_reward_extra_infos_dict = ray.get(
+                    compute_reward_async.remote(data=round_batch, config=self.config, tokenizer=self.tokenizer)
+                )
+            else:
+                round_reward_tensor, round_reward_extra_infos_dict = self._compute_or_extract_reward(
+                    round_batch, reward_fn=self.reward_fn, reward_for_val=False
+                )
+
+            sequence_scores = round_reward_tensor.sum(dim=-1).detach().cpu().tolist()
+            round_batch_size = len(round_batch)
+
+            for sample_idx, score in enumerate(sequence_scores):
+                sample_uid = str(round_batch.non_tensor_batch["uid"][sample_idx])
+                if sample_uid not in prompt_uid_to_idx:
+                    raise ValueError(f"Unknown prompt uid {sample_uid} encountered during adaptive sampling.")
+                prompt_idx = prompt_uid_to_idx[sample_uid]
+                prompt_state = prompt_states[prompt_idx]
+
+                score_value = float(score)
+                is_positive = score_value > positive_threshold
+                prompt_state["total"] += 1
+                prompt_state["sum"] += score_value
+                prompt_state["sumsq"] += score_value * score_value
+                if is_positive:
+                    prompt_state["pos"] += 1
+                else:
+                    prompt_state["neg"] += 1
+
+                sample = round_batch.select_idxs([sample_idx])
+                sample.batch["token_level_scores"] = round_reward_tensor[sample_idx : sample_idx + 1]
+                sample_extra = extract_reward_extra_info_row(
+                    round_reward_extra_infos_dict, sample_idx, round_batch_size
+                )
+                sample_entry = {
+                    "sample": sample,
+                    "extra": sample_extra,
+                    "is_positive": is_positive,
+                }
+
+                if is_positive:
+                    prompt_state["positive_cache"].append(sample_entry)
+                else:
+                    prompt_state["negative_cache"].append(sample_entry)
+                prune_prompt_caches(prompt_state, target_rollouts=target_rollouts)
+
+            for prompt_idx in active_indices:
+                prompt_state = prompt_states[prompt_idx]
+                if prompt_state["finalized"]:
+                    continue
+                meets_class_criteria = (
+                    prompt_state["pos"] >= min_positive_samples and prompt_state["neg"] >= min_negative_samples
+                )
+                if meets_class_criteria and prompt_state["total"] >= target_rollouts:
+                    finalize_prompt_rollouts(prompt_state, target_rollouts=target_rollouts)
+                    active_mask[prompt_idx] = False
+                    prompts_completed_early += 1
+
+        # Finalize unresolved prompts with the best available balanced subset.
+        for prompt_state in prompt_states:
+            if prompt_state["finalized"]:
+                continue
+            if prompt_state["total"] < target_rollouts:
+                raise ValueError(
+                    f"Prompt sampled only {prompt_state['total']} rollouts; expected at least {target_rollouts}. "
+                    "Please increase max_rounds or rollouts_per_round."
+                )
+            finalize_prompt_rollouts(prompt_state, target_rollouts=target_rollouts)
+
+        # Keep rollout KV cache between rounds and sleep only once after adaptive sampling.
+        if self.async_rollout_mode:
+            self.checkpoint_manager.sleep_replicas()
+
+        selected_samples: list[DataProto] = []
+        reward_extra_infos_dict: dict[str, list[Any]] = defaultdict(list)
+        rollouts_per_prompt = []
+        pass_rates = []
+        weights = []
+        selected_pos = []
+        selected_neg = []
+
+        for prompt_state in prompt_states:
+            total = int(prompt_state["total"])
+            mean = float(prompt_state["sum"] / total)
+            var = max(float(prompt_state["sumsq"] / total - mean * mean), 0.0)
+            std = float(var**0.5)
+            pass_rate = float(prompt_state["pos"] / total)
+            weight = float(1.0 / pass_rate) if pass_rate > 0 else 1.0
+
+            rollouts_per_prompt.append(total)
+            pass_rates.append(pass_rate)
+            weights.append(weight)
+            selected_pos.append(int(prompt_state["selected_pos"]))
+            selected_neg.append(int(prompt_state["selected_neg"]))
+
+            for entry in prompt_state["selected"]:
+                sample = entry["sample"]
+                score_dtype = sample.batch["token_level_scores"].dtype
+                score_device = sample.batch["token_level_scores"].device
+                sample.batch["adaptive_group_mean"] = torch.tensor([mean], dtype=score_dtype, device=score_device)
+                sample.batch["adaptive_group_std"] = torch.tensor([std], dtype=score_dtype, device=score_device)
+                sample.batch["adaptive_group_pass_rate"] = torch.tensor(
+                    [pass_rate], dtype=score_dtype, device=score_device
+                )
+                sample.batch["adaptive_group_weight"] = torch.tensor([weight], dtype=score_dtype, device=score_device)
+                selected_samples.append(sample)
+                for key, value in entry["extra"].items():
+                    reward_extra_infos_dict[key].append(value)
+
+        expected_batch_size = num_prompts * target_rollouts
+        if len(selected_samples) != expected_batch_size:
+            raise ValueError(
+                f"Adaptive group sampling built {len(selected_samples)} selected samples, "
+                f"expected {expected_batch_size}."
+            )
+
+        selected_batch = DataProto.concat(selected_samples)
+
+        selected_pos_arr = np.array(selected_pos, dtype=np.float32)
+        selected_neg_arr = np.array(selected_neg, dtype=np.float32)
+        metrics = {
+            "adaptive_group_sampling/total_rollouts": float(np.sum(rollouts_per_prompt)),
+            "adaptive_group_sampling/rollouts_per_prompt_mean": float(np.mean(rollouts_per_prompt)),
+            "adaptive_group_sampling/rollouts_per_prompt_min": float(np.min(rollouts_per_prompt)),
+            "adaptive_group_sampling/rollouts_per_prompt_max": float(np.max(rollouts_per_prompt)),
+            "adaptive_group_sampling/rounds_executed": float(rounds_executed),
+            "adaptive_group_sampling/prompts_completed_early": float(prompts_completed_early),
+            "adaptive_group_sampling/prompts_not_completed_in_rounds": float(num_prompts - prompts_completed_early),
+            "adaptive_group_sampling/pass_rate_mean": float(np.mean(pass_rates)),
+            "adaptive_group_sampling/pass_rate_min": float(np.min(pass_rates)),
+            "adaptive_group_sampling/pass_rate_max": float(np.max(pass_rates)),
+            "adaptive_group_sampling/weight_mean": float(np.mean(weights)),
+            "adaptive_group_sampling/weight_min": float(np.min(weights)),
+            "adaptive_group_sampling/weight_max": float(np.max(weights)),
+            "adaptive_group_sampling/selected_positive_per_prompt_mean": float(np.mean(selected_pos_arr)),
+            "adaptive_group_sampling/selected_negative_per_prompt_mean": float(np.mean(selected_neg_arr)),
+            "adaptive_group_sampling/selected_positive_ratio_mean": float(
+                np.mean(selected_pos_arr / (selected_pos_arr + selected_neg_arr + 1e-8))
+            ),
+        }
+        return selected_batch, dict(reward_extra_infos_dict), metrics
 
     def _validate(self, merged: bool = False):
         data_source_lst = []
@@ -1339,6 +1648,9 @@ class RayPPOTrainer:
             rollout_skip = RolloutSkip(self.config, self.actor_rollout_wg)
             rollout_skip.wrap_generate_sequences()
 
+        adaptive_group_sampling_cfg = self._get_adaptive_group_sampling_config()
+        self._validate_adaptive_group_sampling_config(adaptive_group_sampling_cfg)
+
         # add tqdm
         progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
 
@@ -1380,28 +1692,45 @@ class RayPPOTrainer:
 
                 # pass global_steps to trace
                 gen_batch.meta_info["global_steps"] = self.global_steps
-                gen_batch_output = gen_batch.repeat(
-                    repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
-                )
+                adaptive_group_sampling_enabled = bool(adaptive_group_sampling_cfg["enable"])
+                reward_extra_infos_dict: dict[str, list[Any]] = {}
+                if not adaptive_group_sampling_enabled:
+                    gen_batch_output = gen_batch.repeat(
+                        repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
+                    )
+                else:
+                    gen_batch_output = None
 
                 is_last_step = self.global_steps >= self.total_training_steps
                 with marked_timer("step", timing_raw):
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
-                        if not self.async_rollout_mode:
-                            gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)
+                        if adaptive_group_sampling_enabled:
+                            batch, reward_extra_infos_dict, adaptive_sampling_metrics = (
+                                self._generate_batch_with_adaptive_group_sampling(
+                                    batch=batch,
+                                    gen_batch=gen_batch,
+                                    adaptive_cfg=adaptive_group_sampling_cfg,
+                                    curr_step_profile=curr_step_profile,
+                                    timing_raw=timing_raw,
+                                )
+                            )
+                            metrics.update(adaptive_sampling_metrics)
                         else:
-                            if curr_step_profile:
-                                self.async_rollout_manager.start_profile(global_step=self.global_steps)
-                            gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
-                            self.checkpoint_manager.sleep_replicas()
-                            if curr_step_profile:
-                                self.async_rollout_manager.stop_profile()
+                            if not self.async_rollout_mode:
+                                gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)
+                            else:
+                                if curr_step_profile:
+                                    self.async_rollout_manager.start_profile(global_step=self.global_steps)
+                                gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
+                                self.checkpoint_manager.sleep_replicas()
+                                if curr_step_profile:
+                                    self.async_rollout_manager.stop_profile()
 
-                        timing_raw.update(gen_batch_output.meta_info["timing"])
-                        gen_batch_output.meta_info.pop("timing", None)
+                            timing_raw.update(gen_batch_output.meta_info["timing"])
+                            gen_batch_output.meta_info.pop("timing", None)
 
-                    if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
+                    if (not adaptive_group_sampling_enabled) and self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         if self.reward_fn is None:
                             raise ValueError("A reward_fn is required for REMAX advantage estimation.")
 
@@ -1441,9 +1770,10 @@ class RayPPOTrainer:
                             batch.batch["reward_baselines"] = reward_baseline_tensor
 
                             del rm_scores, gen_baseline_batch, gen_baseline_output
-                    # repeat to align with repeated responses in rollout
-                    batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
-                    batch = batch.union(gen_batch_output)
+                    if not adaptive_group_sampling_enabled:
+                        # repeat to align with repeated responses in rollout
+                        batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                        batch = batch.union(gen_batch_output)
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
@@ -1458,30 +1788,32 @@ class RayPPOTrainer:
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
                     # get images_seqlens
                     images_seqlens_all = []
-                    for multi_modal_input in batch.non_tensor_batch["multi_modal_inputs"]:
-                        if "image_grid_thw" not in multi_modal_input.keys():
-                            continue
-                        images_seqlens_all.extend(multi_modal_input["images_seqlens"].tolist())
+                    if "multi_modal_inputs" in batch.non_tensor_batch:
+                        for multi_modal_input in batch.non_tensor_batch["multi_modal_inputs"]:
+                            if "image_grid_thw" not in multi_modal_input.keys():
+                                continue
+                            images_seqlens_all.extend(multi_modal_input["images_seqlens"].tolist())
                     batch.meta_info["images_seqlens"] = images_seqlens_all
                     with marked_timer("reward", timing_raw, color="yellow"):
-                        # compute reward model score
-                        if self.use_rm and "rm_scores" not in batch.batch.keys():
-                            if not self.use_reward_loop:
-                                reward_tensor = self.rm_wg.compute_rm_score(batch)
-                            else:
-                                assert self.reward_loop_manager is not None, "RewardLoopManager is None"
-                                reward_tensor = self.reward_loop_manager.compute_rm_score(batch)
-                            batch = batch.union(reward_tensor)
+                        if not adaptive_group_sampling_enabled:
+                            # compute reward model score
+                            if self.use_rm and "rm_scores" not in batch.batch.keys():
+                                if not self.use_reward_loop:
+                                    reward_tensor = self.rm_wg.compute_rm_score(batch)
+                                else:
+                                    assert self.reward_loop_manager is not None, "RewardLoopManager is None"
+                                    reward_tensor = self.reward_loop_manager.compute_rm_score(batch)
+                                batch = batch.union(reward_tensor)
 
-                        # Compute or extract reward for training
-                        if self.config.reward_model.launch_reward_fn_async:
-                            future_reward = compute_reward_async.remote(
-                                data=batch, config=self.config, tokenizer=self.tokenizer
-                            )
-                        else:
-                            reward_tensor, reward_extra_infos_dict = self._compute_or_extract_reward(
-                                batch, reward_fn=self.reward_fn, reward_for_val=False
-                            )
+                            # Compute or extract reward for training
+                            if self.config.reward_model.launch_reward_fn_async:
+                                future_reward = compute_reward_async.remote(
+                                    data=batch, config=self.config, tokenizer=self.tokenizer
+                                )
+                            else:
+                                reward_tensor, reward_extra_infos_dict = self._compute_or_extract_reward(
+                                    batch, reward_fn=self.reward_fn, reward_for_val=False
+                                )
 
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
@@ -1545,11 +1877,13 @@ class RayPPOTrainer:
                             batch = batch.union(values)
 
                     with marked_timer("adv", timing_raw, color="brown"):
-                        # we combine with rule-based rm
-                        reward_extra_infos_dict: dict[str, list]
-                        if self.config.reward_model.launch_reward_fn_async:
-                            reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
-                        batch.batch["token_level_scores"] = reward_tensor
+                        if adaptive_group_sampling_enabled:
+                            reward_tensor = batch.batch["token_level_scores"]
+                        else:
+                            # we combine with rule-based rm
+                            if self.config.reward_model.launch_reward_fn_async:
+                                reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
+                            batch.batch["token_level_scores"] = reward_tensor
 
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
@@ -1582,16 +1916,30 @@ class RayPPOTrainer:
                         norm_adv_by_std_in_grpo = self.config.algorithm.get(
                             "norm_adv_by_std_in_grpo", True
                         )  # GRPO adv normalization factor
-
-                        batch = compute_advantage(
-                            batch,
-                            adv_estimator=self.config.algorithm.adv_estimator,
-                            gamma=self.config.algorithm.gamma,
-                            lam=self.config.algorithm.lam,
-                            num_repeat=self.config.actor_rollout_ref.rollout.n,
-                            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-                            config=self.config.algorithm,
-                        )
+                        if adaptive_group_sampling_enabled:
+                            advantages, returns, adaptive_weights = core_algos.compute_adaptive_grpo_outcome_advantage(
+                                token_level_rewards=batch.batch["token_level_rewards"],
+                                response_mask=batch.batch["response_mask"],
+                                group_mean=batch.batch["adaptive_group_mean"],
+                                group_std=batch.batch["adaptive_group_std"],
+                                group_pass_rate=batch.batch["adaptive_group_pass_rate"],
+                                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                            )
+                            batch.batch["advantages"] = advantages
+                            batch.batch["returns"] = returns
+                            metrics["adaptive_group_sampling/adv_weight_mean"] = adaptive_weights.mean().item()
+                            metrics["adaptive_group_sampling/adv_weight_min"] = adaptive_weights.min().item()
+                            metrics["adaptive_group_sampling/adv_weight_max"] = adaptive_weights.max().item()
+                        else:
+                            batch = compute_advantage(
+                                batch,
+                                adv_estimator=self.config.algorithm.adv_estimator,
+                                gamma=self.config.algorithm.gamma,
+                                lam=self.config.algorithm.lam,
+                                num_repeat=self.config.actor_rollout_ref.rollout.n,
+                                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                                config=self.config.algorithm,
+                            )
 
                     # update critic
                     if self.use_critic:

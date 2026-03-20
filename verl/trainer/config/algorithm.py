@@ -17,7 +17,13 @@ from typing import Any, Optional
 
 from verl.base_config import BaseConfig
 
-__all__ = ["AlgoConfig", "FilterGroupsConfig", "KLControlConfig", "RolloutCorrectionConfig"]
+__all__ = [
+    "AlgoConfig",
+    "AdaptiveGroupSamplingConfig",
+    "FilterGroupsConfig",
+    "KLControlConfig",
+    "RolloutCorrectionConfig",
+]
 
 
 @dataclass
@@ -54,6 +60,27 @@ class FilterGroupsConfig(BaseConfig):
     enable: bool = False
     metric: Optional[str] = None
     max_num_gen_batches: int = 0
+
+
+@dataclass
+class AdaptiveGroupSamplingConfig(BaseConfig):
+    """Configuration for adaptive multi-round grouped sampling (GRPO-style).
+
+    Args:
+        enable (bool): Whether to enable adaptive grouped sampling.
+        min_positive_samples (int): Minimum number of positive samples before stopping a prompt.
+        min_negative_samples (int): Minimum number of negative samples before stopping a prompt.
+        max_rounds (int): Maximum number of sampling rounds.
+        rollouts_per_round (int): Number of rollouts sampled per active prompt each round.
+        positive_threshold (float): A rollout is positive when sequence reward > positive_threshold.
+    """
+
+    enable: bool = False
+    min_positive_samples: int = 1
+    min_negative_samples: int = 1
+    max_rounds: int = 1
+    rollouts_per_round: int = 1
+    positive_threshold: float = 0.0
 
 
 @dataclass
@@ -581,6 +608,7 @@ class AlgoConfig(BaseConfig):
         use_pf_ppo (bool): Whether to enable preference feedback PPO.
         pf_ppo (dict[str, Any]): Preference feedback PPO settings.
         filter_groups (Optional[FilterGroupsConfig]): Filter groups configuration, used in DAPO and Entropy
+        adaptive_group_sampling (Optional[AdaptiveGroupSamplingConfig]): Adaptive grouped sampling configuration.
         rollout_correction (Optional[RolloutCorrectionConfig]): Rollout Correction configuration.
             Addresses off-policy issues from policy mismatch, model staleness, and general distribution shifts.
 
@@ -609,6 +637,7 @@ class AlgoConfig(BaseConfig):
     use_pf_ppo: bool = False
     pf_ppo: dict[str, Any] = field(default_factory=dict)
     filter_groups: Optional[FilterGroupsConfig] = None
+    adaptive_group_sampling: Optional[AdaptiveGroupSamplingConfig] = None
     # Rollout Correction: corrects off-policy issues (policy mismatch, model staleness, distribution shifts)
     # Set to None to disable, use RolloutCorrectionConfig presets (e.g., .tis(), .mis()), or pass dict
     rollout_correction: Optional[RolloutCorrectionConfig] = None

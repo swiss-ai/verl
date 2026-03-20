@@ -119,6 +119,26 @@ algorithm:
     # Power used for weight scaling in "pow" method
     weight_pow: 2.0
 
+  # Adaptive group-size sampling for GRPO-style training
+  adaptive_group_sampling:
+    _target_: verl.trainer.config.AdaptiveGroupSamplingConfig
+
+    # Whether to enable adaptive grouped sampling
+    enable: False
+
+    # Minimum number of positive/negative samples required to stop sampling
+    min_positive_samples: 1
+    min_negative_samples: 1
+
+    # Maximum rollout sampling rounds
+    max_rounds: 1
+
+    # Number of rollouts sampled per active prompt in each round
+    rollouts_per_round: 1
+
+    # A rollout is positive when sequence reward > positive_threshold
+    positive_threshold: 0.5
+
 # config for the trainer
 trainer:
 
