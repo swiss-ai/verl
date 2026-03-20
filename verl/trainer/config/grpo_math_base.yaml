@@ -1,0 +1,90 @@
+defaults:
+  - ppo_trainer
+  - _self_
+
+algorithm:
+  adv_estimator: grpo
+  norm_adv_by_std_in_grpo: false
+
+data:
+  train_files: ./data/math/train.parquet
+  val_files: ./data/math/test.parquet
+  train_batch_size: 1024
+  max_prompt_length: 1024
+  max_response_length: 2048
+  truncation: left
+
+actor_rollout_ref:
+  nccl_timeout: 1800
+
+  model:
+    path: Qwen/Qwen2.5-3B-Instruct
+    use_remove_padding: true
+    enable_gradient_checkpointing: true
+    use_shm: false
+    override_config:
+      attn_implementation: flash_attention_3
+
+  actor:
+    ppo_mini_batch_size: 256
+    ppo_micro_batch_size_per_gpu: 16
+    optim:
+      optimizer: _AdamW
+      lr: 2e-6
+      weight_decay: 0.1
+      clip_grad: 2.0
+      optimizer_impl: torchao.optim
+      override_optimizer_config:
+        bf16_stochastic_round: true
+    strategy: fsdp2
+    fsdp_config:
+      strategy: fsdp2
+      param_offload: false
+      optimizer_offload: false
+      entropy_from_logits_with_chunking: ${oc.select:actor_rollout_ref.actor.entropy_from_logits_with_chunking,false}
+      entropy_checkpointing: ${oc.select:actor_rollout_ref.actor.entropy_checkpointing,false}
+      model_dtype: bf16
+      mixed_precision:
+        param_dtype: bf16
+        reduce_dtype: bf16
+        buffer_dtype: bf16
+    clip_ratio_high: 0.28
+    clip_ratio_low: 0.2
+    use_kl_loss: false
+    loss_agg_mode: token-mean
+    shuffle: true
+
+  rollout:
+    gpu_memory_utilization: 0.35
+    log_prob_micro_batch_size_per_gpu: 16
+    tensor_model_parallel_size: 1
+    n: 4
+    max_num_batched_tokens: 8192
+    max_num_seqs: 256
+    name: sglang
+    dtype: bfloat16
+    multi_stage_wake_up: true
+    free_cache_engine: true
+    enforce_eager: false
+    load_format: safetensors
+
+trainer:
+  total_epochs: 1000
+  total_training_steps: 300
+  save_freq: -1
+  test_freq: 20
+  max_actor_ckpt_to_keep: null
+  project_name: Reinforce-Ada
+  experiment_name: GRPO
+  logger: ["console", "wandb"]
+  nnodes: 1
+  n_gpus_per_node: 4
+  log_val_generations: 5
+  val_before_train: true
+  default_local_dir: ./outputs/${trainer.project_name}/${trainer.experiment_name}
+  validation_data_dir: ${trainer.default_local_dir}/validation/
+
+ray_kwargs:
+  ray_init:
+    num_cpus: ${oc.decode:${oc.env:SLURM_CPUS_PER_TASK,null}}
+  timeline_json_file: null

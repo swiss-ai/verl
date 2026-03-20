@@ -775,6 +775,18 @@ class RayPPOTrainer:
                     active_mask[prompt_idx] = False
                     prompts_completed_early += 1
 
+        # Prompts still active after all rounds are exactly those that hit max_rounds
+        # without satisfying the early-finalization constraints.
+        active_at_max_rounds = np.where(active_mask)[0] if rounds_executed >= max_rounds else np.array([], dtype=int)
+        active_unmet_min_positive = 0
+        active_unmet_min_negative = 0
+        for prompt_idx in active_at_max_rounds:
+            prompt_state = prompt_states[int(prompt_idx)]
+            if prompt_state["pos"] < min_positive_samples:
+                active_unmet_min_positive += 1
+            if prompt_state["neg"] < min_negative_samples:
+                active_unmet_min_negative += 1
+
         # Finalize unresolved prompts with the best available balanced subset.
         for prompt_state in prompt_states:
             if prompt_state["finalized"]:
@@ -844,6 +856,8 @@ class RayPPOTrainer:
             "adaptive_group_sampling/rollouts_per_prompt_max": float(np.max(rollouts_per_prompt)),
             "adaptive_group_sampling/rounds_executed": float(rounds_executed),
             "adaptive_group_sampling/prompts_not_completed_in_rounds": float(num_prompts - prompts_completed_early),
+            "adaptive_group_sampling/max_rounds_unmet_pos_min": float(active_unmet_min_positive),
+            "adaptive_group_sampling/max_rounds_unmet_neg_min": float(active_unmet_min_negative),
             # NOTE: this is computed with all rollouts, while critic/rewards/mean only sees the selected rollouts
             "adaptive_group_sampling/pass_rate_mean": float(np.mean(pass_rates)),
             "adaptive_group_sampling/selected_positive_per_prompt_mean": float(np.mean(selected_pos_arr)),

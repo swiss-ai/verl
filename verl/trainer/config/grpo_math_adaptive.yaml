@@ -1,0 +1,14 @@
+defaults:
+  - grpo_math_base
+  - _self_
+
+algorithm:
+  adaptive_group_sampling:
+    enable: true
+    min_positive_samples: 1
+    min_negative_samples: 1
+    max_rounds: 8
+    rollouts_per_round: 4
+    positive_threshold: 0.5
+trainer:
+  experiment_name: GRPO-Ada
