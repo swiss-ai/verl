@@ -843,14 +843,9 @@ class RayPPOTrainer:
             "adaptive_group_sampling/rollouts_per_prompt_min": float(np.min(rollouts_per_prompt)),
             "adaptive_group_sampling/rollouts_per_prompt_max": float(np.max(rollouts_per_prompt)),
             "adaptive_group_sampling/rounds_executed": float(rounds_executed),
-            "adaptive_group_sampling/prompts_completed_early": float(prompts_completed_early),
             "adaptive_group_sampling/prompts_not_completed_in_rounds": float(num_prompts - prompts_completed_early),
+            # NOTE: this is computed with all rollouts, while critic/rewards/mean only sees the selected rollouts
             "adaptive_group_sampling/pass_rate_mean": float(np.mean(pass_rates)),
-            "adaptive_group_sampling/pass_rate_min": float(np.min(pass_rates)),
-            "adaptive_group_sampling/pass_rate_max": float(np.max(pass_rates)),
-            "adaptive_group_sampling/weight_mean": float(np.mean(weights)),
-            "adaptive_group_sampling/weight_min": float(np.min(weights)),
-            "adaptive_group_sampling/weight_max": float(np.max(weights)),
             "adaptive_group_sampling/selected_positive_per_prompt_mean": float(np.mean(selected_pos_arr)),
             "adaptive_group_sampling/selected_negative_per_prompt_mean": float(np.mean(selected_neg_arr)),
             "adaptive_group_sampling/selected_positive_ratio_mean": float(
@@ -1927,9 +1922,6 @@ class RayPPOTrainer:
                             )
                             batch.batch["advantages"] = advantages
                             batch.batch["returns"] = returns
-                            metrics["adaptive_group_sampling/adv_weight_mean"] = adaptive_weights.mean().item()
-                            metrics["adaptive_group_sampling/adv_weight_min"] = adaptive_weights.min().item()
-                            metrics["adaptive_group_sampling/adv_weight_max"] = adaptive_weights.max().item()
                         else:
                             batch = compute_advantage(
                                 batch,
