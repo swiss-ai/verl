@@ -1,0 +1,10 @@
+defaults:
+  - grpo_math_base
+  - _self_
+
+algorithm:
+  adv_estimator: f_grpo
+  fgrpo_gamma: 1.0  # F-GRPO focal exponent gamma. Larger gamma increases downweighting of easy prompts.
+
+trainer:
+  experiment_name: F-GRPO

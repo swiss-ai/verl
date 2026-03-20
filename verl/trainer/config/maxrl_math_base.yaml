@@ -1,0 +1,9 @@
+defaults:
+  - grpo_math_base
+  - _self_
+
+algorithm:
+  adv_estimator: maxrl
+
+trainer:
+  experiment_name: MAXRL

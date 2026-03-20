@@ -9,7 +9,7 @@ algorithm:
 data:
   train_files: ./data/math/train.parquet
   val_files: ./data/math/test.parquet
-  train_batch_size: 1024
+  train_batch_size: 256
   max_prompt_length: 1024
   max_response_length: 2048
   truncation: left
@@ -26,13 +26,13 @@ actor_rollout_ref:
       attn_implementation: flash_attention_3
 
   actor:
-    ppo_mini_batch_size: 256
+    ppo_mini_batch_size: 64
     ppo_micro_batch_size_per_gpu: 16
     optim:
       optimizer: _AdamW
-      lr: 2e-6
-      weight_decay: 0.1
-      clip_grad: 2.0
+      lr: 1e-6
+      weight_decay: 0.01
+      clip_grad: 1.0
       optimizer_impl: torchao.optim
       override_optimizer_config:
         bf16_stochastic_round: true
@@ -55,7 +55,7 @@ actor_rollout_ref:
     shuffle: true
 
   rollout:
-    gpu_memory_utilization: 0.35
+    gpu_memory_utilization: 0.4
     log_prob_micro_batch_size_per_gpu: 16
     tensor_model_parallel_size: 1
     n: 4
@@ -67,10 +67,15 @@ actor_rollout_ref:
     free_cache_engine: true
     enforce_eager: false
     load_format: safetensors
+    val_kwargs:
+      do_sample: True
+      n: 16
+      top_p: 0.95
+      temperature: 0.6
 
 trainer:
   total_epochs: 1000
-  total_training_steps: 300
+  total_training_steps: 500
   save_freq: -1
   test_freq: 20
   max_actor_ckpt_to_keep: null
