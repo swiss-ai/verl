@@ -521,6 +521,14 @@ class AgentLoopWorker:
     async def _agent_loop_postprocess(self, output, **kwargs) -> _InternalAgentLoopOutput:
         """Perform post-processing operations on the output of each individual agent loop."""
         output.extra_fields["raw_prompt"] = kwargs["raw_prompt"]
+        prompt_max_len = self.config.actor_rollout_ref.rollout.prompt_length
+        response_max_len = self.config.actor_rollout_ref.rollout.response_length
+
+        prompt_ids = output.prompt_ids[-prompt_max_len:]
+        response_ids = output.response_ids[:response_max_len]
+        response_mask = output.response_mask[:response_max_len]
+        if output.response_logprobs is not None:
+            output.response_logprobs = output.response_logprobs[:response_max_len]
 
         # Some AgentLoop may have already computed the reward score, e.g SWE-agent.
 
@@ -545,9 +553,9 @@ class AgentLoopWorker:
         # TODO(wuxibin): remove padding and use tensordict.
         self.tokenizer.padding_side = "left"
         prompt_output = self.tokenizer.pad(
-            {"input_ids": output.prompt_ids},
+            {"input_ids": prompt_ids},
             padding="max_length",
-            max_length=self.config.actor_rollout_ref.rollout.prompt_length,
+            max_length=prompt_max_len,
             return_tensors="pt",
             return_attention_mask=True,
         )
@@ -557,9 +565,9 @@ class AgentLoopWorker:
 
         self.tokenizer.padding_side = "right"
         response_output = self.tokenizer.pad(
-            {"input_ids": output.response_ids},
+            {"input_ids": response_ids},
             padding="max_length",
-            max_length=self.config.actor_rollout_ref.rollout.response_length,
+            max_length=response_max_len,
             return_tensors="pt",
             return_attention_mask=True,
         )
@@ -568,9 +576,9 @@ class AgentLoopWorker:
             response_output["attention_mask"] = response_output["attention_mask"].unsqueeze(0)
 
         response_mask_output = self.tokenizer.pad(
-            {"input_ids": output.response_mask},
+            {"input_ids": response_mask},
             padding="max_length",
-            max_length=self.config.actor_rollout_ref.rollout.response_length,
+            max_length=response_max_len,
             return_tensors="pt",
             return_attention_mask=False,
         )
@@ -579,7 +587,7 @@ class AgentLoopWorker:
 
         response_logprobs = None
         if output.response_logprobs is not None:
-            pad_size = self.config.actor_rollout_ref.rollout.response_length - len(output.response_logprobs)
+            pad_size = response_max_len - len(output.response_logprobs)
             response_logprobs = torch.tensor(output.response_logprobs + [0.0] * pad_size).unsqueeze(0)
 
         response_mask = response_mask_output["input_ids"] * response_output["attention_mask"]
@@ -599,7 +607,7 @@ class AgentLoopWorker:
             routed_experts = torch.zeros(1, total_length, layer_num, topk_num, dtype=experts_tensor.dtype)
 
             # Calculate start position: left padding means original prompt starts at the end
-            start_pos = prompt_output["input_ids"].shape[1] - len(output.prompt_ids)
+            start_pos = prompt_output["input_ids"].shape[1] - len(prompt_ids)
             end_pos = min(start_pos + length, total_length)
 
             # Add boundary checks for robustness
