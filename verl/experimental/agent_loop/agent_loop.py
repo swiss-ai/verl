@@ -529,6 +529,19 @@ class AgentLoopWorker:
         response_mask = output.response_mask[:response_max_len]
         if output.response_logprobs is not None:
             output.response_logprobs = output.response_logprobs[:response_max_len]
+        if isinstance(prompt_ids, torch.Tensor | np.ndarray):
+            prompt_ids = prompt_ids.tolist()
+        if isinstance(response_ids, torch.Tensor | np.ndarray):
+            response_ids = response_ids.tolist()
+        if isinstance(response_mask, torch.Tensor | np.ndarray):
+            response_mask = response_mask.tolist()
+        if len(response_ids) == 0:
+            logger.warning(
+                "Degenerate rollout sample with empty response_ids detected "
+                "(uid=%s, num_turns=%s). Padding-only response will be produced.",
+                kwargs.get("uid", "unknown"),
+                output.num_turns,
+            )
 
         # Some AgentLoop may have already computed the reward score, e.g SWE-agent.
 
@@ -553,37 +566,29 @@ class AgentLoopWorker:
         # TODO(wuxibin): remove padding and use tensordict.
         self.tokenizer.padding_side = "left"
         prompt_output = self.tokenizer.pad(
-            {"input_ids": prompt_ids},
+            {"input_ids": [prompt_ids]},
             padding="max_length",
             max_length=prompt_max_len,
             return_tensors="pt",
             return_attention_mask=True,
         )
-        if prompt_output["input_ids"].dim() == 1:
-            prompt_output["input_ids"] = prompt_output["input_ids"].unsqueeze(0)
-            prompt_output["attention_mask"] = prompt_output["attention_mask"].unsqueeze(0)
 
         self.tokenizer.padding_side = "right"
         response_output = self.tokenizer.pad(
-            {"input_ids": response_ids},
+            {"input_ids": [response_ids]},
             padding="max_length",
             max_length=response_max_len,
             return_tensors="pt",
             return_attention_mask=True,
         )
-        if response_output["input_ids"].dim() == 1:
-            response_output["input_ids"] = response_output["input_ids"].unsqueeze(0)
-            response_output["attention_mask"] = response_output["attention_mask"].unsqueeze(0)
 
         response_mask_output = self.tokenizer.pad(
-            {"input_ids": response_mask},
+            {"input_ids": [response_mask]},
             padding="max_length",
             max_length=response_max_len,
             return_tensors="pt",
             return_attention_mask=False,
         )
-        if response_mask_output["input_ids"].dim() == 1:
-            response_mask_output["input_ids"] = response_mask_output["input_ids"].unsqueeze(0)
 
         response_logprobs = None
         if output.response_logprobs is not None:
