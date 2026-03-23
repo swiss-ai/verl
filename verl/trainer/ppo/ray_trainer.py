@@ -557,35 +557,32 @@ class RayPPOTrainer:
 
     
     def _get_adaptive_group_sampling_config(self) -> dict[str, Any]:
-        """Resolve adaptive group sampling config with backward-compatible key support."""
-        algo_cfg = self.config.algorithm
-        adaptive_cfg = algo_cfg.get("adaptive_group_sampling", None)
-
-        legacy_enable = bool(algo_cfg.get("multiround_adaptive_downsampling", False))
-        adaptive_enable = bool(adaptive_cfg.get("enable", False)) if adaptive_cfg is not None else False
-        enable = adaptive_enable or legacy_enable
-
-        def _read_int(field: str, legacy_field: str, default: int) -> int:
-            if adaptive_cfg is not None and adaptive_cfg.get(field, None) is not None:
-                return int(adaptive_cfg.get(field))
-            if algo_cfg.get(legacy_field, None) is not None:
-                return int(algo_cfg.get(legacy_field))
-            return int(default)
-
-        def _read_float(field: str, legacy_field: str, default: float) -> float:
-            if adaptive_cfg is not None and adaptive_cfg.get(field, None) is not None:
-                return float(adaptive_cfg.get(field))
-            if algo_cfg.get(legacy_field, None) is not None:
-                return float(algo_cfg.get(legacy_field))
-            return float(default)
+        """Resolve adaptive group sampling config from algorithm.adaptive_group_sampling."""
+        adaptive_cfg = self.config.algorithm.get("adaptive_group_sampling", None) or {}
+        required_fields = (
+            "enable",
+            "min_positive_samples",
+            "min_negative_samples",
+            "max_rounds",
+            "rollouts_per_round",
+            "positive_threshold",
+            "apply_inverse_pass_rate_weight",
+        )
+        missing_fields = [field for field in required_fields if adaptive_cfg.get(field, None) is None]
+        if missing_fields:
+            raise KeyError(
+                "Missing required adaptive_group_sampling config field(s): "
+                f"{', '.join(missing_fields)}."
+            )
 
         return {
-            "enable": enable,
-            "min_positive_samples": _read_int("min_positive_samples", "n_pos", 1),
-            "min_negative_samples": _read_int("min_negative_samples", "n_neg", 1),
-            "max_rounds": _read_int("max_rounds", "max_rounds", 1),
-            "rollouts_per_round": _read_int("rollouts_per_round", "n_per_round", 1),
-            "positive_threshold": _read_float("positive_threshold", "positive_threshold", 0.0),
+            "enable": bool(adaptive_cfg["enable"]),
+            "min_positive_samples": int(adaptive_cfg["min_positive_samples"]),
+            "min_negative_samples": int(adaptive_cfg["min_negative_samples"]),
+            "max_rounds": int(adaptive_cfg["max_rounds"]),
+            "rollouts_per_round": int(adaptive_cfg["rollouts_per_round"]),
+            "positive_threshold": float(adaptive_cfg["positive_threshold"]),
+            "apply_inverse_pass_rate_weight": bool(adaptive_cfg["apply_inverse_pass_rate_weight"]),
         }
 
 
@@ -1933,6 +1930,9 @@ class RayPPOTrainer:
                                 group_std=batch.batch["adaptive_group_std"],
                                 group_pass_rate=batch.batch["adaptive_group_pass_rate"],
                                 norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                                apply_inverse_pass_rate_weight=adaptive_group_sampling_cfg[
+                                    "apply_inverse_pass_rate_weight"
+                                ],
                             )
                             batch.batch["advantages"] = advantages
                             batch.batch["returns"] = returns

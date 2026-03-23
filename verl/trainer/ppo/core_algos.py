@@ -408,6 +408,7 @@ def compute_adaptive_grpo_outcome_advantage(
     group_pass_rate: torch.Tensor,
     epsilon: float = 1e-6,
     norm_adv_by_std_in_grpo: bool = True,
+    apply_inverse_pass_rate_weight: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute GRPO outcome advantages using provided group statistics computed with adaptive group size.
     NOTE: to compensate for the downsampling, we scale the advantage by 1/p, where p is the pass rate of the group. If the pass rate is zero, we use weight 1 by design.
@@ -420,6 +421,7 @@ def compute_adaptive_grpo_outcome_advantage(
         group_pass_rate: pass rate for each group, shape (num_groups,)
         epsilon: small value to avoid division by zero
         norm_adv_by_std_in_grpo: whether to normalize advantage by std within group
+        apply_inverse_pass_rate_weight: whether to scale each sample's advantage by 1 / pass_rate
     """
     with torch.no_grad():
         scores = token_level_rewards.sum(dim=-1)
@@ -433,8 +435,11 @@ def compute_adaptive_grpo_outcome_advantage(
         else:
             scalar_advantages = scores - group_mean
 
-        # Scale the advantage by 1/p to upweight prompts with low pass rate.
-        adaptive_weights = torch.where(group_pass_rate > 0, 1.0 / group_pass_rate, torch.ones_like(group_pass_rate))
+        # Optionally scale by 1/p to upweight prompts with low pass-rate.
+        if apply_inverse_pass_rate_weight:
+            adaptive_weights = torch.where(group_pass_rate > 0, 1.0 / group_pass_rate, torch.ones_like(group_pass_rate))
+        else:
+            adaptive_weights = torch.ones_like(group_pass_rate)
         scalar_advantages = scalar_advantages * adaptive_weights
 
         advantages = scalar_advantages.unsqueeze(-1) * response_mask

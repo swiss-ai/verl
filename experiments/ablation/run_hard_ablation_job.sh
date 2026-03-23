@@ -11,7 +11,7 @@
 
 set -xeuo pipefail
 
-WORKING_DIR="${WORKING_DIR:-/capstor/scratch/cscs/msantelmo/inverse_batch}"
+WORKING_DIR="${WORKING_DIR:-/capstor/scratch/cscs/msantelmo/inverse_batch/verl}"
 cd "${WORKING_DIR}"
 
 ALGO="${ALGO:-grpo}" # grpo|maxrl|f_grpo|rl_ada
@@ -29,6 +29,7 @@ ROUND_SAMPLES="${ROUND_SAMPLES:-2}"
 MAX_ROUNDS="${MAX_ROUNDS:-8}"
 MIN_POS="${MIN_POS:-1}"
 MIN_NEG="${MIN_NEG:-1}"
+APPLY_INV_PASS_RATE_WEIGHT="${APPLY_INV_PASS_RATE_WEIGHT:-true}"
 
 REPEAT_IDX="${REPEAT_IDX:-1}"
 SEED="${SEED:-42}"
@@ -55,11 +56,6 @@ build_overrides() {
     "actor_rollout_ref.model.path=${MODEL_NAME_OR_PATH}"
     "data.train_files=['${TRAIN_FILE}']"
     "data.val_files=['${TEST_FILE}']"
-    "algorithm.use_kl_in_reward=false"
-    "actor_rollout_ref.actor.use_kl_loss=false"
-    "algorithm.norm_adv_by_std_in_grpo=false"
-    "algorithm.filter_groups.enable=false"
-    "algorithm.rollout_correction.rollout_rs=null"
     "trainer.project_name=${PROJECT_NAME}"
     "trainer.experiment_name=${RUN_NAME}"
     "trainer.default_local_dir=${RUN_DIR}"
@@ -71,12 +67,13 @@ build_overrides() {
 
   if [ "${ALGO}" = "rl_ada" ]; then
     overrides+=(
-      "actor_rollout_ref.rollout.n=${ROUND_SAMPLES}"
+      "actor_rollout_ref.rollout.n=${ROLLOUT_N}"
       "algorithm.adaptive_group_sampling.enable=true"
       "algorithm.adaptive_group_sampling.rollouts_per_round=${ROUND_SAMPLES}"
       "algorithm.adaptive_group_sampling.max_rounds=${MAX_ROUNDS}"
       "algorithm.adaptive_group_sampling.min_positive_samples=${MIN_POS}"
       "algorithm.adaptive_group_sampling.min_negative_samples=${MIN_NEG}"
+      "algorithm.adaptive_group_sampling.apply_inverse_pass_rate_weight=${APPLY_INV_PASS_RATE_WEIGHT}"
     )
   else
     overrides+=(
@@ -110,7 +107,7 @@ case "${ALGO}" in
     ;;
   rl_ada)
     CONFIG_NAME="grpo_math_adaptive"
-    BUDGET_TAG="${ROUND_SAMPLES}x${MAX_ROUNDS}_${MIN_POS}-${MIN_NEG}"
+    BUDGET_TAG="${ROUND_SAMPLES}x${MAX_ROUNDS}_${MIN_POS}-${MIN_NEG}_k${ROLLOUT_N}_w${APPLY_INV_PASS_RATE_WEIGHT}"
     ;;
   *)
     echo "Unsupported ALGO=${ALGO}. Use grpo|maxrl|f_grpo|rl_ada"
@@ -118,12 +115,17 @@ case "${ALGO}" in
     ;;
 esac
 
+# Shared HuggingFace cache (prevents repeated downloads across runs/workers).
+export HF_HOME="${HF_HOME:-/capstor/scratch/cscs/msantelmo/huggingface}"
+export HF_HUB_CACHE="${HF_HUB_CACHE:-${HF_HUB_CACHE_DIR:-${HF_HOME}/hub}}"
+export HF_HUB_OFFLINE="1"
+export TRANSFORMERS_OFFLINE="1"
+
 resolve_run_name
 
 export WANDB_RUN_GROUP="${WANDB_RUN_GROUP:-${DATASET_TAG}}"
 export WANDB_NAME="${RUN_NAME}"
 
-cd verl
 pip install --no-deps --no-cache-dir --force-reinstall -e .
 
 build_overrides

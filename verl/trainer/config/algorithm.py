@@ -73,6 +73,7 @@ class AdaptiveGroupSamplingConfig(BaseConfig):
         max_rounds (int): Maximum number of sampling rounds.
         rollouts_per_round (int): Number of rollouts sampled per active prompt each round.
         positive_threshold (float): A rollout is positive when sequence reward > positive_threshold.
+        apply_inverse_pass_rate_weight (bool): Whether to scale adaptive GRPO advantages by 1 / pass_rate.
     """
 
     enable: bool = False
@@ -81,6 +82,7 @@ class AdaptiveGroupSamplingConfig(BaseConfig):
     max_rounds: int = 1
     rollouts_per_round: int = 1
     positive_threshold: float = 0.0
+    apply_inverse_pass_rate_weight: bool = True
 
 
 @dataclass
