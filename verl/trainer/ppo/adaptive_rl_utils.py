@@ -69,6 +69,28 @@ def prune_prompt_caches(prompt_state: dict[str, Any], target_rollouts: int) -> N
         prompt_state["negative_cache"] = prompt_state["negative_cache"][:max_neg_to_keep]
 
 
+def finalize_prompt_rollouts_keep_all(prompt_state: dict[str, Any]) -> None:
+    """Finalize one prompt cache by keeping all cached samples.
+
+    This is used when adaptive_group_sampling.apply_downsampling=False.
+    In that mode we intentionally keep every cached rollout so the actor/critic update
+    can consume a variable number of samples per prompt.
+    """
+    # Preserve deterministic ordering: positives first then negatives, matching cache append order.
+    selected = prompt_state["positive_cache"] + prompt_state["negative_cache"]
+
+    if not selected:
+        raise ValueError("Unable to finalize keep-all rollouts: prompt cache is empty.")
+
+    selected_pos = sum(1 for entry in selected if entry["is_positive"])
+    selected_neg = len(selected) - selected_pos
+
+    prompt_state["selected"] = selected
+    prompt_state["selected_pos"] = selected_pos
+    prompt_state["selected_neg"] = selected_neg
+    prompt_state["finalized"] = True
+
+
 def finalize_prompt_rollouts(prompt_state: dict[str, Any], target_rollouts: int) -> None:
     """Finalize one prompt cache into exactly target_rollouts selected samples."""
     selected, selected_pos, selected_neg = select_balanced_rollout_entries(

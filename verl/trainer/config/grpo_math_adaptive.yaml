@@ -10,5 +10,6 @@ algorithm:
     max_rounds: 8
     rollouts_per_round: 4
     positive_threshold: 0.5
+    apply_downsampling: true
 trainer:
   experiment_name: GRPO-Ada

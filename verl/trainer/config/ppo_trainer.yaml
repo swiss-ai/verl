@@ -139,6 +139,10 @@ algorithm:
     # A rollout is positive when sequence reward > positive_threshold
     positive_threshold: 0.5
 
+    # Whether to downsample adaptive prompt rollouts to actor_rollout_ref.rollout.n
+    # If false, keep all collected rollouts (variable samples per prompt / per step)
+    apply_downsampling: True
+
     # Whether to scale adaptive GRPO advantages by inverse pass-rate (1 / p)
     apply_inverse_pass_rate_weight: True
 

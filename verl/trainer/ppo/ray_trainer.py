@@ -44,6 +44,7 @@ from verl.trainer.config import AlgoConfig
 from verl.trainer.ppo.adaptive_rl_utils import (
     extract_reward_extra_info_row,
     finalize_prompt_rollouts,
+    finalize_prompt_rollouts_keep_all,
     prune_prompt_caches,
 )
 from verl.trainer.ppo import core_algos
@@ -566,6 +567,7 @@ class RayPPOTrainer:
             "max_rounds",
             "rollouts_per_round",
             "positive_threshold",
+            "apply_downsampling",
             "apply_inverse_pass_rate_weight",
         )
         missing_fields = [field for field in required_fields if adaptive_cfg.get(field, None) is None]
@@ -582,6 +584,7 @@ class RayPPOTrainer:
             "max_rounds": int(adaptive_cfg["max_rounds"]),
             "rollouts_per_round": int(adaptive_cfg["rollouts_per_round"]),
             "positive_threshold": float(adaptive_cfg["positive_threshold"]),
+            "apply_downsampling": bool(adaptive_cfg["apply_downsampling"]),
             "apply_inverse_pass_rate_weight": bool(adaptive_cfg["apply_inverse_pass_rate_weight"]),
         }
 
@@ -603,6 +606,7 @@ class RayPPOTrainer:
         min_negative_samples = adaptive_cfg["min_negative_samples"]
         max_rounds = adaptive_cfg["max_rounds"]
         rollouts_per_round = adaptive_cfg["rollouts_per_round"]
+        apply_downsampling = adaptive_cfg["apply_downsampling"]
 
         if min_positive_samples < 0 or min_negative_samples < 0:
             raise ValueError("Adaptive group sampling requires non-negative min_positive_samples/min_negative_samples.")
@@ -610,6 +614,8 @@ class RayPPOTrainer:
             raise ValueError("Adaptive group sampling requires max_rounds > 0.")
         if rollouts_per_round <= 0:
             raise ValueError("Adaptive group sampling requires rollouts_per_round > 0.")
+        if not isinstance(apply_downsampling, bool):
+            raise ValueError("Adaptive group sampling requires apply_downsampling to be a boolean.")
 
         target_rollouts = int(self.config.actor_rollout_ref.rollout.n)
         if max_rounds * rollouts_per_round < target_rollouts:
@@ -627,31 +633,35 @@ class RayPPOTrainer:
         curr_step_profile: bool,
         timing_raw: dict[str, float],
     ) -> tuple[DataProto, dict[str, list[Any]], dict[str, float]]:
-        """Generate adaptive group rollouts, then downsample to fixed-size per prompt."""
+        """Generate adaptive-group rollouts and build the training batch."""
         target_rollouts = int(self.config.actor_rollout_ref.rollout.n)
         rollouts_per_round = int(adaptive_cfg["rollouts_per_round"])
         max_rounds = int(adaptive_cfg["max_rounds"])
         min_positive_samples = int(adaptive_cfg["min_positive_samples"])
         min_negative_samples = int(adaptive_cfg["min_negative_samples"])
         positive_threshold = float(adaptive_cfg["positive_threshold"])
+        apply_downsampling = bool(adaptive_cfg["apply_downsampling"])
 
         num_prompts = len(batch)
         prompt_uids = [str(uid) for uid in batch.non_tensor_batch["uid"].tolist()]
         if len(set(prompt_uids)) != num_prompts:
             raise ValueError("Adaptive group sampling requires unique prompt uids per prompt.")
-        # Route sampled rollouts back to prompt states by uid (instead of relying on positional layout).
+        # Route sampled rollouts back to prompt states by uid
         prompt_uid_to_idx = {uid: idx for idx, uid in enumerate(prompt_uids)}
         prompt_states: list[dict[str, Any]] = []
         for _ in range(num_prompts):
             prompt_states.append(
                 {
+                    # Running counts/statistics computed with ALL sampled rollouts
                     "total": 0,
                     "pos": 0,
                     "neg": 0,
                     "sum": 0.0,
                     "sumsq": 0.0,
+                    # Per-class cached rollout payloads used during final selection
                     "positive_cache": [],
                     "negative_cache": [],
+                    # Final payloads that will be concatenated into the training DataProto
                     "selected": [],
                     "selected_pos": 0,
                     "selected_neg": 0,
@@ -659,12 +669,12 @@ class RayPPOTrainer:
                 }
             )
 
+        # Prompt is active while it still needs additional sampled rollouts
         active_mask = np.ones(num_prompts, dtype=bool)
         prompts_completed_early = 0
         rounds_executed = 0
 
         for i in range(max_rounds):
-            # print progress and number of active prompts for this round
             print(
                 f"[Adaptive Sampling] Round {i+1}/{max_rounds} - Executing rollouts for active prompts ({active_mask.sum()})"
             )
@@ -680,7 +690,7 @@ class RayPPOTrainer:
             round_prompt_batch = active_prompt_batch.repeat(repeat_times=rollouts_per_round, interleave=True)
             round_gen_batch = active_gen_batch.repeat(repeat_times=rollouts_per_round, interleave=True)
             round_gen_batch.meta_info["global_steps"] = self.global_steps
-            # Generation backends split the batch across workers/ranks, so make the batch divisible.
+            # Rollout backend requires divisibility by worker/rank split factor
             size_divisor = (
                 self.actor_rollout_wg.world_size
                 if not self.async_rollout_mode
@@ -703,9 +713,10 @@ class RayPPOTrainer:
                 timing_raw[key] = timing_raw.get(key, 0.0) + value
             round_gen_output.meta_info.pop("timing", None)
 
+            # Union prompt tensors and generated response tensors for reward computation
             round_batch = round_prompt_batch.union(round_gen_output)
 
-            # Reward path mirrors regular trainer logic, but done round-by-round.
+            # Reward path mirrors regular trainer logic, but done round-by-round
             if self.use_rm and "rm_scores" not in round_batch.batch.keys():
                 if not self.use_reward_loop:
                     round_rm_scores = self.rm_wg.compute_rm_score(round_batch)
@@ -743,6 +754,7 @@ class RayPPOTrainer:
                 else:
                     prompt_state["neg"] += 1
 
+                # Build one-sample DataProto payload to keep only what PPO update needs
                 sample = round_batch.select_idxs([sample_idx])
                 sample.batch["token_level_scores"] = round_reward_tensor[sample_idx : sample_idx + 1]
                 sample_extra = extract_reward_extra_info_row(
@@ -758,8 +770,12 @@ class RayPPOTrainer:
                     prompt_state["positive_cache"].append(sample_entry)
                 else:
                     prompt_state["negative_cache"].append(sample_entry)
-                prune_prompt_caches(prompt_state, target_rollouts=target_rollouts)
 
+                # Prune cached samples when downsampling is ON
+                if apply_downsampling:
+                    prune_prompt_caches(prompt_state, target_rollouts=target_rollouts)
+
+            # Prompt-level stopping/finalization check after processing current round
             for prompt_idx in active_indices:
                 prompt_state = prompt_states[prompt_idx]
                 if prompt_state["finalized"]:
@@ -768,7 +784,10 @@ class RayPPOTrainer:
                     prompt_state["pos"] >= min_positive_samples and prompt_state["neg"] >= min_negative_samples
                 )
                 if meets_class_criteria and prompt_state["total"] >= target_rollouts:
-                    finalize_prompt_rollouts(prompt_state, target_rollouts=target_rollouts)
+                    if apply_downsampling:
+                        finalize_prompt_rollouts(prompt_state, target_rollouts=target_rollouts)
+                    else:
+                        finalize_prompt_rollouts_keep_all(prompt_state)
                     active_mask[prompt_idx] = False
                     prompts_completed_early += 1
 
@@ -793,17 +812,20 @@ class RayPPOTrainer:
                     f"Prompt sampled only {prompt_state['total']} rollouts; expected at least {target_rollouts}. "
                     "Please increase max_rounds or rollouts_per_round."
                 )
-            finalize_prompt_rollouts(prompt_state, target_rollouts=target_rollouts)
+            if apply_downsampling:
+                finalize_prompt_rollouts(prompt_state, target_rollouts=target_rollouts)
+            else:
+                finalize_prompt_rollouts_keep_all(prompt_state)
 
         # Keep rollout KV cache between rounds and sleep only once after adaptive sampling.
         if self.async_rollout_mode:
             self.checkpoint_manager.sleep_replicas()
 
+        # Materialize selected samples and attach per-prompt statistics
         selected_samples: list[DataProto] = []
         reward_extra_infos_dict: dict[str, list[Any]] = defaultdict(list)
         rollouts_per_prompt = []
         pass_rates = []
-        weights = []
         selected_pos = []
         selected_neg = []
 
@@ -813,11 +835,9 @@ class RayPPOTrainer:
             var = max(float(prompt_state["sumsq"] / total - mean * mean), 0.0)
             std = float(var**0.5)
             pass_rate = float(prompt_state["pos"] / total)
-            weight = float(1.0 / pass_rate) if pass_rate > 0 else 1.0
 
             rollouts_per_prompt.append(total)
             pass_rates.append(pass_rate)
-            weights.append(weight)
             selected_pos.append(int(prompt_state["selected_pos"]))
             selected_neg.append(int(prompt_state["selected_neg"]))
 
@@ -830,17 +850,28 @@ class RayPPOTrainer:
                 sample.batch["adaptive_group_pass_rate"] = torch.tensor(
                     [pass_rate], dtype=score_dtype, device=score_device
                 )
-                sample.batch["adaptive_group_weight"] = torch.tensor([weight], dtype=score_dtype, device=score_device)
                 selected_samples.append(sample)
                 for key, value in entry["extra"].items():
                     reward_extra_infos_dict[key].append(value)
 
-        expected_batch_size = num_prompts * target_rollouts
-        if len(selected_samples) != expected_batch_size:
-            raise ValueError(
-                f"Adaptive group sampling built {len(selected_samples)} selected samples, "
-                f"expected {expected_batch_size}."
-            )
+        if apply_downsampling:
+            expected_batch_size = num_prompts * target_rollouts
+            if len(selected_samples) != expected_batch_size:
+                raise ValueError(
+                    f"Adaptive group sampling built {len(selected_samples)} selected samples, "
+                    f"expected {expected_batch_size}."
+                )
+        else:
+            if len(selected_samples) == 0:
+                raise ValueError("Adaptive keep-all sampling produced zero selected samples.")
+            for prompt_idx, prompt_state in enumerate(prompt_states):
+                selected_count = len(prompt_state["selected"])
+                total_count = int(prompt_state["total"])
+                if selected_count != total_count:
+                    raise ValueError(
+                        "Adaptive keep-all sampling invariant violated: "
+                        f"prompt_idx={prompt_idx} selected_count={selected_count} total_count={total_count}."
+                    )
 
         selected_batch = DataProto.concat(selected_samples)
 
@@ -1414,6 +1445,13 @@ class RayPPOTrainer:
         When use_prefix_grouper is enabled, uses group-level balancing to keep samples with
         the same uid together on the same rank for prefix sharing optimization.
         """
+        # Using adaptive group size with no downsampling can produce variable number of samples per prompt.
+        # This can violate equal-size partition assumptions in balancing utilities, so we allow a
+        # graceful skip/fallback path for that specific case instead of raising and stopping training.
+        adaptive_downsampling_enabled = bool(batch.meta_info.get("adaptive_downsampling_enabled", True))
+        allow_uneven_adaptive_batch = not adaptive_downsampling_enabled
+        metrics.setdefault("adaptive_group_sampling/balance_skipped_due_to_variable_batch", 0.0)
+
         attention_mask = batch.batch["attention_mask"]
         batch_size = attention_mask.shape[0]
         global_seqlen_lst = batch.batch["attention_mask"].view(batch_size, -1).sum(-1)  # (train_batch_size,)
@@ -1422,46 +1460,54 @@ class RayPPOTrainer:
         # Note: world_size may include tensor/pipeline parallel dimensions, but we only want DP
         dp_size = self._get_dp_size(self.actor_rollout_wg, "actor")
 
-        # Use group-level balancing for PrefixGrouper to keep same-uid samples together
-        if getattr(self, "use_prefix_grouper", False) and "uid" in batch.non_tensor_batch:
-            from verl.utils.seqlen_balancing import get_group_balanced_partitions
+        try:
+            # Use group-level balancing for PrefixGrouper to keep same-uid samples together.
+            if getattr(self, "use_prefix_grouper", False) and "uid" in batch.non_tensor_batch:
+                from verl.utils.seqlen_balancing import get_group_balanced_partitions
 
-            uid_list = list(batch.non_tensor_batch["uid"])
-            seqlen_list = global_seqlen_lst.tolist()
+                uid_list = list(batch.non_tensor_batch["uid"])
+                seqlen_list = global_seqlen_lst.tolist()
 
-            # Count number of uid groups
-            num_groups = len(set(uid_list))
+                # Count number of uid groups
+                num_groups = len(set(uid_list))
 
-            if num_groups % dp_size != 0:
-                raise ValueError(
-                    f"PrefixGrouper with balance_batch requires num_uid_groups ({num_groups}) "
-                    f"% dp_size ({dp_size}) == 0. "
-                    f"This ensures each rank gets equal number of groups. "
-                    f"Current batch_size={batch_size}, adjust batch_size to be a multiple of "
-                    f"dp_size * rollout.n."
-                )
+                if num_groups % dp_size != 0:
+                    raise ValueError(
+                        f"PrefixGrouper with balance_batch requires num_uid_groups ({num_groups}) "
+                        f"% dp_size ({dp_size}) == 0. "
+                        f"This ensures each rank gets equal number of groups. "
+                        f"Current batch_size={batch_size}, adjust batch_size to be a multiple of "
+                        f"dp_size * rollout.n."
+                    )
 
-            global_partition_lst = get_group_balanced_partitions(
-                seqlen_list=seqlen_list,
-                uid_list=uid_list,
-                k_partitions=dp_size,
-            )
-
-        elif keep_minibatch:
-            # Decouple the DP balancing and mini-batching.
-            minibatch_size = self.config.actor_rollout_ref.actor.get("ppo_mini_batch_size")
-            minibatch_num = len(workload_lst) // minibatch_size
-            global_partition_lst = [[] for _ in range(dp_size)]
-            for i in range(minibatch_num):
-                rearrange_minibatch_lst = get_seqlen_balanced_partitions(
-                    workload_lst[i * minibatch_size : (i + 1) * minibatch_size],
+                global_partition_lst = get_group_balanced_partitions(
+                    seqlen_list=seqlen_list,
+                    uid_list=uid_list,
                     k_partitions=dp_size,
-                    equal_size=True,
                 )
-                for j, part in enumerate(rearrange_minibatch_lst):
-                    global_partition_lst[j].extend([x + minibatch_size * i for x in part])
-        else:
-            global_partition_lst = get_seqlen_balanced_partitions(workload_lst, k_partitions=dp_size, equal_size=True)
+
+            elif keep_minibatch:
+                # Decouple the DP balancing and mini-batching.
+                minibatch_size = self.config.actor_rollout_ref.actor.get("ppo_mini_batch_size")
+                minibatch_num = len(workload_lst) // minibatch_size
+                global_partition_lst = [[] for _ in range(dp_size)]
+                for i in range(minibatch_num):
+                    rearrange_minibatch_lst = get_seqlen_balanced_partitions(
+                        workload_lst[i * minibatch_size : (i + 1) * minibatch_size],
+                        k_partitions=dp_size,
+                        equal_size=True,
+                    )
+                    for j, part in enumerate(rearrange_minibatch_lst):
+                        global_partition_lst[j].extend([x + minibatch_size * i for x in part])
+            else:
+                global_partition_lst = get_seqlen_balanced_partitions(workload_lst, k_partitions=dp_size, equal_size=True)
+        except (AssertionError, ValueError):
+            # FIXME: implement a more robust balancing that can handle variable batch size instead of skipping balancing.
+            if allow_uneven_adaptive_batch:
+                metrics["adaptive_group_sampling/balance_skipped_due_to_variable_batch"] = 1.0
+                return
+            raise
+
         # Place smaller micro-batches at both ends to reduce the bubbles in pipeline parallel.
         # Skip reordering within partitions for PrefixGrouper to maintain uid grouping
         if not getattr(self, "use_prefix_grouper", False):
