@@ -351,6 +351,9 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
 
         # normalize config
         if self._is_actor:
+            # TODO(adaptive-keep-all): same caveat as FSDP path - this assumes rollout.n
+            # approximates train samples per prompt, which may not hold when adaptive sampling
+            # keeps all rollouts (apply_downsampling=False).
             self.config.actor.ppo_mini_batch_size *= self.config.rollout.n
             self.config.actor.ppo_mini_batch_size //= mpu.get_data_parallel_world_size()
             if self.config.actor.get("ppo_micro_batch_size", None):

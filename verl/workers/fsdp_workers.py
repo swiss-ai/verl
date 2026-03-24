@@ -238,6 +238,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # normalize config
         if self._is_actor:
+            # TODO: (adaptive-keep-all) ppo_mini_batch_size is still scaled by rollout.n.
+            # With adaptive_group_sampling.apply_downsampling=False, rollout.n is no longer
+            # the true number of training samples per prompt, so this normalization becomes a
+            # heuristic inherited from fixed-group training.
             self.config.actor.ppo_mini_batch_size *= self.config.rollout.n
             self.config.actor.ppo_mini_batch_size //= self.device_mesh.size() // self.ulysses_sequence_parallel_size
             assert self.config.actor.ppo_mini_batch_size > 0, (

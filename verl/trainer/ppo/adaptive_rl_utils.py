@@ -7,6 +7,11 @@ group sampling. It intentionally avoids trainer state and side effects.
 from typing import Any
 
 import numpy as np
+import torch
+
+from verl import DataProto
+
+ADAPTIVE_KEEP_ALL_PAD_MASK_KEY = "_adaptive_keep_all_is_pad"
 
 
 def select_balanced_rollout_entries(
@@ -105,3 +110,88 @@ def finalize_prompt_rollouts(prompt_state: dict[str, Any], target_rollouts: int)
     prompt_state["selected_pos"] = selected_pos
     prompt_state["selected_neg"] = selected_neg
     prompt_state["finalized"] = True
+
+
+def _build_padding_indices(batch_size: int, pad_size: int) -> list[int]:
+    """Build deterministic indices for DataProto padding by repeating from batch head."""
+    if pad_size <= 0:
+        return list(range(batch_size))
+    if batch_size <= 0:
+        raise ValueError("Cannot pad an empty batch.")
+    return list(range(batch_size)) + [idx % batch_size for idx in range(pad_size)]
+
+
+def _apply_padding_mask_to_response_mask(batch: DataProto, mask_key: str) -> None:
+    """Force padded samples to have zero response mask so they do not contribute to loss.
+
+    Args:
+        batch: Target batch that may contain adaptive padding rows.
+        mask_key: non-tensor key holding a boolean array aligned with dim-0.
+            Entries with ``True`` are treated as adaptive padding rows.
+    """
+    if "response_mask" not in batch.batch.keys():
+        return
+    if mask_key not in batch.non_tensor_batch:
+        return
+
+    pad_mask = np.asarray(batch.non_tensor_batch[mask_key]).astype(bool)
+    if pad_mask.shape[0] != len(batch):
+        raise ValueError(
+            f"Padding mask length mismatch: mask_len={pad_mask.shape[0]}, batch_len={len(batch)}."
+        )
+    if not np.any(pad_mask):
+        return
+
+    pad_mask_torch = torch.from_numpy(pad_mask).to(device=batch.batch["response_mask"].device, dtype=torch.bool)
+    batch.batch["response_mask"][pad_mask_torch] = 0
+
+
+def pad_adaptive_batch_to_divisor(
+    batch: DataProto,
+    size_divisor: int,
+    mask_key: str = ADAPTIVE_KEEP_ALL_PAD_MASK_KEY,
+) -> tuple[DataProto, int]:
+    """Pad adaptive batch so DP chunking can split it evenly."""
+    if size_divisor <= 0:
+        raise ValueError(f"size_divisor must be > 0, got {size_divisor}.")
+    if mask_key in batch.non_tensor_batch:
+        raise ValueError(f"Mask key '{mask_key}' already exists in non_tensor_batch.")
+
+    original_size = len(batch)
+    pad_size = (size_divisor - (original_size % size_divisor)) % size_divisor
+    if pad_size == 0:
+        return batch, 0
+
+    padded_indices = _build_padding_indices(batch_size=original_size, pad_size=pad_size)
+    padded_batch = batch.select_idxs(padded_indices)
+
+    pad_mask = np.zeros(len(padded_batch), dtype=bool)
+    pad_mask[-pad_size:] = True
+    padded_batch.non_tensor_batch[mask_key] = pad_mask
+    _apply_padding_mask_to_response_mask(padded_batch, mask_key=mask_key)
+    return padded_batch, pad_size
+
+
+def unpad_adaptive_batch(
+    batch: DataProto,
+    mask_key: str = ADAPTIVE_KEEP_ALL_PAD_MASK_KEY,
+) -> tuple[DataProto, int]:
+    """Remove adaptive padding rows from batch using stored mask."""
+    if mask_key not in batch.non_tensor_batch:
+        return batch, 0
+
+    pad_mask = np.asarray(batch.non_tensor_batch[mask_key]).astype(bool)
+    if pad_mask.shape[0] != len(batch):
+        raise ValueError(
+            f"Padding mask length mismatch: mask_len={pad_mask.shape[0]}, batch_len={len(batch)}."
+        )
+    pad_count = int(pad_mask.sum())
+
+    if pad_count == 0:
+        batch.non_tensor_batch.pop(mask_key, None)
+        return batch, 0
+
+    keep_indices = np.where(~pad_mask)[0].tolist()
+    unpadded_batch = batch.select_idxs(keep_indices)
+    unpadded_batch.non_tensor_batch.pop(mask_key, None)
+    return unpadded_batch, pad_count

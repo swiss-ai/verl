@@ -19,6 +19,7 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 
 import json
+import math
 import os
 import uuid
 from collections import defaultdict
@@ -42,10 +43,13 @@ from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup, Res
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.config import AlgoConfig
 from verl.trainer.ppo.adaptive_rl_utils import (
+    ADAPTIVE_KEEP_ALL_PAD_MASK_KEY,
     extract_reward_extra_info_row,
     finalize_prompt_rollouts,
     finalize_prompt_rollouts_keep_all,
+    pad_adaptive_batch_to_divisor as pad_adaptive_dataproto_to_divisor,
     prune_prompt_caches,
+    unpad_adaptive_batch as unpad_adaptive_dataproto_batch,
 )
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
@@ -616,9 +620,18 @@ class RayPPOTrainer:
             raise ValueError("Adaptive group sampling requires rollouts_per_round > 0.")
         if not isinstance(apply_downsampling, bool):
             raise ValueError("Adaptive group sampling requires apply_downsampling to be a boolean.")
+        if (
+            (not apply_downsampling)
+            and self.config.trainer.balance_batch
+            and bool(self.config.actor_rollout_ref.actor.get("use_prefix_grouper", False))
+        ):
+            raise ValueError(
+                "Adaptive keep-all mode (apply_downsampling=False) is currently incompatible with "
+                "balance_batch=True when use_prefix_grouper=True. Please disable one of them."
+            )
 
         target_rollouts = int(self.config.actor_rollout_ref.rollout.n)
-        if max_rounds * rollouts_per_round < target_rollouts:
+        if apply_downsampling and (max_rounds * rollouts_per_round < target_rollouts):
             raise ValueError(
                 "Adaptive group sampling requires max_rounds * rollouts_per_round >= actor_rollout_ref.rollout.n, "
                 f"but got {max_rounds} * {rollouts_per_round} < {target_rollouts}."
@@ -634,7 +647,7 @@ class RayPPOTrainer:
         timing_raw: dict[str, float],
     ) -> tuple[DataProto, dict[str, list[Any]], dict[str, float]]:
         """Generate adaptive-group rollouts and build the training batch."""
-        target_rollouts = int(self.config.actor_rollout_ref.rollout.n)
+        target_rollouts = int(self.config.actor_rollout_ref.rollout.n)  # NOTE: target_rollouts is only enforced when downsampling
         rollouts_per_round = int(adaptive_cfg["rollouts_per_round"])
         max_rounds = int(adaptive_cfg["max_rounds"])
         min_positive_samples = int(adaptive_cfg["min_positive_samples"])
@@ -783,7 +796,9 @@ class RayPPOTrainer:
                 meets_class_criteria = (
                     prompt_state["pos"] >= min_positive_samples and prompt_state["neg"] >= min_negative_samples
                 )
-                if meets_class_criteria and prompt_state["total"] >= target_rollouts:
+                if meets_class_criteria and (
+                    (apply_downsampling and prompt_state["total"] >= target_rollouts) or (not apply_downsampling)
+                ):
                     if apply_downsampling:
                         finalize_prompt_rollouts(prompt_state, target_rollouts=target_rollouts)
                     else:
@@ -807,7 +822,7 @@ class RayPPOTrainer:
         for prompt_state in prompt_states:
             if prompt_state["finalized"]:
                 continue
-            if prompt_state["total"] < target_rollouts:
+            if apply_downsampling and (prompt_state["total"] < target_rollouts):
                 raise ValueError(
                     f"Prompt sampled only {prompt_state['total']} rollouts; expected at least {target_rollouts}. "
                     "Please increase max_rounds or rollouts_per_round."
@@ -1439,19 +1454,73 @@ class RayPPOTrainer:
             dp_rank_mapping = worker_group._dispatch_info[role]
         return max(dp_rank_mapping) + 1
 
+    def _get_training_dp_divisor(self) -> int:
+        """Compute a common size divisor across actor/ref/critic DP meshes for one train step."""
+
+        def resolve_dp_size(worker_group, role_candidates: tuple[str, ...]) -> int:
+            last_error = None
+            for role in role_candidates:
+                try:
+                    return self._get_dp_size(worker_group, role)
+                except (KeyError, ValueError, AssertionError, AttributeError, IndexError, RuntimeError) as exc:
+                    last_error = exc
+            raise RuntimeError(
+                f"Failed to resolve dp_size for worker_group with roles={role_candidates}. "
+                f"Last error: {type(last_error).__name__}: {last_error}"
+            )
+
+        divisors = [resolve_dp_size(self.actor_rollout_wg, ("actor", "train"))]
+
+        if self.use_reference_policy and not self.ref_in_actor:
+            divisors.append(resolve_dp_size(self.ref_policy_wg, ("ref", "actor", "train")))
+
+        if self.use_critic:
+            divisors.append(resolve_dp_size(self.critic_wg, ("critic", "train", "actor")))
+
+        size_divisor = 1
+        for dp_size in divisors:
+            size_divisor = math.lcm(size_divisor, dp_size)
+        return size_divisor
+
+    def pad_adaptive_batch_to_divisor(self, batch: DataProto, metrics: dict[str, Any]) -> DataProto:
+        """Pad adaptive batch to the common DP divisor and record padding metrics."""
+        metrics.setdefault("adaptive_group_sampling/dp_padding_added", 0.0)
+        metrics.setdefault("adaptive_group_sampling/dp_padding_ratio", 0.0)
+        metrics.setdefault("adaptive_group_sampling/balance_applied_keep_all", 0.0)
+
+        original_size = len(batch)
+        size_divisor = self._get_training_dp_divisor()
+        batch, pad_size = pad_adaptive_dataproto_to_divisor(
+            batch=batch,
+            size_divisor=size_divisor,
+            mask_key=ADAPTIVE_KEEP_ALL_PAD_MASK_KEY,
+        )
+        metrics["adaptive_group_sampling/dp_padding_added"] = float(pad_size)
+        metrics["adaptive_group_sampling/dp_padding_ratio"] = float(pad_size / max(original_size, 1))
+        return batch
+
+    def unpad_adaptive_batch(self, batch: DataProto, metrics: dict[str, Any]) -> DataProto:
+        """Remove adaptive padding rows and validate that removal count matches tracked metrics."""
+        expected_pad = int(metrics.get("adaptive_group_sampling/dp_padding_added", 0.0))
+        batch, removed_pad = unpad_adaptive_dataproto_batch(
+            batch=batch,
+            mask_key=ADAPTIVE_KEEP_ALL_PAD_MASK_KEY,
+        )
+        if removed_pad != expected_pad:
+            raise ValueError(
+                "Adaptive keep-all padding mismatch: "
+                f"expected_pad={expected_pad}, removed_pad={removed_pad}."
+            )
+        if "attention_mask" in batch.batch.keys():
+            batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
+        return batch
+
     def _balance_batch(self, batch: DataProto, metrics, logging_prefix="global_seqlen", keep_minibatch=False):
         """Reorder the data on single controller such that each dp rank gets similar total tokens.
 
         When use_prefix_grouper is enabled, uses group-level balancing to keep samples with
         the same uid together on the same rank for prefix sharing optimization.
         """
-        # Using adaptive group size with no downsampling can produce variable number of samples per prompt.
-        # This can violate equal-size partition assumptions in balancing utilities, so we allow a
-        # graceful skip/fallback path for that specific case instead of raising and stopping training.
-        adaptive_downsampling_enabled = bool(batch.meta_info.get("adaptive_downsampling_enabled", True))
-        allow_uneven_adaptive_batch = not adaptive_downsampling_enabled
-        metrics.setdefault("adaptive_group_sampling/balance_skipped_due_to_variable_batch", 0.0)
-
         attention_mask = batch.batch["attention_mask"]
         batch_size = attention_mask.shape[0]
         global_seqlen_lst = batch.batch["attention_mask"].view(batch_size, -1).sum(-1)  # (train_batch_size,)
@@ -1502,10 +1571,6 @@ class RayPPOTrainer:
             else:
                 global_partition_lst = get_seqlen_balanced_partitions(workload_lst, k_partitions=dp_size, equal_size=True)
         except (AssertionError, ValueError):
-            # FIXME: implement a more robust balancing that can handle variable batch size instead of skipping balancing.
-            if allow_uneven_adaptive_batch:
-                metrics["adaptive_group_sampling/balance_skipped_due_to_variable_batch"] = 1.0
-                return
             raise
 
         # Place smaller micro-batches at both ends to reduce the bubbles in pipeline parallel.
@@ -1523,6 +1588,8 @@ class RayPPOTrainer:
             seqlen_list=global_seqlen_lst.tolist(), partitions=global_partition_lst, prefix=logging_prefix
         )
         metrics.update(global_balance_stats)
+        if ADAPTIVE_KEEP_ALL_PAD_MASK_KEY in batch.non_tensor_batch:
+            metrics["adaptive_group_sampling/balance_applied_keep_all"] = 1.0
 
     def _compute_values(self, batch: DataProto) -> DataProto:
         if self.use_legacy_worker_impl == "disable":
@@ -1605,6 +1672,9 @@ class RayPPOTrainer:
             batch_td = left_right_2_no_padding(batch_td)
             calculate_entropy = self.config.actor_rollout_ref.actor.entropy_coeff != 0.0
             ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
+            # TODO: (adaptive-keep-all) This scaling still depends on rollout.n.
+            # When adaptive mode is ON without downsampling, the effective train batch size can vary across steps,
+            # so a dynamic mini/global batch sizing policy may be more appropriate.
             ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
             ppo_epochs = self.config.actor_rollout_ref.actor.ppo_epochs
             seed = self.config.actor_rollout_ref.actor.data_loader_seed
@@ -1636,6 +1706,8 @@ class RayPPOTrainer:
             # step 2: convert from padding to no-padding
             batch_td = left_right_2_no_padding(batch_td)
             ppo_mini_batch_size = self.config.critic.ppo_mini_batch_size
+            # TODO: (adaptive-keep-all) Same coupling as actor path - rollout.n is used to
+            # scale critic mini-batch size even when adaptive keep-all changes actual sample count.
             ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
             ppo_epochs = self.config.critic.ppo_epochs
             seed = self.config.critic.data_loader_seed
@@ -1745,6 +1817,9 @@ class RayPPOTrainer:
                 # pass global_steps to trace
                 gen_batch.meta_info["global_steps"] = self.global_steps
                 adaptive_group_sampling_enabled = bool(adaptive_group_sampling_cfg["enable"])
+                adaptive_keep_all_enabled = adaptive_group_sampling_enabled and (
+                    not bool(adaptive_group_sampling_cfg["apply_downsampling"])
+                )
                 reward_extra_infos_dict: dict[str, list[Any]] = {}
                 if not adaptive_group_sampling_enabled:
                     gen_batch_output = gen_batch.repeat(
@@ -1826,9 +1901,24 @@ class RayPPOTrainer:
                         # repeat to align with repeated responses in rollout
                         batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                         batch = batch.union(gen_batch_output)
+                    elif reward_extra_infos_dict:
+                        adaptive_reward_extras = {}
+                        for key, values in reward_extra_infos_dict.items():
+                            values_arr = np.array(values)
+                            if values_arr.ndim > 0 and values_arr.shape[0] != len(batch):
+                                raise ValueError(
+                                    "Adaptive reward extra info length mismatch before balancing: "
+                                    f"key={key}, value_len={values_arr.shape[0]}, batch_len={len(batch)}."
+                                )
+                            adaptive_reward_extras[key] = values_arr
+                        batch.non_tensor_batch.update(adaptive_reward_extras)
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
+
+                    if adaptive_keep_all_enabled:
+                        batch = self.pad_adaptive_batch_to_divisor(batch=batch, metrics=metrics)
+
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,
                     # which won't affect the advantage calculation (since it's based on uid),
@@ -1937,7 +2027,8 @@ class RayPPOTrainer:
                                 reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
                             batch.batch["token_level_scores"] = reward_tensor
 
-                        if reward_extra_infos_dict:
+                        if reward_extra_infos_dict and (not adaptive_group_sampling_enabled):
+                            # NOTE: When adaptive sampling is enabled, the reward extra infos are already added to batch.non_tensor_batch
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
 
                         # compute rewards. apply_kl_penalty if available
@@ -2012,6 +2103,9 @@ class RayPPOTrainer:
 
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
+
+                    if adaptive_keep_all_enabled:
+                        batch = self.unpad_adaptive_batch(batch=batch, metrics=metrics)
 
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
