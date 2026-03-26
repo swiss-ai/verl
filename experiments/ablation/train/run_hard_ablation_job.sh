@@ -29,6 +29,7 @@ ROUND_SAMPLES="${ROUND_SAMPLES:-2}"
 MAX_ROUNDS="${MAX_ROUNDS:-8}"
 MIN_POS="${MIN_POS:-1}"
 MIN_NEG="${MIN_NEG:-1}"
+APPLY_DOWNSAMPLING="${APPLY_DOWNSAMPLING:-true}"
 APPLY_INV_PASS_RATE_WEIGHT="${APPLY_INV_PASS_RATE_WEIGHT:-true}"
 
 REPEAT_IDX="${REPEAT_IDX:-1}"
@@ -49,7 +50,6 @@ resolve_run_name() {
   mkdir -p "${RUN_DIR}"
 }
 
-
 build_overrides() {
   overrides=(
     "--config-name=${CONFIG_NAME}"
@@ -63,6 +63,11 @@ build_overrides() {
     "hydra.run.dir=${RUN_DIR}"
     "hydra.output_subdir=.hydra"
     "actor_rollout_ref.actor.data_loader_seed=${SEED}"
+    "actor_rollout_ref.actor.checkpoint.save_contents=['model','extra','hf_model']"
+    "trainer.save_freq=20"
+    "trainer.test_freq=20"
+    "trainer.max_actor_ckpt_to_keep=1"
+    "trainer.max_critic_ckpt_to_keep=1"
   )
 
   if [ "${ALGO}" = "rl_ada" ]; then
@@ -73,6 +78,7 @@ build_overrides() {
       "algorithm.adaptive_group_sampling.max_rounds=${MAX_ROUNDS}"
       "algorithm.adaptive_group_sampling.min_positive_samples=${MIN_POS}"
       "algorithm.adaptive_group_sampling.min_negative_samples=${MIN_NEG}"
+      "algorithm.adaptive_group_sampling.apply_downsampling=${APPLY_DOWNSAMPLING}"
       "algorithm.adaptive_group_sampling.apply_inverse_pass_rate_weight=${APPLY_INV_PASS_RATE_WEIGHT}"
     )
   else
@@ -99,7 +105,6 @@ write_metadata() {
   } > "${meta_file}"
 }
 
-
 case "${ALGO}" in
   grpo|maxrl|f_grpo)
     CONFIG_NAME="${ALGO}_math_base"
@@ -107,7 +112,7 @@ case "${ALGO}" in
     ;;
   rl_ada)
     CONFIG_NAME="grpo_math_adaptive"
-    BUDGET_TAG="${ROUND_SAMPLES}x${MAX_ROUNDS}_${MIN_POS}-${MIN_NEG}_k${ROLLOUT_N}_w${APPLY_INV_PASS_RATE_WEIGHT}"
+    BUDGET_TAG="${ROUND_SAMPLES}x${MAX_ROUNDS}_${MIN_POS}-${MIN_NEG}_k${ROLLOUT_N}_d${APPLY_DOWNSAMPLING}_w${APPLY_INV_PASS_RATE_WEIGHT}"
     ;;
   *)
     echo "Unsupported ALGO=${ALGO}. Use grpo|maxrl|f_grpo|rl_ada"

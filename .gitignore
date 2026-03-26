@@ -130,3 +130,6 @@ outputs
 .history
 data/
 outputs/
+slurm_logs/
+core_nid*
+**/figures/

@@ -51,6 +51,11 @@ def default_compute_score(
         "HuggingFaceH4/MATH-500",
         "deepscaler",
         "math500",
+        "amc23",
+        "amc2023",
+        "aime2024",
+        "aime2025",
+        "aime2026",
         "beyondaime",
         "gsm8k_boxed",
     ]:

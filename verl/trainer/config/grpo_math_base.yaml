@@ -69,7 +69,7 @@ actor_rollout_ref:
     load_format: safetensors
     val_kwargs:
       do_sample: True
-      n: 16
+      n: 4
       top_p: 0.95
       temperature: 0.6
 
