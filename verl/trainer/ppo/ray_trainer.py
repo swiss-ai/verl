@@ -560,7 +560,39 @@ class RayPPOTrainer:
 
         return gen_batch
 
-    
+    def _get_filter_groups_config(self) -> dict[str, Any]:
+        """Resolve filter-groups config from algorithm.filter_groups."""
+        filter_cfg = self.config.algorithm.get("filter_groups", None) or {}
+        max_num_gen_batches = filter_cfg.get("max_num_gen_batches", 0)
+        if max_num_gen_batches is None:
+            max_num_gen_batches = 0
+        batch_target = filter_cfg.get("batch_target", "prompts")
+        if batch_target is None:
+            batch_target = "prompts"
+
+        return {
+            "enable": bool(filter_cfg.get("enable", False)),
+            "metric": filter_cfg.get("metric", None),
+            "max_num_gen_batches": int(max_num_gen_batches),
+            "batch_target": str(batch_target).lower(),
+        }
+
+    def _validate_filter_groups_config(self, filter_cfg: dict[str, Any]) -> None:
+        if not filter_cfg["enable"]:
+            return
+
+        if self.config.algorithm.use_kl_in_reward:
+            raise ValueError("Filter groups currently does not support algorithm.use_kl_in_reward=True.")
+        if filter_cfg["metric"] is None:
+            raise ValueError("algorithm.filter_groups.metric must be set when algorithm.filter_groups.enable=True.")
+        if self.config.actor_rollout_ref.rollout.n <= 1:
+            raise ValueError("Filter groups requires actor_rollout_ref.rollout.n > 1.")
+        if filter_cfg["batch_target"] not in {"prompts", "samples"}:
+            raise ValueError(
+                "algorithm.filter_groups.batch_target must be one of {'prompts', 'samples'} "
+                f"when algorithm.filter_groups.enable=True, got {filter_cfg['batch_target']}."
+            )
+
     def _get_adaptive_group_sampling_config(self) -> dict[str, Any]:
         """Resolve adaptive group sampling config from algorithm.adaptive_group_sampling."""
         adaptive_cfg = self.config.algorithm.get("adaptive_group_sampling", None) or {}
@@ -645,6 +677,7 @@ class RayPPOTrainer:
         adaptive_cfg: dict[str, Any],
         curr_step_profile: bool,
         timing_raw: dict[str, float],
+        sleep_replicas_after_sampling: bool = True,
     ) -> tuple[DataProto, dict[str, list[Any]], dict[str, float]]:
         """Generate adaptive-group rollouts and build the training batch."""
         target_rollouts = int(self.config.actor_rollout_ref.rollout.n)  # NOTE: target_rollouts is only enforced when downsampling
@@ -833,7 +866,7 @@ class RayPPOTrainer:
                 finalize_prompt_rollouts_keep_all(prompt_state)
 
         # Keep rollout KV cache between rounds and sleep only once after adaptive sampling.
-        if self.async_rollout_mode:
+        if self.async_rollout_mode and sleep_replicas_after_sampling:
             self.checkpoint_manager.sleep_replicas()
 
         # Materialize selected samples and attach per-prompt statistics
@@ -1774,6 +1807,8 @@ class RayPPOTrainer:
 
         adaptive_group_sampling_cfg = self._get_adaptive_group_sampling_config()
         self._validate_adaptive_group_sampling_config(adaptive_group_sampling_cfg)
+        filter_groups_cfg = self._get_filter_groups_config()
+        self._validate_filter_groups_config(filter_groups_cfg)
 
         # add tqdm
         progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
@@ -1790,6 +1825,10 @@ class RayPPOTrainer:
             else False
         )
         next_step_profile = False
+        pending_filtered_batch = None
+        pending_prompt_count = 0
+        pending_sample_count = 0
+        pending_num_gen_batches = 0
 
         for epoch in range(current_epoch, self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
@@ -1817,16 +1856,33 @@ class RayPPOTrainer:
                 # pass global_steps to trace
                 gen_batch.meta_info["global_steps"] = self.global_steps
                 adaptive_group_sampling_enabled = bool(adaptive_group_sampling_cfg["enable"])
+                filter_groups_enabled = bool(filter_groups_cfg["enable"])
                 adaptive_keep_all_enabled = adaptive_group_sampling_enabled and (
                     not bool(adaptive_group_sampling_cfg["apply_downsampling"])
                 )
                 reward_extra_infos_dict: dict[str, list[Any]] = {}
-                if not adaptive_group_sampling_enabled:
-                    gen_batch_output = gen_batch.repeat(
-                        repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
-                    )
-                else:
-                    gen_batch_output = None
+                reward_precomputed = False
+                future_reward = None
+                rollout_n = int(self.config.actor_rollout_ref.rollout.n)
+                prompt_bsz = int(self.config.data.train_batch_size)
+                sample_bsz = prompt_bsz * rollout_n
+
+                if filter_groups_enabled:
+                    # Optimization when filter-groups is enabled: only generate the number of prompts
+                    # needed to satisfy the current accumulation target.
+                    if filter_groups_cfg["batch_target"] == "samples":
+                        missing_samples = max(sample_bsz - pending_sample_count, 0)
+                        if adaptive_group_sampling_enabled and (not adaptive_group_sampling_cfg["apply_downsampling"]):
+                            missing_prompts = missing_samples
+                        else:
+                            missing_prompts = int(math.ceil(missing_samples / max(rollout_n, 1)))
+                    else:
+                        missing_prompts = max(prompt_bsz - pending_prompt_count, 0)
+                    missing_prompts = max(1, min(len(batch), int(missing_prompts)))
+                    if missing_prompts < len(batch):
+                        batch = batch.select_idxs(list(range(missing_prompts)))
+                        gen_batch = gen_batch.select_idxs(list(range(missing_prompts)))
+                gen_batch_output = None
 
                 is_last_step = self.global_steps >= self.total_training_steps
                 with marked_timer("step", timing_raw):
@@ -1840,17 +1896,20 @@ class RayPPOTrainer:
                                     adaptive_cfg=adaptive_group_sampling_cfg,
                                     curr_step_profile=curr_step_profile,
                                     timing_raw=timing_raw,
+                                    sleep_replicas_after_sampling=False,
                                 )
                             )
                             metrics.update(adaptive_sampling_metrics)
                         else:
+                            gen_batch_output = gen_batch.repeat(
+                                repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
+                            )
                             if not self.async_rollout_mode:
                                 gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)
                             else:
                                 if curr_step_profile:
                                     self.async_rollout_manager.start_profile(global_step=self.global_steps)
                                 gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
-                                self.checkpoint_manager.sleep_replicas()
                                 if curr_step_profile:
                                     self.async_rollout_manager.stop_profile()
 
@@ -1870,7 +1929,6 @@ class RayPPOTrainer:
                                 if curr_step_profile:
                                     self.async_rollout_manager.start_profile()
                                 gen_baseline_output = self.async_rollout_manager.generate_sequences(gen_baseline_batch)
-                                self.checkpoint_manager.sleep_replicas()
                                 if curr_step_profile:
                                     self.async_rollout_manager.stop_profile()
                             batch = batch.union(gen_baseline_output)
@@ -1913,6 +1971,159 @@ class RayPPOTrainer:
                             adaptive_reward_extras[key] = values_arr
                         batch.non_tensor_batch.update(adaptive_reward_extras)
 
+                    # Compute rewards before filter-groups so we can early-continue without
+                    # running old_log_prob/ref/value/adv on under-filled updates.
+                    if not reward_precomputed:
+                        with marked_timer("reward", timing_raw, color="yellow"):
+                            if not adaptive_group_sampling_enabled:
+                                if self.use_rm and "rm_scores" not in batch.batch.keys():
+                                    if not self.use_reward_loop:
+                                        reward_tensor = self.rm_wg.compute_rm_score(batch)
+                                    else:
+                                        assert self.reward_loop_manager is not None, "RewardLoopManager is None"
+                                        reward_tensor = self.reward_loop_manager.compute_rm_score(batch)
+                                    batch = batch.union(reward_tensor)
+
+                                if filter_groups_enabled:
+                                    reward_tensor, reward_extra_infos_dict = self._compute_or_extract_reward(
+                                        batch, reward_fn=self.reward_fn, reward_for_val=False
+                                    )
+                                    batch.batch["token_level_scores"] = reward_tensor
+                                    batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+                                    if reward_extra_infos_dict:
+                                        batch.non_tensor_batch.update(
+                                            {k: np.array(v) for k, v in reward_extra_infos_dict.items()}
+                                        )
+                                elif self.config.reward_model.launch_reward_fn_async:
+                                    future_reward = compute_reward_async.remote(
+                                        data=batch, config=self.config, tokenizer=self.tokenizer
+                                    )
+                                else:
+                                    reward_tensor, reward_extra_infos_dict = self._compute_or_extract_reward(
+                                        batch, reward_fn=self.reward_fn, reward_for_val=False
+                                    )
+
+                    # Filter out groups of samples if configured, based on reward metric variance.
+                    if filter_groups_enabled:
+                        pending_num_gen_batches += 1
+
+                        metric_name = filter_groups_cfg["metric"]
+                        if metric_name == "seq_final_reward":
+                            seq_reward_tensor = (
+                                batch.batch["token_level_rewards"]
+                                if "token_level_rewards" in batch.batch
+                                else batch.batch["token_level_scores"]
+                            )
+                            batch.non_tensor_batch["seq_final_reward"] = (
+                                seq_reward_tensor.sum(dim=-1).detach().cpu().numpy()
+                            )
+                        elif metric_name == "seq_reward":
+                            batch.non_tensor_batch["seq_reward"] = (
+                                batch.batch["token_level_scores"].sum(dim=-1).detach().cpu().numpy()
+                            )
+                        elif metric_name not in batch.non_tensor_batch:
+                            raise KeyError(
+                                f"Filter metric '{metric_name}' not found in batch.non_tensor_batch. "
+                                "Expected one of reward extra-info keys or seq_reward/seq_final_reward."
+                            )
+
+                        prompt_uid2metric_vals = defaultdict(list)
+                        for uid, metric_val in zip(
+                            batch.non_tensor_batch["uid"], batch.non_tensor_batch[metric_name], strict=True
+                        ):
+                            prompt_uid2metric_vals[uid].append(metric_val)
+
+                        kept_prompt_uids = [
+                            uid
+                            for uid, metric_vals in prompt_uid2metric_vals.items()
+                            if np.std(metric_vals) > 0 or len(metric_vals) == 1
+                        ]
+                        kept_prompt_count_this_round = len(kept_prompt_uids)
+                        pending_prompt_count += kept_prompt_count_this_round
+
+                        kept_traj_idxs = [
+                            idx
+                            for idx, traj_from_prompt_uid in enumerate(batch.non_tensor_batch["uid"])
+                            if traj_from_prompt_uid in kept_prompt_uids
+                        ]
+                        kept_sample_count_this_round = len(kept_traj_idxs)
+                        pending_sample_count += kept_sample_count_this_round
+                        batch = batch[kept_traj_idxs]
+                        pending_filtered_batch = (
+                            batch
+                            if pending_filtered_batch is None
+                            else DataProto.concat([pending_filtered_batch, batch])
+                        )
+
+                        batch_target = filter_groups_cfg["batch_target"]
+                        if batch_target == "samples":
+                            has_enough = pending_sample_count >= sample_bsz
+                            curr_count = pending_sample_count
+                            target_count = sample_bsz
+                        else:
+                            has_enough = pending_prompt_count >= prompt_bsz
+                            curr_count = pending_prompt_count
+                            target_count = prompt_bsz
+
+                        if not has_enough:
+                            print(
+                                "[filter_groups] criteria not met; "
+                                f"round={pending_num_gen_batches}, "
+                                f"kept_prompts_this_round={kept_prompt_count_this_round}, "
+                                f"kept_samples_this_round={kept_sample_count_this_round}, "
+                                f"accumulated_{batch_target}={curr_count}/{target_count}"
+                            )
+                            max_num_gen_batches = int(filter_groups_cfg["max_num_gen_batches"])
+                            if max_num_gen_batches <= 0 or pending_num_gen_batches < max_num_gen_batches:
+                                print(f"[filter_groups] keep generating (rounds_so_far={pending_num_gen_batches})")
+                                continue
+                            raise ValueError(
+                                f"{pending_num_gen_batches=} >= {max_num_gen_batches=}."
+                                + " Generated too many. Please check if your data are too difficult."
+                                + " You could also try set max_num_gen_batches=0 to enable endless trials."
+                            )
+                        elif pending_num_gen_batches > 1:
+                            print(
+                                "[filter_groups] criteria met; "
+                                f"rounds_executed={pending_num_gen_batches}, "
+                                f"accumulated_{batch_target}={curr_count}/{target_count}"
+                            )
+
+                        if pending_filtered_batch is None:
+                            raise ValueError("No filtered samples collected. Please check filter_groups settings.")
+                        prompt_uid2sample_count = defaultdict(int)
+                        for prompt_uid in pending_filtered_batch.non_tensor_batch["uid"]:
+                            prompt_uid2sample_count[prompt_uid] += 1
+
+                        selected_prompt_count = 0
+                        selected_sample_count = 0
+                        selected_prompt_uid_set = set()
+                        for prompt_uid in pending_filtered_batch.non_tensor_batch["uid"]:
+                            if prompt_uid in selected_prompt_uid_set:
+                                continue
+                            selected_prompt_uid_set.add(prompt_uid)
+                            selected_prompt_count += 1
+                            selected_sample_count += prompt_uid2sample_count[prompt_uid]
+                            if (
+                                (batch_target == "samples" and selected_sample_count >= sample_bsz)
+                                or (batch_target == "prompts" and selected_prompt_count >= prompt_bsz)
+                            ):
+                                break
+                        selected_traj_idxs = [
+                            idx
+                            for idx, traj_from_prompt_uid in enumerate(pending_filtered_batch.non_tensor_batch["uid"])
+                            if traj_from_prompt_uid in selected_prompt_uid_set
+                        ]
+                        batch = pending_filtered_batch[selected_traj_idxs]
+                        reward_precomputed = True
+                        reward_extra_infos_dict = {}
+                        metrics["train/num_gen_batches"] = float(pending_num_gen_batches)
+
+                    # Async rollout replicas should only be slept when generation for this
+                    # training step is finalized (i.e., not continuing filter retry rounds).
+                    if self.async_rollout_mode:
+                        self.checkpoint_manager.sleep_replicas()
+
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
 
@@ -1936,26 +2147,6 @@ class RayPPOTrainer:
                                 continue
                             images_seqlens_all.extend(multi_modal_input["images_seqlens"].tolist())
                     batch.meta_info["images_seqlens"] = images_seqlens_all
-                    with marked_timer("reward", timing_raw, color="yellow"):
-                        if not adaptive_group_sampling_enabled:
-                            # compute reward model score
-                            if self.use_rm and "rm_scores" not in batch.batch.keys():
-                                if not self.use_reward_loop:
-                                    reward_tensor = self.rm_wg.compute_rm_score(batch)
-                                else:
-                                    assert self.reward_loop_manager is not None, "RewardLoopManager is None"
-                                    reward_tensor = self.reward_loop_manager.compute_rm_score(batch)
-                                batch = batch.union(reward_tensor)
-
-                            # Compute or extract reward for training
-                            if self.config.reward_model.launch_reward_fn_async:
-                                future_reward = compute_reward_async.remote(
-                                    data=batch, config=self.config, tokenizer=self.tokenizer
-                                )
-                            else:
-                                reward_tensor, reward_extra_infos_dict = self._compute_or_extract_reward(
-                                    batch, reward_fn=self.reward_fn, reward_for_val=False
-                                )
 
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
@@ -2021,13 +2212,13 @@ class RayPPOTrainer:
                     with marked_timer("adv", timing_raw, color="brown"):
                         if adaptive_group_sampling_enabled:
                             reward_tensor = batch.batch["token_level_scores"]
-                        else:
+                        elif not reward_precomputed:
                             # we combine with rule-based rm
                             if self.config.reward_model.launch_reward_fn_async:
                                 reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
                             batch.batch["token_level_scores"] = reward_tensor
 
-                        if reward_extra_infos_dict and (not adaptive_group_sampling_enabled):
+                        if reward_extra_infos_dict and (not adaptive_group_sampling_enabled) and (not reward_precomputed):
                             # NOTE: When adaptive sampling is enabled, the reward extra infos are already added to batch.non_tensor_batch
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
 
@@ -2189,6 +2380,13 @@ class RayPPOTrainer:
 
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
+
+                # reset pending batch and filtering state
+                if filter_groups_enabled:
+                    pending_filtered_batch = None
+                    pending_prompt_count = 0
+                    pending_sample_count = 0
+                    pending_num_gen_batches = 0
 
                 progress_bar.update(1)
                 self.global_steps += 1

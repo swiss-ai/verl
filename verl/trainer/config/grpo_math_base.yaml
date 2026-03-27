@@ -11,7 +11,7 @@ data:
   val_files: ./data/math/test.parquet
   train_batch_size: 256
   max_prompt_length: 1024
-  max_response_length: 2048
+  max_response_length: 3072
   truncation: left
 
 actor_rollout_ref:

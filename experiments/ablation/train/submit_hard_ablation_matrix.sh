@@ -16,9 +16,9 @@ REPEATS=3
 START_SEED=42
 HF_HUB_CACHE_DIR="${HF_HUB_CACHE_DIR:-/capstor/scratch/cscs/msantelmo/huggingface/hub}"
 
-# Minimal validation/checkpoint knobs forwarded to run_hard_ablation_job.sh.
-VAL_ROLLOUT_N="${VAL_ROLLOUT_N:-4}"
-CHECKPOINT_FREQ="${CHECKPOINT_FREQ:-20}"
+# DAPO-like filtering settings
+ENABLE_FILTER_GROUPS=true
+FILTER_GROUPS_BATCH_TARGET=prompts
 
 MODELS=(
   # "swiss-ai/Apertus-8B-Instruct-2509"
@@ -65,7 +65,11 @@ submit_job() {
     resolved_model="${HF_HUB_CACHE_DIR}/models--${model//\//--}/snapshots/${commit}"
   fi
 
-  local run_name="${DATASET_TAG}__${algo}__${model_tag}__${budget_tag}__rep${rep}"
+  local filter_suffix=""
+  if [ "${ENABLE_FILTER_GROUPS}" = "true" ]; then
+    filter_suffix="__DAPO-${FILTER_GROUPS_BATCH_TARGET}"
+  fi
+  local run_name="${DATASET_TAG}__${algo}__${model_tag}${filter_suffix}__${budget_tag}__rep${rep}"
   local wandb_group="${run_name%__rep${rep}}"
   local run_dir="${OUTPUT_ROOT}/${run_name}"
   mkdir -p "${run_dir}"
@@ -89,8 +93,10 @@ submit_job() {
   MIN_NEG="${min_neg}" \
   APPLY_DOWNSAMPLING="${apply_downsampling}" \
   APPLY_INV_PASS_RATE_WEIGHT="${apply_inv_pass_rate_weight}" \
-  VAL_ROLLOUT_N="${VAL_ROLLOUT_N}" \
-  CHECKPOINT_FREQ="${CHECKPOINT_FREQ}" \
+  ENABLE_FILTER_GROUPS="${ENABLE_FILTER_GROUPS}" \
+  FILTER_GROUPS_METRIC="acc" \
+  FILTER_GROUPS_MAX_NUM_GEN_BATCHES=0 \
+  FILTER_GROUPS_BATCH_TARGET="${FILTER_GROUPS_BATCH_TARGET}" \
   sbatch \
     --job-name="${run_name}" \
     --output="${run_dir}/slurm.out" \

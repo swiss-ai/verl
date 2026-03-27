@@ -32,6 +32,10 @@ MIN_NEG="${MIN_NEG:-1}"
 APPLY_DOWNSAMPLING="${APPLY_DOWNSAMPLING:-true}"
 APPLY_INV_PASS_RATE_WEIGHT="${APPLY_INV_PASS_RATE_WEIGHT:-true}"
 
+# DAPO-like filtering
+ENABLE_FILTER_GROUPS="${ENABLE_FILTER_GROUPS:-false}"
+FILTER_GROUPS_BATCH_TARGET="${FILTER_GROUPS_BATCH_TARGET:-prompts}"
+
 REPEAT_IDX="${REPEAT_IDX:-1}"
 SEED="${SEED:-42}"
 RUN_NAME="${RUN_NAME:-}"
@@ -64,10 +68,12 @@ build_overrides() {
     "hydra.output_subdir=.hydra"
     "actor_rollout_ref.actor.data_loader_seed=${SEED}"
     "actor_rollout_ref.actor.checkpoint.save_contents=['model','extra','hf_model']"
-    "trainer.save_freq=20"
+    "trainer.save_freq=10"
     "trainer.test_freq=20"
     "trainer.max_actor_ckpt_to_keep=1"
     "trainer.max_critic_ckpt_to_keep=1"
+    "algorithm.filter_groups.enable=${ENABLE_FILTER_GROUPS}"
+    "algorithm.filter_groups.batch_target=${FILTER_GROUPS_BATCH_TARGET}"
   )
 
   if [ "${ALGO}" = "rl_ada" ]; then
@@ -101,6 +107,8 @@ write_metadata() {
     echo "SEED=${SEED}"
     echo "REPEAT_IDX=${REPEAT_IDX}"
     echo "BUDGET_TAG=${BUDGET_TAG}"
+    echo "ENABLE_FILTER_GROUPS=${ENABLE_FILTER_GROUPS}"
+    echo "FILTER_GROUPS_BATCH_TARGET=${FILTER_GROUPS_BATCH_TARGET}"
     echo "DATE=$(date --iso-8601=seconds)"
   } > "${meta_file}"
 }
