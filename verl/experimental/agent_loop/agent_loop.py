@@ -264,6 +264,11 @@ class AgentLoopBase(ABC):
         Returns:
             list[int]: Prompt token ids.
         """
+        # Some chat templates (e.g., Llama tool-use templates) switch into function-calling
+        # mode when `tools` is present, even if it's an empty list. Treat empty list as no tools.
+        if not tools:
+            tools = None
+
         if self.processor is not None:
             raw_prompt = await self.loop.run_in_executor(
                 None,
