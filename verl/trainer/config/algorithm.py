@@ -79,6 +79,10 @@ class AdaptiveGroupSamplingConfig(BaseConfig):
         positive_threshold (float): A rollout is positive when sequence reward > positive_threshold.
         apply_downsampling (bool): Whether to downsample each prompt to rollout.n samples after adaptive sampling.
         apply_inverse_pass_rate_weight (bool): Whether to scale adaptive GRPO advantages by 1 / pass_rate.
+        apply_prompt_inverse_group_weight (bool): Whether to multiply each prompt's retained samples by 1 / K_i
+            in actor loss, where K_i is retained samples for prompt i.
+        apply_within_prompt_mass_balance (bool): Whether to rescale positive and non-positive samples within each
+            prompt so per-prompt positive and negative weighted masses are balanced.
     """
 
     enable: bool = False
@@ -89,6 +93,8 @@ class AdaptiveGroupSamplingConfig(BaseConfig):
     positive_threshold: float = 0.0
     apply_downsampling: bool = True
     apply_inverse_pass_rate_weight: bool = True
+    apply_prompt_inverse_group_weight: bool = False
+    apply_within_prompt_mass_balance: bool = False
 
 
 @dataclass

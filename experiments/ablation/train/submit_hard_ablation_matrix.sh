@@ -37,8 +37,12 @@ RL_ADA_CONFIGS=(
   "2 8 1 1 2 true true"
   "2 8 1 1 2 true false"
   "2 32 1 1 16 false true"
-  "2 32 1 1 16 true true"
 )
+# Additional adaptive weighting switches (crossed with every RL_ADA_CONFIGS entry):
+# - apply_prompt_inverse_group_weight: 1 / K_i prompt-level weighting.
+# - apply_within_prompt_mass_balance: within-prompt +/- mass balancing.
+PROMPT_INVERSE_GROUP_WEIGHT_OPTIONS=(false true)
+WITHIN_PROMPT_MASS_BALANCE_OPTIONS=(false true)
 
 mkdir -p "${OUTPUT_ROOT}"
 
@@ -55,6 +59,8 @@ submit_job() {
   local min_neg="${10:-1}"
   local apply_downsampling="${11:-true}"
   local apply_inv_pass_rate_weight="${12:-true}"
+  local apply_prompt_inverse_group_weight="${13:-false}"
+  local apply_within_prompt_mass_balance="${14:-false}"
 
   local model_tag
   model_tag="$(basename "${model}" | tr '/:.' '-' | tr -c '[:alnum:]_-' '-')"
@@ -93,6 +99,8 @@ submit_job() {
   MIN_NEG="${min_neg}" \
   APPLY_DOWNSAMPLING="${apply_downsampling}" \
   APPLY_INV_PASS_RATE_WEIGHT="${apply_inv_pass_rate_weight}" \
+  APPLY_PROMPT_INVERSE_GROUP_WEIGHT="${apply_prompt_inverse_group_weight}" \
+  APPLY_WITHIN_PROMPT_MASS_BALANCE="${apply_within_prompt_mass_balance}" \
   ENABLE_FILTER_GROUPS="${ENABLE_FILTER_GROUPS}" \
   FILTER_GROUPS_METRIC="acc" \
   FILTER_GROUPS_MAX_NUM_GEN_BATCHES=0 \
@@ -121,19 +129,25 @@ for model in "${MODELS[@]}"; do
     # RL-Ada: round-based adaptive sampling configs
     for cfg in "${RL_ADA_CONFIGS[@]}"; do
       read -r round_samples max_rounds min_pos min_neg downsample_n apply_downsampling apply_inv_pass_rate_weight <<< "${cfg}"
-      submit_job \
-        "rl_ada" \
-        "${model}" \
-        "${round_samples}x${max_rounds}_${min_pos}-${min_neg}_k${downsample_n}_d${apply_downsampling}_w${apply_inv_pass_rate_weight}" \
-        "${rep}" \
-        "${seed}" \
-        "${downsample_n}" \
-        "${round_samples}" \
-        "${max_rounds}" \
-        "${min_pos}" \
-        "${min_neg}" \
-        "${apply_downsampling}" \
-        "${apply_inv_pass_rate_weight}"
+      for apply_prompt_inverse_group_weight in "${PROMPT_INVERSE_GROUP_WEIGHT_OPTIONS[@]}"; do
+        for apply_within_prompt_mass_balance in "${WITHIN_PROMPT_MASS_BALANCE_OPTIONS[@]}"; do
+          submit_job \
+            "rl_ada" \
+            "${model}" \
+            "${round_samples}x${max_rounds}_${min_pos}-${min_neg}_k${downsample_n}_d${apply_downsampling}_w${apply_inv_pass_rate_weight}_pk${apply_prompt_inverse_group_weight}_mb${apply_within_prompt_mass_balance}" \
+            "${rep}" \
+            "${seed}" \
+            "${downsample_n}" \
+            "${round_samples}" \
+            "${max_rounds}" \
+            "${min_pos}" \
+            "${min_neg}" \
+            "${apply_downsampling}" \
+            "${apply_inv_pass_rate_weight}" \
+            "${apply_prompt_inverse_group_weight}" \
+            "${apply_within_prompt_mass_balance}"
+        done
+      done
     done
   done
 done

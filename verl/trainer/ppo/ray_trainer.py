@@ -622,8 +622,9 @@ class RayPPOTrainer:
             "positive_threshold": float(adaptive_cfg["positive_threshold"]),
             "apply_downsampling": bool(adaptive_cfg["apply_downsampling"]),
             "apply_inverse_pass_rate_weight": bool(adaptive_cfg["apply_inverse_pass_rate_weight"]),
+            "apply_prompt_inverse_group_weight": bool(adaptive_cfg.get("apply_prompt_inverse_group_weight", False)),
+            "apply_within_prompt_mass_balance": bool(adaptive_cfg.get("apply_within_prompt_mass_balance", False)),
         }
-
 
     def _validate_adaptive_group_sampling_config(self, adaptive_cfg: dict[str, Any]) -> None:
         if not adaptive_cfg["enable"]:
@@ -643,6 +644,8 @@ class RayPPOTrainer:
         max_rounds = adaptive_cfg["max_rounds"]
         rollouts_per_round = adaptive_cfg["rollouts_per_round"]
         apply_downsampling = adaptive_cfg["apply_downsampling"]
+        apply_prompt_inverse_group_weight = adaptive_cfg["apply_prompt_inverse_group_weight"]
+        apply_within_prompt_mass_balance = adaptive_cfg["apply_within_prompt_mass_balance"]
 
         if min_positive_samples < 0 or min_negative_samples < 0:
             raise ValueError("Adaptive group sampling requires non-negative min_positive_samples/min_negative_samples.")
@@ -652,6 +655,14 @@ class RayPPOTrainer:
             raise ValueError("Adaptive group sampling requires rollouts_per_round > 0.")
         if not isinstance(apply_downsampling, bool):
             raise ValueError("Adaptive group sampling requires apply_downsampling to be a boolean.")
+        if not isinstance(apply_prompt_inverse_group_weight, bool):
+            raise ValueError(
+                "Adaptive group sampling requires apply_prompt_inverse_group_weight to be a boolean."
+            )
+        if not isinstance(apply_within_prompt_mass_balance, bool):
+            raise ValueError(
+                "Adaptive group sampling requires apply_within_prompt_mass_balance to be a boolean."
+            )
         if (
             (not apply_downsampling)
             and self.config.trainer.balance_batch
@@ -668,7 +679,6 @@ class RayPPOTrainer:
                 "Adaptive group sampling requires max_rounds * rollouts_per_round >= actor_rollout_ref.rollout.n, "
                 f"but got {max_rounds} * {rollouts_per_round} < {target_rollouts}."
             )
-
 
     def _generate_batch_with_adaptive_group_sampling(
         self,
@@ -2264,6 +2274,20 @@ class RayPPOTrainer:
                             )
                             batch.batch["advantages"] = advantages
                             batch.batch["returns"] = returns
+                            if adaptive_group_sampling_cfg["apply_prompt_inverse_group_weight"] or adaptive_group_sampling_cfg[
+                                "apply_within_prompt_mass_balance"
+                            ]:
+                                batch.batch["advantages"] = core_algos.apply_adaptive_prompt_advantage_weighting(
+                                    advantages=batch.batch["advantages"],
+                                    response_mask=batch.batch["response_mask"],
+                                    index=batch.non_tensor_batch["uid"],
+                                    apply_prompt_inverse_group_weight=adaptive_group_sampling_cfg[
+                                        "apply_prompt_inverse_group_weight"
+                                    ],
+                                    apply_within_prompt_mass_balance=adaptive_group_sampling_cfg[
+                                        "apply_within_prompt_mass_balance"
+                                    ],
+                                )
                         else:
                             batch = compute_advantage(
                                 batch,

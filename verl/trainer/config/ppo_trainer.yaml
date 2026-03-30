@@ -157,10 +157,16 @@ algorithm:
 
     # Whether to downsample adaptive prompt rollouts to actor_rollout_ref.rollout.n
     # If false, keep all collected rollouts (variable samples per prompt / per step)
-    apply_downsampling: True
+    apply_downsampling: False
 
     # Whether to scale adaptive GRPO advantages by inverse pass-rate (1 / p)
-    apply_inverse_pass_rate_weight: True
+    apply_inverse_pass_rate_weight: False
+
+    # Whether to apply prompt-level 1/K_i weighting in policy loss, where K_i is retained samples per prompt
+    apply_prompt_inverse_group_weight: False
+
+    # Whether to apply within-prompt positive/non-positive mass balancing in policy loss
+    apply_within_prompt_mass_balance: False
 
 # config for the trainer
 trainer:

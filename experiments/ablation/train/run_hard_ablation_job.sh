@@ -31,6 +31,8 @@ MIN_POS="${MIN_POS:-1}"
 MIN_NEG="${MIN_NEG:-1}"
 APPLY_DOWNSAMPLING="${APPLY_DOWNSAMPLING:-true}"
 APPLY_INV_PASS_RATE_WEIGHT="${APPLY_INV_PASS_RATE_WEIGHT:-true}"
+APPLY_PROMPT_INVERSE_GROUP_WEIGHT="${APPLY_PROMPT_INVERSE_GROUP_WEIGHT:-false}"
+APPLY_WITHIN_PROMPT_MASS_BALANCE="${APPLY_WITHIN_PROMPT_MASS_BALANCE:-false}"
 
 # DAPO-like filtering
 ENABLE_FILTER_GROUPS="${ENABLE_FILTER_GROUPS:-false}"
@@ -86,6 +88,8 @@ build_overrides() {
       "algorithm.adaptive_group_sampling.min_negative_samples=${MIN_NEG}"
       "algorithm.adaptive_group_sampling.apply_downsampling=${APPLY_DOWNSAMPLING}"
       "algorithm.adaptive_group_sampling.apply_inverse_pass_rate_weight=${APPLY_INV_PASS_RATE_WEIGHT}"
+      "algorithm.adaptive_group_sampling.apply_prompt_inverse_group_weight=${APPLY_PROMPT_INVERSE_GROUP_WEIGHT}"
+      "algorithm.adaptive_group_sampling.apply_within_prompt_mass_balance=${APPLY_WITHIN_PROMPT_MASS_BALANCE}"
     )
   else
     overrides+=(
@@ -109,6 +113,8 @@ write_metadata() {
     echo "BUDGET_TAG=${BUDGET_TAG}"
     echo "ENABLE_FILTER_GROUPS=${ENABLE_FILTER_GROUPS}"
     echo "FILTER_GROUPS_BATCH_TARGET=${FILTER_GROUPS_BATCH_TARGET}"
+    echo "APPLY_PROMPT_INVERSE_GROUP_WEIGHT=${APPLY_PROMPT_INVERSE_GROUP_WEIGHT}"
+    echo "APPLY_WITHIN_PROMPT_MASS_BALANCE=${APPLY_WITHIN_PROMPT_MASS_BALANCE}"
     echo "DATE=$(date --iso-8601=seconds)"
   } > "${meta_file}"
 }
@@ -120,7 +126,7 @@ case "${ALGO}" in
     ;;
   rl_ada)
     CONFIG_NAME="grpo_math_adaptive"
-    BUDGET_TAG="${ROUND_SAMPLES}x${MAX_ROUNDS}_${MIN_POS}-${MIN_NEG}_k${ROLLOUT_N}_d${APPLY_DOWNSAMPLING}_w${APPLY_INV_PASS_RATE_WEIGHT}"
+    BUDGET_TAG="${ROUND_SAMPLES}x${MAX_ROUNDS}_${MIN_POS}-${MIN_NEG}_k${ROLLOUT_N}_d${APPLY_DOWNSAMPLING}_w${APPLY_INV_PASS_RATE_WEIGHT}_pk${APPLY_PROMPT_INVERSE_GROUP_WEIGHT}_mb${APPLY_WITHIN_PROMPT_MASS_BALANCE}"
     ;;
   *)
     echo "Unsupported ALGO=${ALGO}. Use grpo|maxrl|f_grpo|rl_ada"

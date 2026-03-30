@@ -22,6 +22,7 @@ __all__ = [
     "register_adv_est",
     "get_adv_estimator_fn",
     "AdvantageEstimator",
+    "apply_adaptive_prompt_advantage_weighting",
     "compute_adaptive_grpo_outcome_advantage",
     "compute_maxrl_outcome_advantage",
     "compute_f_grpo_outcome_advantage",
@@ -444,6 +445,123 @@ def compute_adaptive_grpo_outcome_advantage(
 
         advantages = scalar_advantages.unsqueeze(-1) * response_mask
         return advantages, advantages, adaptive_weights
+
+
+def _build_group_ids(index: np.ndarray) -> np.ndarray:
+    """Build stable integer group ids from prompt index labels."""
+    group_map: dict[Any, int] = {}
+    group_ids = np.empty(len(index), dtype=np.int64)
+    next_group_id = 0
+    for i, uid in enumerate(index.tolist()):
+        group_id = group_map.get(uid)
+        if group_id is None:
+            group_id = next_group_id
+            group_map[uid] = group_id
+            next_group_id += 1
+        group_ids[i] = group_id
+    return group_ids
+
+
+def apply_adaptive_prompt_advantage_weighting(
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray | list[Any],
+    apply_prompt_inverse_group_weight: bool = False,
+    apply_within_prompt_mass_balance: bool = False,
+    eps: float = 1e-12,
+) -> torch.Tensor:
+    """Apply optional prompt-level weighting and within-prompt mass balancing.
+
+    The effective per-sample coefficient is:
+        - prompt-level: ``1 / K_i`` where ``K_i`` is retained valid samples for prompt ``i``.
+        - mass-balancing:
+            - for ``A_ij > 0``: ``alpha_i^+ = 1 / sum_{j in P_i} max(A_ij, 0)``
+            - for ``A_ij <= 0``: ``alpha_i^- = 1 / sum_{j in N_i} max(-A_ij, 0)``
+
+    Here ``A_ij`` is the per-sample scalar advantage (masked mean over response tokens),
+    ``P_i = {j | A_ij > 0}``, ``N_i = {j | A_ij <= 0}``.
+
+    Args:
+        advantages: Per-token advantages, shape ``(batch_size, response_len)``.
+        response_mask: Per-token response mask, shape ``(batch_size, response_len)``.
+        index: Prompt/group identifiers aligned with batch rows.
+        apply_prompt_inverse_group_weight: Whether to apply prompt-level ``1 / K_i``.
+        apply_within_prompt_mass_balance: Whether to balance positive/non-positive masses within each prompt.
+        eps: Small positive threshold used to guard zero-mass denominators.
+
+    Degenerate safeguards:
+        - If a prompt has no valid samples, it contributes nothing.
+        - If a prompt has zero positive/negative mass, the corresponding alpha defaults to 1.
+        - Padded rows (zero valid response tokens) are excluded from group counts/masses.
+    """
+    if not apply_prompt_inverse_group_weight and not apply_within_prompt_mass_balance:
+        return advantages
+
+    index = np.asarray(index)
+
+    if advantages.ndim != 2:
+        raise ValueError(f"Expected advantages to be 2D (bs, response_len), got shape={tuple(advantages.shape)}.")
+    if response_mask.ndim != 2:
+        raise ValueError(
+            f"Expected response_mask to be 2D (bs, response_len), got shape={tuple(response_mask.shape)}."
+        )
+    if advantages.shape != response_mask.shape:
+        raise ValueError(
+            "advantages and response_mask must have the same shape, "
+            f"got {tuple(advantages.shape)} vs {tuple(response_mask.shape)}."
+        )
+    if index.ndim != 1:
+        raise ValueError(f"Expected index to be 1D, got shape={tuple(index.shape)}.")
+    if len(index) != advantages.shape[0]:
+        raise ValueError(
+            "index length must match batch size, "
+            f"got len(index)={len(index)} vs batch_size={advantages.shape[0]}."
+        )
+
+    device = advantages.device
+    dtype = advantages.dtype
+
+    group_ids_np = _build_group_ids(index=index)
+    group_ids = torch.from_numpy(group_ids_np).to(device=device, dtype=torch.long)
+    num_groups = int(group_ids.max().item()) + 1 if group_ids.numel() > 0 else 0
+
+    mask = response_mask.to(dtype=dtype)
+    token_counts = mask.sum(dim=-1)
+    valid_rows = token_counts > 0
+
+    # Sequence-level scalar advantages A_ij.
+    scalar_advantages = (advantages * mask).sum(dim=-1) / token_counts.clamp_min(1.0)
+    sample_coeff = torch.ones_like(scalar_advantages)
+
+    if num_groups == 0 or not torch.any(valid_rows):
+        return advantages
+
+    valid_group_ids = group_ids[valid_rows]
+
+    if apply_prompt_inverse_group_weight:
+        group_counts = torch.bincount(valid_group_ids, minlength=num_groups).to(dtype=dtype)
+        inv_group_counts = torch.where(group_counts > 0, 1.0 / group_counts, torch.zeros_like(group_counts))
+        sample_coeff = sample_coeff * inv_group_counts[group_ids]
+
+    if apply_within_prompt_mass_balance:
+        positive_mass = torch.clamp(scalar_advantages, min=0.0)
+        negative_mass = torch.clamp(-scalar_advantages, min=0.0)
+
+        pos_group_mass = torch.bincount(
+            valid_group_ids, weights=positive_mass[valid_rows], minlength=num_groups
+        ).to(dtype=dtype)
+        neg_group_mass = torch.bincount(
+            valid_group_ids, weights=negative_mass[valid_rows], minlength=num_groups
+        ).to(dtype=dtype)
+
+        alpha_pos = torch.where(pos_group_mass > eps, 1.0 / pos_group_mass, torch.ones_like(pos_group_mass))
+        alpha_neg = torch.where(neg_group_mass > eps, 1.0 / neg_group_mass, torch.ones_like(neg_group_mass))
+
+        is_positive = scalar_advantages > 0
+        mass_balance_coeff = torch.where(is_positive, alpha_pos[group_ids], alpha_neg[group_ids])
+        sample_coeff = sample_coeff * mass_balance_coeff
+
+    return advantages * sample_coeff.unsqueeze(-1)
 
 
 @register_adv_est(AdvantageEstimator.GRPO_VECTORIZED)
