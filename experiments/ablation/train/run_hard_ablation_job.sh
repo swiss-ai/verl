@@ -73,8 +73,8 @@ build_overrides() {
     "critic.checkpoint.save_contents=[]"
     "trainer.save_freq=10"
     "trainer.test_freq=20"
-    "trainer.max_actor_ckpt_to_keep=1"
-    "trainer.max_critic_ckpt_to_keep=1"
+    "trainer.max_actor_ckpt_to_keep=2"
+    "trainer.max_critic_ckpt_to_keep=2"
     "algorithm.filter_groups.enable=${ENABLE_FILTER_GROUPS}"
     "algorithm.filter_groups.batch_target=${FILTER_GROUPS_BATCH_TARGET}"
   )
