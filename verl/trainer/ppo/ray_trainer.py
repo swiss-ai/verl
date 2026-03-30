@@ -21,6 +21,7 @@ This trainer supports model-agonistic model initialization with huggingface
 import json
 import math
 import os
+import time
 import uuid
 from collections import defaultdict
 from copy import deepcopy
@@ -680,6 +681,126 @@ class RayPPOTrainer:
                 f"but got {max_rounds} * {rollouts_per_round} < {target_rollouts}."
             )
 
+    @staticmethod
+    def _accumulate_float_metrics(dst: dict[str, float], src: dict[str, float]) -> None:
+        """In-place add all numeric entries from src into dst."""
+        for key, value in src.items():
+            dst[key] = dst.get(key, 0.0) + float(value)
+
+    @staticmethod
+    def _new_adaptive_sampling_metrics_accumulator() -> dict[str, float]:
+        """Create an accumulator for adaptive-group metrics across DAPO rounds."""
+        return {
+            "num_gen_batches": 0.0,
+            "num_prompts": 0.0,
+            "total_rollouts": 0.0,
+            "rollouts_per_prompt_min": float("inf"),
+            "rollouts_per_prompt_max": 0.0,
+            "rounds_executed": 0.0,
+            "prompts_not_completed_in_rounds": 0.0,
+            "max_rounds_unmet_pos_min": 0.0,
+            "max_rounds_unmet_neg_min": 0.0,
+            "pass_rate_weighted_sum": 0.0,
+            "selected_positive_weighted_sum": 0.0,
+            "selected_negative_weighted_sum": 0.0,
+            "selected_positive_ratio_weighted_sum": 0.0,
+        }
+
+    def _accumulate_adaptive_sampling_metrics(
+        self,
+        accumulator: dict[str, float] | None,
+        adaptive_metrics: dict[str, float],
+        num_prompts: int,
+    ) -> dict[str, float]:
+        """Aggregate adaptive-group metrics over multiple DAPO generation rounds."""
+        if accumulator is None:
+            accumulator = self._new_adaptive_sampling_metrics_accumulator()
+
+        prompt_weight = float(max(num_prompts, 0))
+        if prompt_weight <= 0:
+            return accumulator
+
+        total_rollouts = float(adaptive_metrics.get("adaptive_group_sampling/total_rollouts", 0.0))
+        rollouts_per_prompt_min = float(adaptive_metrics.get("adaptive_group_sampling/rollouts_per_prompt_min", 0.0))
+        rollouts_per_prompt_max = float(adaptive_metrics.get("adaptive_group_sampling/rollouts_per_prompt_max", 0.0))
+        rounds_executed = float(adaptive_metrics.get("adaptive_group_sampling/rounds_executed", 0.0))
+        prompts_not_completed = float(
+            adaptive_metrics.get("adaptive_group_sampling/prompts_not_completed_in_rounds", 0.0)
+        )
+        max_rounds_unmet_pos_min = float(adaptive_metrics.get("adaptive_group_sampling/max_rounds_unmet_pos_min", 0.0))
+        max_rounds_unmet_neg_min = float(adaptive_metrics.get("adaptive_group_sampling/max_rounds_unmet_neg_min", 0.0))
+        pass_rate_mean = float(adaptive_metrics.get("adaptive_group_sampling/pass_rate_mean", 0.0))
+        selected_positive_per_prompt_mean = float(
+            adaptive_metrics.get("adaptive_group_sampling/selected_positive_per_prompt_mean", 0.0)
+        )
+        selected_negative_per_prompt_mean = float(
+            adaptive_metrics.get("adaptive_group_sampling/selected_negative_per_prompt_mean", 0.0)
+        )
+        selected_positive_ratio_mean = float(
+            adaptive_metrics.get("adaptive_group_sampling/selected_positive_ratio_mean", 0.0)
+        )
+
+        accumulator["num_gen_batches"] += 1.0
+        accumulator["num_prompts"] += prompt_weight
+        accumulator["total_rollouts"] += total_rollouts
+        accumulator["rollouts_per_prompt_min"] = min(accumulator["rollouts_per_prompt_min"], rollouts_per_prompt_min)
+        accumulator["rollouts_per_prompt_max"] = max(accumulator["rollouts_per_prompt_max"], rollouts_per_prompt_max)
+        accumulator["rounds_executed"] += rounds_executed
+        accumulator["prompts_not_completed_in_rounds"] += prompts_not_completed
+        accumulator["max_rounds_unmet_pos_min"] += max_rounds_unmet_pos_min
+        accumulator["max_rounds_unmet_neg_min"] += max_rounds_unmet_neg_min
+        accumulator["pass_rate_weighted_sum"] += pass_rate_mean * prompt_weight
+        accumulator["selected_positive_weighted_sum"] += selected_positive_per_prompt_mean * prompt_weight
+        accumulator["selected_negative_weighted_sum"] += selected_negative_per_prompt_mean * prompt_weight
+        accumulator["selected_positive_ratio_weighted_sum"] += selected_positive_ratio_mean * prompt_weight
+
+        return accumulator
+
+    def _finalize_adaptive_sampling_metrics(self, accumulator: dict[str, float] | None) -> dict[str, float]:
+        """Compute final adaptive-group metrics from an accumulated DAPO state."""
+        if accumulator is None:
+            return {}
+
+        num_prompts = float(accumulator.get("num_prompts", 0.0))
+        if num_prompts <= 0:
+            return {}
+
+        rollouts_per_prompt_min = float(accumulator.get("rollouts_per_prompt_min", 0.0))
+        if math.isinf(rollouts_per_prompt_min):
+            rollouts_per_prompt_min = 0.0
+
+        return {
+            "adaptive_group_sampling/total_rollouts": float(accumulator.get("total_rollouts", 0.0)),
+            "adaptive_group_sampling/rollouts_per_prompt_mean": float(
+                accumulator.get("total_rollouts", 0.0) / num_prompts
+            ),
+            "adaptive_group_sampling/rollouts_per_prompt_min": rollouts_per_prompt_min,
+            "adaptive_group_sampling/rollouts_per_prompt_max": float(accumulator.get("rollouts_per_prompt_max", 0.0)),
+            "adaptive_group_sampling/rounds_executed": float(accumulator.get("rounds_executed", 0.0)),
+            "adaptive_group_sampling/prompts_not_completed_in_rounds": float(
+                accumulator.get("prompts_not_completed_in_rounds", 0.0)
+            ),
+            "adaptive_group_sampling/max_rounds_unmet_pos_min": float(
+                accumulator.get("max_rounds_unmet_pos_min", 0.0)
+            ),
+            "adaptive_group_sampling/max_rounds_unmet_neg_min": float(
+                accumulator.get("max_rounds_unmet_neg_min", 0.0)
+            ),
+            "adaptive_group_sampling/pass_rate_mean": float(accumulator.get("pass_rate_weighted_sum", 0.0) / num_prompts),
+            "adaptive_group_sampling/selected_positive_per_prompt_mean": float(
+                accumulator.get("selected_positive_weighted_sum", 0.0) / num_prompts
+            ),
+            "adaptive_group_sampling/selected_negative_per_prompt_mean": float(
+                accumulator.get("selected_negative_weighted_sum", 0.0) / num_prompts
+            ),
+            "adaptive_group_sampling/selected_positive_ratio_mean": float(
+                accumulator.get("selected_positive_ratio_weighted_sum", 0.0) / num_prompts
+            ),
+            # Useful when filter-groups triggers >1 generation rounds for one optimizer update.
+            "adaptive_group_sampling/dapo_num_gen_batches": float(accumulator.get("num_gen_batches", 0.0)),
+            "adaptive_group_sampling/dapo_num_prompts": num_prompts,
+        }
+
     def _generate_batch_with_adaptive_group_sampling(
         self,
         batch: DataProto,
@@ -944,7 +1065,7 @@ class RayPPOTrainer:
             "adaptive_group_sampling/prompts_not_completed_in_rounds": float(num_prompts - prompts_completed_early),
             "adaptive_group_sampling/max_rounds_unmet_pos_min": float(active_unmet_min_positive),
             "adaptive_group_sampling/max_rounds_unmet_neg_min": float(active_unmet_min_negative),
-            # NOTE: this is computed with all rollouts, while critic/rewards/mean only sees the selected rollouts
+            # NOTE: this is computed with all rollouts, while critic/rewards/mean only sees the rollouts in the final batch
             "adaptive_group_sampling/pass_rate_mean": float(np.mean(pass_rates)),
             "adaptive_group_sampling/selected_positive_per_prompt_mean": float(np.mean(selected_pos_arr)),
             "adaptive_group_sampling/selected_negative_per_prompt_mean": float(np.mean(selected_neg_arr)),
@@ -1839,6 +1960,8 @@ class RayPPOTrainer:
         pending_prompt_count = 0
         pending_sample_count = 0
         pending_num_gen_batches = 0
+        pending_timing_raw: dict[str, float] = {}
+        pending_adaptive_sampling_metrics: dict[str, float] | None = None
 
         for epoch in range(current_epoch, self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
@@ -1846,6 +1969,7 @@ class RayPPOTrainer:
                     self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=False)
                 metrics = {}
                 timing_raw = {}
+                loop_wall_start = time.perf_counter()
 
                 with marked_timer("start_profile", timing_raw):
                     self._start_profiling(
@@ -1899,6 +2023,7 @@ class RayPPOTrainer:
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
                         if adaptive_group_sampling_enabled:
+                            adaptive_prompt_count = len(batch)
                             batch, reward_extra_infos_dict, adaptive_sampling_metrics = (
                                 self._generate_batch_with_adaptive_group_sampling(
                                     batch=batch,
@@ -1909,7 +2034,14 @@ class RayPPOTrainer:
                                     sleep_replicas_after_sampling=False,
                                 )
                             )
-                            metrics.update(adaptive_sampling_metrics)
+                            if filter_groups_enabled:
+                                pending_adaptive_sampling_metrics = self._accumulate_adaptive_sampling_metrics(
+                                    accumulator=pending_adaptive_sampling_metrics,
+                                    adaptive_metrics=adaptive_sampling_metrics,
+                                    num_prompts=adaptive_prompt_count,
+                                )
+                            else:
+                                metrics.update(adaptive_sampling_metrics)
                         else:
                             gen_batch_output = gen_batch.repeat(
                                 repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
@@ -2086,6 +2218,10 @@ class RayPPOTrainer:
                             max_num_gen_batches = int(filter_groups_cfg["max_num_gen_batches"])
                             if max_num_gen_batches <= 0 or pending_num_gen_batches < max_num_gen_batches:
                                 print(f"[filter_groups] keep generating (rounds_so_far={pending_num_gen_batches})")
+                                self._accumulate_float_metrics(pending_timing_raw, timing_raw)
+                                pending_timing_raw["step"] = pending_timing_raw.get("step", 0.0) + max(
+                                    time.perf_counter() - loop_wall_start, 0.0
+                                )
                                 continue
                             raise ValueError(
                                 f"{pending_num_gen_batches=} >= {max_num_gen_batches=}."
@@ -2128,6 +2264,9 @@ class RayPPOTrainer:
                         reward_precomputed = True
                         reward_extra_infos_dict = {}
                         metrics["train/num_gen_batches"] = float(pending_num_gen_batches)
+
+                    if filter_groups_enabled and adaptive_group_sampling_enabled:
+                        metrics.update(self._finalize_adaptive_sampling_metrics(pending_adaptive_sampling_metrics))
 
                     # Async rollout replicas should only be slept when generation for this
                     # training step is finalized (i.e., not continuing filter retry rounds).
@@ -2377,6 +2516,9 @@ class RayPPOTrainer:
                     prev_step_profile = curr_step_profile
                     curr_step_profile = next_step_profile
 
+                if filter_groups_enabled and pending_timing_raw:
+                    self._accumulate_float_metrics(timing_raw, pending_timing_raw)
+
                 steps_duration = timing_raw["step"]
                 self.max_steps_duration = max(self.max_steps_duration, steps_duration)
 
@@ -2411,6 +2553,8 @@ class RayPPOTrainer:
                     pending_prompt_count = 0
                     pending_sample_count = 0
                     pending_num_gen_batches = 0
+                    pending_timing_raw = {}
+                    pending_adaptive_sampling_metrics = None
 
                 progress_bar.update(1)
                 self.global_steps += 1
