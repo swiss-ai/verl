@@ -13,18 +13,21 @@ HF_HUB_CACHE_DIR="${HF_HUB_CACHE_DIR:-/capstor/scratch/cscs/msantelmo/huggingfac
 
 MODELS=(
   "meta-llama/Llama-3.2-3B-Instruct"
+  "Qwen/Qwen2.5-7B-Instruct"
 )
 
-TASKS_CSV="${TASKS_CSV:-all}"
-FORCE="${FORCE:-false}"
-SAVE_PREDICTIONS="${SAVE_PREDICTIONS:-false}"
+TASKS_CSV="math500,gsm8k,aime2024,aime2025"
+FORCE=false
+SAVE_PREDICTIONS=true
 
-N="${N:-}"
-MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-}"
-TEMPERATURE="${TEMPERATURE:-}"
-TOP_K="${TOP_K:-}"
-TOP_P="${TOP_P:-}"
-SEED="${SEED:-}"
+N=64
+MAX_NEW_TOKENS=8192
+TEMPERATURE=0.6
+TOP_K=""
+TOP_P=0.95
+SEED=42
+
+# Leave to default
 DTYPE="${DTYPE:-}"
 TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-}"
@@ -57,13 +60,21 @@ resolve_model_path() {
   echo "${model}"
 }
 
+normalize_model_tag() {
+  local raw="$1"
+  local tag
+  tag="$(printf '%s' "${raw}" | tr '/:.' '-' | tr -c '[:alnum:]_-' '-')"
+  tag="${tag%-}"
+  echo "${tag}"
+}
+
 submit_base_eval_job() {
   local model="$1"
   local resolved_model
   resolved_model="$(resolve_model_path "${model}")"
 
   local model_tag
-  model_tag="$(basename "${model}" | tr '/:.' '-' | tr -c '[:alnum:]_-' '-')"
+  model_tag="$(normalize_model_tag "$(basename "${model}")")"
   local out_dir="${OUTPUT_ROOT}/${model_tag}"
   mkdir -p "${out_dir}"
 

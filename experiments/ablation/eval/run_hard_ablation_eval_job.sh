@@ -4,8 +4,8 @@
 #SBATCH --container-writable
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --time=06:00:00
-#SBATCH --environment=reasoning
+#SBATCH --time=04:00:00
+#SBATCH --environment=sdpo
 #SBATCH --output=slurm_logs/%x_%j.out
 #SBATCH --error=slurm_logs/%x_%j.err
 
@@ -45,6 +45,9 @@ fi
 
 cd "${WORKING_DIR}"
 
+echo "[setup] Reinstalling local verl"
+pip install --no-deps --no-cache-dir --force-reinstall -e .
+
 append_common_overrides() {
   local -n cmd_ref="$1"
   [[ -n "${N}" ]] && cmd_ref+=(--n "${N}")
@@ -59,6 +62,14 @@ append_common_overrides() {
   [[ -n "${MAX_MODEL_LEN}" ]] && cmd_ref+=(--max-model-len "${MAX_MODEL_LEN}")
   [[ -n "${MAX_NUM_SEQS}" ]] && cmd_ref+=(--max-num-seqs "${MAX_NUM_SEQS}")
   [[ "${SAVE_PREDICTIONS}" == "true" ]] && cmd_ref+=(--save-predictions)
+}
+
+normalize_model_tag() {
+  local raw="$1"
+  local tag
+  tag="$(printf '%s' "${raw}" | tr '/:.' '-' | tr -c '[:alnum:]_-' '-')"
+  tag="${tag%-}"
+  echo "${tag}"
 }
 
 run_checkpoint_eval() {
@@ -99,58 +110,25 @@ run_base_model_eval() {
   if [[ -z "${model_name}" ]]; then
     model_name="$(basename "${MODEL_PATH}")"
   fi
-  model_name="$(echo "${model_name}" | tr '/:.' '-' | tr -c '[:alnum:]_-' '-')"
+  model_name="$(normalize_model_tag "${model_name}")"
 
   local output_dir="${EVAL_OUTPUT_DIR:-${OUTPUT_ROOT}/${model_name}}"
   local eval_log="${EVALUATION_LOG_FILE:-${output_dir}/evaluation_log.jsonl}"
   local eval_script="${WORKING_DIR}/experiments/ablation/eval/evaluate_checkpoint.py"
   mkdir -p "${output_dir}"
 
-  declare -a task_files=()
-  if [[ "${TASKS_CSV}" == "all" ]]; then
-    while IFS= read -r task_file; do
-      task_files+=("${task_file}")
-    done < <(find "${EVAL_DATA_DIR}" -maxdepth 1 -type f -name "*.parquet" | sort)
-  else
-    IFS=',' read -r -a TASKS <<< "${TASKS_CSV}"
-    for task in "${TASKS[@]}"; do
-      task_file="${EVAL_DATA_DIR}/${task}.parquet"
-      if [[ ! -f "${task_file}" ]]; then
-        echo "Task parquet not found: ${task_file}"
-        exit 1
-      fi
-      task_files+=("${task_file}")
-    done
-  fi
-
-  if [[ ${#task_files[@]} -eq 0 ]]; then
-    echo "No task parquet files found in ${EVAL_DATA_DIR}"
-    exit 1
-  fi
-
-  for task_file in "${task_files[@]}"; do
-    task_name="$(basename "${task_file}" .parquet)"
-    task_output_dir="${output_dir}/${task_name}"
-    metrics_file="${task_output_dir}/metrics.json"
-
-    if [[ -f "${metrics_file}" && "${FORCE}" != "true" ]]; then
-      echo "[skip] ${model_name} ${task_name}: metrics already exist"
-      continue
-    fi
-
-    mkdir -p "${task_output_dir}"
-    cmd=(
-      python3 "${eval_script}"
-      --model-path "${MODEL_PATH}"
-      --data-file "${task_file}"
-      --output-dir "${task_output_dir}"
-      --task-name "${task_name}"
-      --evaluation-log-file "${eval_log}"
-    )
-    append_common_overrides cmd
-    echo "[run] ${model_name} ${task_name}"
-    "${cmd[@]}"
-  done
+  cmd=(
+    python3 "${eval_script}"
+    --model-path "${MODEL_PATH}"
+    --eval-data-dir "${EVAL_DATA_DIR}"
+    --tasks "${TASKS_CSV}"
+    --output-dir "${output_dir}"
+    --evaluation-log-file "${eval_log}"
+  )
+  append_common_overrides cmd
+  [[ "${FORCE}" == "true" ]] && cmd+=(--force)
+  echo "[run] ${model_name} tasks=${TASKS_CSV}"
+  "${cmd[@]}"
 
   echo "Base-model evaluation complete."
 }

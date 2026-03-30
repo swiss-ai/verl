@@ -11,10 +11,8 @@ PROJECT_NAME="RLVR-Ada-Math"
 DATA_DIR="${WORKING_DIR}/data/hard_math"
 OUTPUT_ROOT="${WORKING_DIR}/outputs/${PROJECT_NAME}"
 
-DATASET_TAG="hard"
 REPEATS=3
 START_SEED=42
-HF_HUB_CACHE_DIR="${HF_HUB_CACHE_DIR:-/capstor/scratch/cscs/msantelmo/huggingface/hub}"
 
 # DAPO-like filtering settings
 ENABLE_FILTER_GROUPS=true
@@ -39,8 +37,10 @@ RL_ADA_CONFIGS=(
   "2 32 1 1 16 false true"
 )
 # Additional adaptive weighting switches (crossed with every RL_ADA_CONFIGS entry):
+# - apply_inv_pass_rate_weight: inverse pass-rate weighting.
 # - apply_prompt_inverse_group_weight: 1 / K_i prompt-level weighting.
 # - apply_within_prompt_mass_balance: within-prompt +/- mass balancing.
+INV_PASS_RATE_WEIGHT_OPTIONS=(false true)
 PROMPT_INVERSE_GROUP_WEIGHT_OPTIONS=(false true)
 WITHIN_PROMPT_MASS_BALANCE_OPTIONS=(false true)
 
@@ -61,7 +61,8 @@ submit_job() {
   local apply_inv_pass_rate_weight="${12:-true}"
   local apply_prompt_inverse_group_weight="${13:-false}"
   local apply_within_prompt_mass_balance="${14:-false}"
-
+  
+  HF_HUB_CACHE_DIR="/capstor/scratch/cscs/msantelmo/huggingface/hub"
   local model_tag
   model_tag="$(basename "${model}" | tr '/:.' '-' | tr -c '[:alnum:]_-' '-')"
   local resolved_model="${model}"
@@ -75,6 +76,7 @@ submit_job() {
   if [ "${ENABLE_FILTER_GROUPS}" = "true" ]; then
     filter_suffix="__DAPO-${FILTER_GROUPS_BATCH_TARGET}"
   fi
+  DATASET_TAG="$(basename "${DATA_DIR}")"
   local run_name="${DATASET_TAG}__${algo}__${model_tag}${filter_suffix}__${budget_tag}__rep${rep}"
   local wandb_group="${run_name%__rep${rep}}"
   local run_dir="${OUTPUT_ROOT}/${run_name}"
@@ -128,24 +130,26 @@ for model in "${MODELS[@]}"; do
 
     # RL-Ada: round-based adaptive sampling configs
     for cfg in "${RL_ADA_CONFIGS[@]}"; do
-      read -r round_samples max_rounds min_pos min_neg downsample_n apply_downsampling apply_inv_pass_rate_weight <<< "${cfg}"
-      for apply_prompt_inverse_group_weight in "${PROMPT_INVERSE_GROUP_WEIGHT_OPTIONS[@]}"; do
-        for apply_within_prompt_mass_balance in "${WITHIN_PROMPT_MASS_BALANCE_OPTIONS[@]}"; do
-          submit_job \
-            "rl_ada" \
-            "${model}" \
-            "${round_samples}x${max_rounds}_${min_pos}-${min_neg}_k${downsample_n}_d${apply_downsampling}_w${apply_inv_pass_rate_weight}_pk${apply_prompt_inverse_group_weight}_mb${apply_within_prompt_mass_balance}" \
-            "${rep}" \
-            "${seed}" \
-            "${downsample_n}" \
-            "${round_samples}" \
-            "${max_rounds}" \
-            "${min_pos}" \
-            "${min_neg}" \
-            "${apply_downsampling}" \
-            "${apply_inv_pass_rate_weight}" \
-            "${apply_prompt_inverse_group_weight}" \
-            "${apply_within_prompt_mass_balance}"
+      read -r round_samples max_rounds min_pos min_neg downsample_n apply_downsampling <<< "${cfg}"
+      for apply_inv_pass_rate_weight in "${INV_PASS_RATE_WEIGHT_OPTIONS[@]}"; do
+        for apply_prompt_inverse_group_weight in "${PROMPT_INVERSE_GROUP_WEIGHT_OPTIONS[@]}"; do
+          for apply_within_prompt_mass_balance in "${WITHIN_PROMPT_MASS_BALANCE_OPTIONS[@]}"; do
+            submit_job \
+              "rl_ada" \
+              "${model}" \
+              "${round_samples}x${max_rounds}_${min_pos}-${min_neg}_k${downsample_n}_d${apply_downsampling}_w${apply_inv_pass_rate_weight}_pk${apply_prompt_inverse_group_weight}_mb${apply_within_prompt_mass_balance}" \
+              "${rep}" \
+              "${seed}" \
+              "${downsample_n}" \
+              "${round_samples}" \
+              "${max_rounds}" \
+              "${min_pos}" \
+              "${min_neg}" \
+              "${apply_downsampling}" \
+              "${apply_inv_pass_rate_weight}" \
+              "${apply_prompt_inverse_group_weight}" \
+              "${apply_within_prompt_mass_balance}"
+          done
         done
       done
     done

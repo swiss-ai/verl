@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate one model (checkpoint or base) on one parquet task with vLLM."""
+"""Evaluate one model on one or many parquet tasks with a single vLLM engine."""
 
 from __future__ import annotations
 
@@ -18,19 +18,28 @@ from verl.utils.reward_score import default_compute_score
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Evaluate one model on one task parquet with vLLM.")
+    parser = argparse.ArgumentParser(description="Evaluate one model on one or many task parquets with vLLM.")
     parser.add_argument(
         "--model-path",
         required=True,
         help="Model path (e.g. .../global_step_x/actor/huggingface or a base model path/id).",
     )
-    parser.add_argument("--data-file", required=True, help="Path to one preprocessed task parquet file.")
+
+    data_group = parser.add_mutually_exclusive_group(required=True)
+    data_group.add_argument("--data-file", help="Path to one preprocessed task parquet file.")
+    data_group.add_argument("--eval-data-dir", help="Directory containing per-task parquet files.")
+
     parser.add_argument(
         "--output-dir",
         required=True,
-        help="Directory where metrics and optional predictions are written.",
+        help=(
+            "Single-file mode: directory for that task's metrics/predictions. "
+            "Multi-task mode: root directory; each task is written under <output-dir>/<task-name>."
+        ),
     )
-    parser.add_argument("--task-name", default=None, help="Optional task name override.")
+    parser.add_argument("--task-name", default=None, help="Optional task name override (single-file mode only).")
+    parser.add_argument("--tasks", default="all", help="Comma-separated task names in --eval-data-dir mode (default: all).")
+    parser.add_argument("--force", action="store_true", help="Re-run tasks even when metrics.json already exists.")
 
     # Decoding overrides: if omitted, SamplingParams defaults are used.
     parser.add_argument("--n", type=int, default=None, help="Override number of responses per prompt.")
@@ -127,8 +136,8 @@ def summarize_metrics(stats: list[dict[str, int]], k: int) -> dict[str, float]:
     if not stats:
         return {"num_questions": 0.0, f"acc_mean@{k}": 0.0, f"pass@{k}": 0.0}
 
-    acc_vals = []
-    pass_vals = []
+    acc_vals: list[float] = []
+    pass_vals: list[float] = []
     for item in stats:
         n = item["num_samples"]
         c = item["num_correct"]
@@ -150,77 +159,76 @@ def parse_checkpoint_info(model_path: str) -> tuple[str | None, int | None]:
     return match.group(1), int(match.group(2))
 
 
-def main() -> None:
-    args = parse_args()
-    if args.n is not None and args.n <= 0:
-        raise ValueError("--n must be > 0 when provided.")
+def resolve_task_specs(args: argparse.Namespace) -> list[tuple[str, str, str]]:
+    if args.data_file:
+        task_name = args.task_name or os.path.splitext(os.path.basename(args.data_file))[0]
+        return [(task_name, args.data_file, args.output_dir)]
 
-    # 1) Load normalized eval dataset.
-    os.makedirs(args.output_dir, exist_ok=True)
-    df = pd.read_parquet(args.data_file)
-    if len(df) == 0:
-        raise ValueError(f"Dataset is empty: {args.data_file}")
-    if "prompt" not in df.columns:
-        raise KeyError(f"Missing required 'prompt' column in {args.data_file}")
+    assert args.eval_data_dir is not None
+    if not os.path.isdir(args.eval_data_dir):
+        raise FileNotFoundError(f"Eval data directory does not exist: {args.eval_data_dir}")
 
-    # 2) Build vLLM engine config, applying only CLI overrides.
-    llm_kwargs: dict[str, Any] = {"model": args.model_path}
-    for key, value in [
-        ("dtype", args.dtype),
-        ("tensor_parallel_size", args.tensor_parallel_size),
-        ("gpu_memory_utilization", args.gpu_memory_utilization),
-        ("max_model_len", args.max_model_len),
-        ("max_num_seqs", args.max_num_seqs),
-    ]:
-        if value is not None:
-            llm_kwargs[key] = value
-
-    llm = LLM(**llm_kwargs)
-    tokenizer = llm.get_tokenizer()
-    if getattr(tokenizer, "chat_template", None) is None:
-        raise ValueError("Tokenizer has no chat_template; cannot format prompts for chat generation.")
-
-    # 3) Convert dataset prompts into model-ready chat strings.
-    inputs = [
-        tokenizer.apply_chat_template(
-            normalize_prompt_messages(row["prompt"]),
-            tokenize=False,
-            add_generation_prompt=True,
+    task_files: list[tuple[str, str, str]] = []
+    if args.tasks == "all":
+        parquet_files = sorted(
+            os.path.join(args.eval_data_dir, name)
+            for name in os.listdir(args.eval_data_dir)
+            if name.endswith(".parquet") and os.path.isfile(os.path.join(args.eval_data_dir, name))
         )
-        for _, row in df.iterrows()
-    ]
+        for task_file in parquet_files:
+            task_name = os.path.splitext(os.path.basename(task_file))[0]
+            task_files.append((task_name, task_file, os.path.join(args.output_dir, task_name)))
+    else:
+        for task in [item.strip() for item in args.tasks.split(",") if item.strip()]:
+            task_file = os.path.join(args.eval_data_dir, f"{task}.parquet")
+            if not os.path.isfile(task_file):
+                raise FileNotFoundError(f"Task parquet not found: {task_file}")
+            task_files.append((task, task_file, os.path.join(args.output_dir, task)))
 
-    # 4) Build decoding config, again using only explicit overrides.
-    sampling_kwargs: dict[str, Any] = {}
-    for key, value in [
-        ("n", args.n),
-        ("max_tokens", args.max_new_tokens),
-        ("temperature", args.temperature),
-        ("top_k", args.top_k),
-        ("top_p", args.top_p),
-        ("seed", args.seed),
-    ]:
-        if value is not None:
-            sampling_kwargs[key] = value
+    if not task_files:
+        raise ValueError(f"No task parquet files found for tasks='{args.tasks}' in {args.eval_data_dir}")
 
-    # vLLM handles dynamic batching internally while serving this full prompt list.
-    outputs = llm.generate(inputs, sampling_params=SamplingParams(**sampling_kwargs))
+    return task_files
 
-    predictions_path = os.path.join(args.output_dir, "predictions.jsonl")
-    predictions_file = open(predictions_path, "w", encoding="utf-8") if args.save_predictions else None
+
+def evaluate_task(
+    *,
+    llm: LLM,
+    model_path: str,
+    task_name: str,
+    data_file: str,
+    task_output_dir: str,
+    sampling_params: SamplingParams,
+    decoding_overrides: dict[str, Any],
+    vllm_overrides: dict[str, Any],
+    save_predictions: bool,
+    evaluation_log_file: str,
+) -> None:
+    os.makedirs(task_output_dir, exist_ok=True)
+
+    df = pd.read_parquet(data_file)
+    if len(df) == 0:
+        raise ValueError(f"Dataset is empty: {data_file}")
+    if "prompt" not in df.columns:
+        raise KeyError(f"Missing required 'prompt' column in {data_file}")
+
+    messages_batch = [normalize_prompt_messages(row["prompt"]) for _, row in df.iterrows()]
+    outputs = llm.chat(messages=messages_batch, sampling_params=sampling_params)
+
+    predictions_path = os.path.join(task_output_dir, "predictions.jsonl")
+    predictions_file = open(predictions_path, "w", encoding="utf-8") if save_predictions else None
 
     try:
-        # 5) Score every generated response and track per-question correctness counts.
         question_stats: list[dict[str, int]] = []
         per_source_stats: dict[str, list[dict[str, int]]] = {}
 
         for row_idx, request_output in enumerate(outputs):
             row = df.iloc[row_idx]
-            task_name = str(row.get("task", os.path.splitext(os.path.basename(args.data_file))[0]))
             data_source = str(row.get("data_source", "unknown"))
             question_id = str(row.get("question_id", row_idx))
             ground_truth = extract_ground_truth(row)
             extra_info = extract_extra_info(row)
+            model_input_messages = messages_batch[row_idx]
 
             num_samples = 0
             num_correct = 0
@@ -245,6 +253,7 @@ def main() -> None:
                                 "question_id": question_id,
                                 "data_source": data_source,
                                 "response_index": sample_idx,
+                                "input": model_input_messages,
                                 "output": response_text,
                                 "ground_truth": ground_truth,
                                 "score": score_value,
@@ -266,7 +275,6 @@ def main() -> None:
         if predictions_file is not None:
             predictions_file.close()
 
-    # 6) Evaluate only at K_max (largest K available across all questions).
     k_max = min(stat["num_samples"] for stat in question_stats) if question_stats else 1
     overall_metrics = summarize_metrics(question_stats, k=k_max)
     per_data_source_metrics = {
@@ -275,55 +283,30 @@ def main() -> None:
     }
 
     now_iso = datetime.now(timezone.utc).isoformat()
-    checkpoint_name, checkpoint_step = parse_checkpoint_info(args.model_path)
-    task_name = args.task_name or str(df.iloc[0].get("task", os.path.splitext(os.path.basename(args.data_file))[0]))
+    checkpoint_name, checkpoint_step = parse_checkpoint_info(model_path)
 
-    # 7) Persist compact metrics and append an evaluation log row.
     metrics_payload = {
         "datetime_utc": now_iso,
         "task": task_name,
-        "data_file": os.path.abspath(args.data_file),
-        "model_path": args.model_path,
+        "data_file": os.path.abspath(data_file),
+        "model_path": model_path,
         "checkpoint_name": checkpoint_name,
         "checkpoint_step": checkpoint_step,
         "num_questions": len(question_stats),
         "k_evaluated": k_max,
-        "decoding_overrides": {
-            key: value
-            for key, value in {
-                "n": args.n,
-                "max_new_tokens": args.max_new_tokens,
-                "temperature": args.temperature,
-                "top_k": args.top_k,
-                "top_p": args.top_p,
-                "seed": args.seed,
-            }.items()
-            if value is not None
-        },
-        "vllm_overrides": {
-            key: value
-            for key, value in {
-                "dtype": args.dtype,
-                "tensor_parallel_size": args.tensor_parallel_size,
-                "gpu_memory_utilization": args.gpu_memory_utilization,
-                "max_model_len": args.max_model_len,
-                "max_num_seqs": args.max_num_seqs,
-            }.items()
-            if value is not None
-        },
+        "decoding_overrides": decoding_overrides,
+        "vllm_overrides": vllm_overrides,
         "metrics": overall_metrics,
         "metrics_by_data_source": per_data_source_metrics,
-        "saved_predictions": bool(args.save_predictions),
-        "predictions_file": predictions_path if args.save_predictions else None,
+        "saved_predictions": bool(save_predictions),
+        "predictions_file": predictions_path if save_predictions else None,
     }
 
-    metrics_path = os.path.join(args.output_dir, "metrics.json")
+    metrics_path = os.path.join(task_output_dir, "metrics.json")
     with open(metrics_path, "w", encoding="utf-8") as f:
         json.dump(metrics_payload, f, ensure_ascii=False, indent=2)
 
-    log_path = args.evaluation_log_file or os.path.join(args.output_dir, "evaluation_log.jsonl")
-    os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
-    with open(log_path, "a", encoding="utf-8") as f:
+    with open(evaluation_log_file, "a", encoding="utf-8") as f:
         f.write(
             json.dumps(
                 {
@@ -331,8 +314,8 @@ def main() -> None:
                     "task": task_name,
                     "checkpoint_name": checkpoint_name,
                     "checkpoint_step": checkpoint_step,
-                    "model_path": args.model_path,
-                    "data_file": os.path.abspath(args.data_file),
+                    "model_path": model_path,
+                    "data_file": os.path.abspath(data_file),
                     "num_questions": len(question_stats),
                     "k_evaluated": k_max,
                     "metrics": overall_metrics,
@@ -344,11 +327,79 @@ def main() -> None:
         )
 
     print(f"[saved] metrics: {metrics_path}")
-    if args.save_predictions:
+    if save_predictions:
         print(f"[saved] predictions: {predictions_path}")
     else:
         print("[info] predictions.jsonl not saved (use --save-predictions to enable).")
-    print(f"[saved] evaluation log append: {log_path}")
+
+
+def main() -> None:
+    args = parse_args()
+    if args.n is not None and args.n <= 0:
+        raise ValueError("--n must be > 0 when provided.")
+
+    task_specs = resolve_task_specs(args)
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    evaluation_log_file = args.evaluation_log_file or os.path.join(args.output_dir, "evaluation_log.jsonl")
+    os.makedirs(os.path.dirname(evaluation_log_file) or ".", exist_ok=True)
+
+    llm_kwargs: dict[str, Any] = {"model": args.model_path}
+    vllm_overrides: dict[str, Any] = {}
+    for key, value in [
+        ("dtype", args.dtype),
+        ("tensor_parallel_size", args.tensor_parallel_size),
+        ("gpu_memory_utilization", args.gpu_memory_utilization),
+        ("max_model_len", args.max_model_len),
+        ("max_num_seqs", args.max_num_seqs),
+    ]:
+        if value is not None:
+            llm_kwargs[key] = value
+            vllm_overrides[key] = value
+
+    sampling_kwargs: dict[str, Any] = {}
+    decoding_overrides: dict[str, Any] = {}
+    for key, value, metric_key in [
+        ("n", args.n, "n"),
+        ("max_tokens", args.max_new_tokens, "max_new_tokens"),
+        ("temperature", args.temperature, "temperature"),
+        ("top_k", args.top_k, "top_k"),
+        ("top_p", args.top_p, "top_p"),
+        ("seed", args.seed, "seed"),
+    ]:
+        if value is not None:
+            sampling_kwargs[key] = value
+            decoding_overrides[metric_key] = value
+
+    llm = LLM(**llm_kwargs)
+    sampling_params = SamplingParams(**sampling_kwargs)
+
+    completed = 0
+    skipped = 0
+    for task_name, data_file, task_output_dir in task_specs:
+        metrics_file = os.path.join(task_output_dir, "metrics.json")
+        if os.path.isfile(metrics_file) and not args.force:
+            print(f"[skip] {task_name}: metrics already exist")
+            skipped += 1
+            continue
+
+        print(f"[run] {task_name}")
+        evaluate_task(
+            llm=llm,
+            model_path=args.model_path,
+            task_name=task_name,
+            data_file=data_file,
+            task_output_dir=task_output_dir,
+            sampling_params=sampling_params,
+            decoding_overrides=decoding_overrides,
+            vllm_overrides=vllm_overrides,
+            save_predictions=args.save_predictions,
+            evaluation_log_file=evaluation_log_file,
+        )
+        completed += 1
+
+    print(f"[saved] evaluation log append: {evaluation_log_file}")
+    print(f"Evaluation complete. completed={completed}, skipped={skipped}")
 
 
 if __name__ == "__main__":

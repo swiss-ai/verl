@@ -17,19 +17,34 @@ from examples.data_preprocess.math_dataset import extract_solution, make_map_fn
 from verl.utils.hdfs_io import copy, makedirs
 
 BOXED_INSTRUCTION = "Let's think step by step and output the final answer within \\boxed{}."
-DEEPSCALER_HARD_SOURCE = "deepscaler"
-MATH500_HARD_SOURCE = "math500"
-BEYONDAIME_HARD_SOURCE = "beyondaime"
-GSM8K_BOXED_HARD_SOURCE = "gsm8k_boxed"
 
 TRAIN_DATASET_CFG = {
-    "dataset_path": "agentica-org/DeepScaleR-Preview-Dataset",
+    ## DAPO: Medium dataset
+    "dataset_path": "open-r1/DAPO-Math-17k-Processed",
     "split": "train",
-    "config_name": None,
-    "question_key": "problem",
-    "answer_key": "answer",
+    "config_name": "en",
+    "question_key": "prompt",
+    "answer_key": "solution",
     "answer_format": "plain",
-    "output_data_source": DEEPSCALER_HARD_SOURCE,
+    "output_data_source": "dapo_en",
+    
+    # ## MATH: Easy dataset
+    # "dataset_path": "DigitalLearningGmbH/MATH-lighteval",
+    # "split": "train",
+    # "config_name": None,
+    # "question_key": "problem",
+    # "answer_key": "solution",
+    # "answer_format": "plain",
+    # "output_data_source": "DigitalLearningGmbH/MATH-lighteval",
+
+    # ## DeepScaleR: Hard dataset
+    # "dataset_path": "agentica-org/DeepScaleR-Preview-Dataset",
+    # "split": "train",
+    # "config_name": None,
+    # "question_key": "problem",
+    # "answer_key": "answer",
+    # "answer_format": "plain",
+    # "output_data_source": "deepscaler",
 }
 
 TEST_DATASET_CFGS = [
@@ -41,7 +56,7 @@ TEST_DATASET_CFGS = [
         "answer_key": "answer",
         "answer_format": "gsm8k_hash",
         "sample_size": 100, # NOTE: to reduce eval time, we use only 100/1319 samples
-        "output_data_source": GSM8K_BOXED_HARD_SOURCE,
+        "output_data_source": "gsm8k_boxed",
     },
     {
         "dataset_path": "HuggingFaceH4/MATH-500",
@@ -50,7 +65,7 @@ TEST_DATASET_CFGS = [
         "question_key": "problem",
         "answer_key": "answer",
         "answer_format": "plain",
-        "output_data_source": MATH500_HARD_SOURCE,
+        "output_data_source": "math500",
     },
     {
         "dataset_path": "ByteDance-Seed/BeyondAIME",
@@ -59,7 +74,7 @@ TEST_DATASET_CFGS = [
         "question_key": "problem",
         "answer_key": "answer",
         "answer_format": "plain",
-        "output_data_source": BEYONDAIME_HARD_SOURCE,
+        "output_data_source": "beyondaime",
     },
 ]
 

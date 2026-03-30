@@ -110,6 +110,9 @@ if [[ ! -f "${EVAL_SCRIPT}" ]]; then
   exit 1
 fi
 
+echo "[setup] Reinstalling local verl"
+pip install --no-deps --no-cache-dir --force-reinstall -e .
+
 resolve_latest_checkpoint_dir() {
   local run_dir="$1"
   local tracker="${run_dir}/latest_checkpointed_iteration.txt"
@@ -159,62 +162,32 @@ if [[ ! -d "${model_path}" ]]; then
   exit 1
 fi
 
-declare -a TASK_FILES=()
-if [[ "${TASKS_CSV}" == "all" ]]; then
-  while IFS= read -r task_file; do
-    TASK_FILES+=("${task_file}")
-  done < <(find "${EVAL_DATA_DIR}" -maxdepth 1 -type f -name "*.parquet" | sort)
-else
-  IFS=',' read -r -a TASKS <<< "${TASKS_CSV}"
-  for task in "${TASKS[@]}"; do
-    task_file="${EVAL_DATA_DIR}/${task}.parquet"
-    if [[ ! -f "${task_file}" ]]; then
-      echo "Task parquet not found: ${task_file}"
-      exit 1
-    fi
-    TASK_FILES+=("${task_file}")
-  done
-fi
-if [[ ${#TASK_FILES[@]} -eq 0 ]]; then
-  echo "No task parquet files found in ${EVAL_DATA_DIR}"
-  exit 1
-fi
+ckpt_output_dir="${OUTPUT_DIR}/${ckpt_name}"
+mkdir -p "${ckpt_output_dir}"
+cmd=(
+  python3 "${EVAL_SCRIPT}"
+  --model-path "${model_path}"
+  --eval-data-dir "${EVAL_DATA_DIR}"
+  --tasks "${TASKS_CSV}"
+  --output-dir "${ckpt_output_dir}"
+  --evaluation-log-file "${EVALUATION_LOG_FILE}"
+)
 
-for task_file in "${TASK_FILES[@]}"; do
-  task_name="$(basename "${task_file}" .parquet)"
-  task_output_dir="${OUTPUT_DIR}/${ckpt_name}/${task_name}"
-  metrics_file="${task_output_dir}/metrics.json"
+[[ -n "${N}" ]] && cmd+=(--n "${N}")
+[[ -n "${MAX_NEW_TOKENS}" ]] && cmd+=(--max-new-tokens "${MAX_NEW_TOKENS}")
+[[ -n "${TEMPERATURE}" ]] && cmd+=(--temperature "${TEMPERATURE}")
+[[ -n "${TOP_K}" ]] && cmd+=(--top-k "${TOP_K}")
+[[ -n "${TOP_P}" ]] && cmd+=(--top-p "${TOP_P}")
+[[ -n "${SEED}" ]] && cmd+=(--seed "${SEED}")
+[[ -n "${DTYPE}" ]] && cmd+=(--dtype "${DTYPE}")
+[[ -n "${TENSOR_PARALLEL_SIZE}" ]] && cmd+=(--tensor-parallel-size "${TENSOR_PARALLEL_SIZE}")
+[[ -n "${GPU_MEMORY_UTILIZATION}" ]] && cmd+=(--gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}")
+[[ -n "${MAX_MODEL_LEN}" ]] && cmd+=(--max-model-len "${MAX_MODEL_LEN}")
+[[ -n "${MAX_NUM_SEQS}" ]] && cmd+=(--max-num-seqs "${MAX_NUM_SEQS}")
+[[ "${SAVE_PREDICTIONS}" == "true" ]] && cmd+=(--save-predictions)
+[[ "${FORCE}" == "true" ]] && cmd+=(--force)
 
-  if [[ -f "${metrics_file}" && "${FORCE}" != "true" ]]; then
-    echo "[skip] ${ckpt_name} ${task_name}: metrics already exist"
-    continue
-  fi
-
-  mkdir -p "${task_output_dir}"
-  cmd=(
-    python3 "${EVAL_SCRIPT}"
-    --model-path "${model_path}"
-    --data-file "${task_file}"
-    --output-dir "${task_output_dir}"
-    --task-name "${task_name}"
-    --evaluation-log-file "${EVALUATION_LOG_FILE}"
-  )
-
-  [[ -n "${N}" ]] && cmd+=(--n "${N}")
-  [[ -n "${MAX_NEW_TOKENS}" ]] && cmd+=(--max-new-tokens "${MAX_NEW_TOKENS}")
-  [[ -n "${TEMPERATURE}" ]] && cmd+=(--temperature "${TEMPERATURE}")
-  [[ -n "${TOP_K}" ]] && cmd+=(--top-k "${TOP_K}")
-  [[ -n "${TOP_P}" ]] && cmd+=(--top-p "${TOP_P}")
-  [[ -n "${SEED}" ]] && cmd+=(--seed "${SEED}")
-  [[ -n "${DTYPE}" ]] && cmd+=(--dtype "${DTYPE}")
-  [[ -n "${TENSOR_PARALLEL_SIZE}" ]] && cmd+=(--tensor-parallel-size "${TENSOR_PARALLEL_SIZE}")
-  [[ -n "${GPU_MEMORY_UTILIZATION}" ]] && cmd+=(--gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}")
-  [[ -n "${MAX_MODEL_LEN}" ]] && cmd+=(--max-model-len "${MAX_MODEL_LEN}")
-  [[ -n "${MAX_NUM_SEQS}" ]] && cmd+=(--max-num-seqs "${MAX_NUM_SEQS}")
-  [[ "${SAVE_PREDICTIONS}" == "true" ]] && cmd+=(--save-predictions)
-
-  echo "[run] ${ckpt_name} ${task_name}"
-  "${cmd[@]}"
-done
+echo "[run] ${ckpt_name} tasks=${TASKS_CSV}"
+"${cmd[@]}"
 
 echo "Latest-checkpoint evaluation complete."

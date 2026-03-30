@@ -44,7 +44,7 @@ def default_compute_score(
     if data_source == "openai/gsm8k":
         from . import gsm8k
 
-        res = gsm8k.compute_score(solution_str, ground_truth)
+        res = gsm8k.compute_score(solution_str, ground_truth, method="flexible")
     elif data_source in [
         "lighteval/MATH",
         "DigitalLearningGmbH/MATH-lighteval",
@@ -58,6 +58,7 @@ def default_compute_score(
         "aime2026",
         "beyondaime",
         "gsm8k_boxed",
+        "dapo_en",
     ]:
         from . import math_reward
 
