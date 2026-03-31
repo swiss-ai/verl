@@ -19,23 +19,23 @@ from verl.utils.hdfs_io import copy, makedirs
 BOXED_INSTRUCTION = "Let's think step by step and output the final answer within \\boxed{}."
 
 TRAIN_DATASET_CFG = {
-    ## DAPO: Medium dataset
-    "dataset_path": "open-r1/DAPO-Math-17k-Processed",
-    "split": "train",
-    "config_name": "en",
-    "question_key": "prompt",
-    "answer_key": "solution",
-    "answer_format": "plain",
-    "output_data_source": "dapo_en",
-    
-    # ## MATH: Easy dataset
-    # "dataset_path": "DigitalLearningGmbH/MATH-lighteval",
+    # ## DAPO: Medium dataset
+    # "dataset_path": "open-r1/DAPO-Math-17k-Processed",
     # "split": "train",
-    # "config_name": None,
-    # "question_key": "problem",
+    # "config_name": "en",
+    # "question_key": "prompt",
     # "answer_key": "solution",
     # "answer_format": "plain",
-    # "output_data_source": "DigitalLearningGmbH/MATH-lighteval",
+    # "output_data_source": "dapo_en",
+    
+    ## MATH: Easy dataset
+    "dataset_path": "nlile/hendrycks-MATH-benchmark",
+    "split": "train",
+    "config_name": None,
+    "question_key": "problem",
+    "answer_key": "answer",
+    "answer_format": "plain",
+    "output_data_source": "hendrycks-math-12k",
 
     # ## DeepScaleR: Hard dataset
     # "dataset_path": "agentica-org/DeepScaleR-Preview-Dataset",

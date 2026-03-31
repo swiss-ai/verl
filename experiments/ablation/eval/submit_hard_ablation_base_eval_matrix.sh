@@ -4,19 +4,20 @@ set -euo pipefail
 # --------------------------------------------------------------------
 # Submit Slurm jobs to evaluate base models (no training checkpoints).
 # --------------------------------------------------------------------
-WORKING_DIR="${WORKING_DIR:-/capstor/scratch/cscs/msantelmo/inverse_batch/verl}"
+WORKING_DIR="/iopsstor/scratch/cscs/msantelmo/inverse_batch/verl"
 cd "${WORKING_DIR}"
 
-EVAL_DATA_DIR="${EVAL_DATA_DIR:-${WORKING_DIR}/data/eval_benchmarks}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-${WORKING_DIR}/outputs/base_model_eval}"
-HF_HUB_CACHE_DIR="${HF_HUB_CACHE_DIR:-/capstor/scratch/cscs/msantelmo/huggingface/hub}"
+EVAL_DATA_DIR="${WORKING_DIR}/data/eval_benchmarks"
+OUTPUT_ROOT="${WORKING_DIR}/outputs/base_model_eval"
+HF_HUB_CACHE_DIR="/capstor/scratch/cscs/msantelmo/huggingface/hub"
 
 MODELS=(
   "meta-llama/Llama-3.2-3B-Instruct"
-  "Qwen/Qwen2.5-7B-Instruct"
+  "meta-llama/Llama-3.2-1B-Instruct"
+  # "Qwen/Qwen2.5-7B-Instruct"
 )
 
-TASKS_CSV="math500,gsm8k,aime2024,aime2025"
+TASKS_CSV="math500,aime2024,aime2025,amc23,gsm8k"
 FORCE=false
 SAVE_PREDICTIONS=true
 

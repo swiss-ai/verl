@@ -11,7 +11,7 @@
 
 set -xeuo pipefail
 
-WORKING_DIR="${WORKING_DIR:-/capstor/scratch/cscs/msantelmo/inverse_batch/verl}"
+WORKING_DIR="${WORKING_DIR:-/iopsstor/scratch/cscs/msantelmo/inverse_batch/verl}"
 RUN_DIR="${RUN_DIR:-}"
 MODEL_PATH="${MODEL_PATH:-}"
 MODEL_NAME="${MODEL_NAME:-}"
@@ -62,6 +62,7 @@ append_common_overrides() {
   [[ -n "${MAX_MODEL_LEN}" ]] && cmd_ref+=(--max-model-len "${MAX_MODEL_LEN}")
   [[ -n "${MAX_NUM_SEQS}" ]] && cmd_ref+=(--max-num-seqs "${MAX_NUM_SEQS}")
   [[ "${SAVE_PREDICTIONS}" == "true" ]] && cmd_ref+=(--save-predictions)
+  return 0
 }
 
 normalize_model_tag() {

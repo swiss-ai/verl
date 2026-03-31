@@ -133,3 +133,5 @@ outputs/
 slurm_logs/
 core_nid*
 **/figures/
+.codex
+notebooks/

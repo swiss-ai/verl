@@ -59,6 +59,7 @@ def default_compute_score(
         "beyondaime",
         "gsm8k_boxed",
         "dapo_en",
+        "hendrycks-math-12k",
     ]:
         from . import math_reward
 

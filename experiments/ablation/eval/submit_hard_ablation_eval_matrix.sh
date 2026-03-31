@@ -4,28 +4,30 @@ set -euo pipefail
 # --------------------------------------------------------------------
 # Submit one Slurm latest-checkpoint evaluation job per run directory.
 # --------------------------------------------------------------------
-WORKING_DIR="${WORKING_DIR:-/capstor/scratch/cscs/msantelmo/inverse_batch/verl}"
+WORKING_DIR="/iopsstor/scratch/cscs/msantelmo/inverse_batch/verl"
 cd "${WORKING_DIR}"
 
-PROJECT_NAME="${PROJECT_NAME:-RLVR-Ada-Math}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-${WORKING_DIR}/outputs/${PROJECT_NAME}}"
-EVAL_DATA_DIR="${EVAL_DATA_DIR:-${WORKING_DIR}/data/eval_benchmarks}"
-EVAL_OUTPUT_SUBDIR="${EVAL_OUTPUT_SUBDIR:-offline_eval}"
+PROJECT_NAME="RL-Ada-DAPO"
+OUTPUT_ROOT="${WORKING_DIR}/outputs/${PROJECT_NAME}"
+EVAL_DATA_DIR="${WORKING_DIR}/data/eval_benchmarks"
+EVAL_OUTPUT_SUBDIR="eval"
 
-DATASET_TAG="${DATASET_TAG:-hard}"
+DATASET_TAG="easy_math"
 RUN_NAME_REGEX="${RUN_NAME_REGEX:-^${DATASET_TAG}__}"
 EXCLUDE_REGEX="${EXCLUDE_REGEX:-}"
 
-TASKS_CSV="${TASKS_CSV:-all}"
-FORCE="${FORCE:-false}"
-SAVE_PREDICTIONS="${SAVE_PREDICTIONS:-false}"
+TASKS_CSV="math500,aime2024,aime2025,amc23,gsm8k"
+FORCE=false
+SAVE_PREDICTIONS=true
 
-N="${N:-}"
-MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-}"
-TEMPERATURE="${TEMPERATURE:-}"
-TOP_K="${TOP_K:-}"
-TOP_P="${TOP_P:-}"
-SEED="${SEED:-}"
+N=64
+MAX_NEW_TOKENS=8192
+TEMPERATURE=0.6
+TOP_K=""
+TOP_P=0.95
+SEED=42
+
+# Leave to default
 DTYPE="${DTYPE:-}"
 TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-}"

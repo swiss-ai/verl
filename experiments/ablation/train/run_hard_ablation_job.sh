@@ -11,7 +11,7 @@
 
 set -xeuo pipefail
 
-WORKING_DIR="${WORKING_DIR:-/capstor/scratch/cscs/msantelmo/inverse_batch/verl}"
+WORKING_DIR="${WORKING_DIR:-/iopsstor/scratch/cscs/msantelmo/inverse_batch/verl}"
 cd "${WORKING_DIR}"
 
 ALGO="${ALGO:-grpo}" # grpo|maxrl|f_grpo|rl_ada
@@ -19,7 +19,6 @@ MODEL_NAME_OR_PATH="${MODEL_NAME_OR_PATH:-Qwen/Qwen2.5-3B-Instruct}"
 DATA_DIR="${DATA_DIR:-${WORKING_DIR}/data/hard_math}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${WORKING_DIR}/outputs/hard_ablations}"
 PROJECT_NAME="${PROJECT_NAME:-hard-ablation}"
-DATASET_TAG="${DATASET_TAG:-hard}"
 
 # For baselines
 ROLLOUT_N="${ROLLOUT_N:-8}"
@@ -50,7 +49,7 @@ resolve_run_name() {
   model_tag="$(basename "${MODEL_NAME_OR_PATH}" | tr '/:.' '-' | tr -c '[:alnum:]_-' '-')"
   algo_tag="$(echo "${ALGO}" | tr '/:.' '-' | tr -c '[:alnum:]_-' '-')"
   if [ -z "${RUN_NAME}" ]; then
-    RUN_NAME="${DATASET_TAG}__${algo_tag}__${model_tag}__${BUDGET_TAG}__rep${REPEAT_IDX}"
+    RUN_NAME="${algo_tag}__${model_tag}__${BUDGET_TAG}__rep${REPEAT_IDX}"
   fi
   RUN_DIR="${OUTPUT_ROOT}/${RUN_NAME}"
   mkdir -p "${RUN_DIR}"
@@ -71,8 +70,8 @@ build_overrides() {
     "actor_rollout_ref.actor.data_loader_seed=${SEED}"
     "actor_rollout_ref.actor.checkpoint.save_contents=['hf_model']"
     "critic.checkpoint.save_contents=[]"
-    "trainer.save_freq=10"
-    "trainer.test_freq=20"
+    "trainer.save_freq=5"
+    "trainer.test_freq=10"
     "trainer.max_actor_ckpt_to_keep=2"
     "trainer.max_critic_ckpt_to_keep=2"
     "algorithm.filter_groups.enable=${ENABLE_FILTER_GROUPS}"
@@ -136,14 +135,14 @@ case "${ALGO}" in
 esac
 
 # Shared HuggingFace cache (prevents repeated downloads across runs/workers).
-export HF_HOME="${HF_HOME:-/capstor/scratch/cscs/msantelmo/huggingface}"
+export HF_HOME="${HF_HOME:-/iopsstor/scratch/cscs/msantelmo/huggingface}"
 export HF_HUB_CACHE="${HF_HUB_CACHE:-${HF_HUB_CACHE_DIR:-${HF_HOME}/hub}}"
 export HF_HUB_OFFLINE="1"
 export TRANSFORMERS_OFFLINE="1"
 
 resolve_run_name
 
-export WANDB_RUN_GROUP="${WANDB_RUN_GROUP:-${DATASET_TAG}}"
+export WANDB_RUN_GROUP="${WANDB_RUN_GROUP}"
 export WANDB_NAME="${RUN_NAME}"
 
 pip install --no-deps --no-cache-dir --force-reinstall -e .

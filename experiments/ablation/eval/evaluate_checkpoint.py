@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import re
+import statistics
 from datetime import datetime, timezone
 from math import comb
 from typing import Any
@@ -132,24 +133,53 @@ def pass_at_k_estimator(n: int, c: int, k: int) -> float:
     return float(1.0 - (comb(n - c, k) / comb(n, k)))
 
 
-def summarize_metrics(stats: list[dict[str, int]], k: int) -> dict[str, float]:
+def summarize_length_metrics(lengths: list[int]) -> dict[str, float]:
+    if not lengths:
+        return {
+            "response_length_tokens_mean": 0.0,
+            "response_length_tokens_median": 0.0,
+            "response_length_tokens_p25": 0.0,
+            "response_length_tokens_p75": 0.0,
+            "num_responses": 0.0,
+        }
+
+    sorted_lengths = sorted(lengths)
+    return {
+        "response_length_tokens_mean": float(sum(lengths) / len(lengths)),
+        "response_length_tokens_median": float(statistics.median(sorted_lengths)),
+        "response_length_tokens_p25": float(statistics.quantiles(sorted_lengths, n=4, method="inclusive")[0]),
+        "response_length_tokens_p75": float(statistics.quantiles(sorted_lengths, n=4, method="inclusive")[2]),
+        "num_responses": float(len(lengths)),
+    }
+
+
+def summarize_metrics(stats: list[dict[str, Any]], k: int, pass_ks: list[int]) -> dict[str, float]:
     if not stats:
-        return {"num_questions": 0.0, f"acc_mean@{k}": 0.0, f"pass@{k}": 0.0}
+        return {
+            "num_questions": 0.0,
+            f"acc_mean@{k}": 0.0,
+            **{f"pass@{pass_k}": 0.0 for pass_k in pass_ks},
+            **summarize_length_metrics([]),
+        }
 
     acc_vals: list[float] = []
-    pass_vals: list[float] = []
+    metrics = {"num_questions": float(len(stats))}
     for item in stats:
         n = item["num_samples"]
         c = item["num_correct"]
         denom = min(k, n)
         acc_vals.append(float(min(c, denom) / denom) if denom > 0 else 0.0)
-        pass_vals.append(pass_at_k_estimator(n=n, c=c, k=k))
-
-    return {
-        "num_questions": float(len(stats)),
-        f"acc_mean@{k}": float(sum(acc_vals) / len(acc_vals)),
-        f"pass@{k}": float(sum(pass_vals) / len(pass_vals)),
-    }
+    metrics[f"acc_mean@{k}"] = float(sum(acc_vals) / len(acc_vals))
+    metrics.update(
+        {
+            f"pass@{pass_k}": float(
+                sum(pass_at_k_estimator(n=item["num_samples"], c=item["num_correct"], k=pass_k) for item in stats) / len(stats)
+            )
+            for pass_k in pass_ks
+        }
+    )
+    metrics.update(summarize_length_metrics([length for item in stats for length in item["response_lengths"]]))
+    return metrics
 
 
 def parse_checkpoint_info(model_path: str) -> tuple[str | None, int | None]:
@@ -232,9 +262,12 @@ def evaluate_task(
 
             num_samples = 0
             num_correct = 0
+            response_lengths: list[int] = []
             for sample_idx, sample_output in enumerate(request_output.outputs):
                 num_samples += 1
                 response_text = sample_output.text
+                response_length_tokens = len(sample_output.token_ids or [])
+                response_lengths.append(response_length_tokens)
                 score_raw = default_compute_score(
                     data_source=data_source,
                     solution_str=response_text,
@@ -255,6 +288,7 @@ def evaluate_task(
                                 "response_index": sample_idx,
                                 "input": model_input_messages,
                                 "output": response_text,
+                                "response_length_tokens": response_length_tokens,
                                 "ground_truth": ground_truth,
                                 "score": score_value,
                                 "acc": bool(is_correct),
@@ -268,7 +302,7 @@ def evaluate_task(
             if num_samples == 0:
                 raise RuntimeError(f"Question {question_id} produced zero samples.")
 
-            stat = {"num_samples": num_samples, "num_correct": num_correct}
+            stat = {"num_samples": num_samples, "num_correct": num_correct, "response_lengths": response_lengths}
             question_stats.append(stat)
             per_source_stats.setdefault(data_source, []).append(stat)
     finally:
@@ -276,9 +310,10 @@ def evaluate_task(
             predictions_file.close()
 
     k_max = min(stat["num_samples"] for stat in question_stats) if question_stats else 1
-    overall_metrics = summarize_metrics(question_stats, k=k_max)
+    pass_ks = [2**i for i in range(k_max.bit_length()) if 2**i <= k_max]
+    overall_metrics = summarize_metrics(question_stats, k=k_max, pass_ks=pass_ks)
     per_data_source_metrics = {
-        source: summarize_metrics(source_stats, k=k_max)
+        source: summarize_metrics(source_stats, k=k_max, pass_ks=pass_ks)
         for source, source_stats in sorted(per_source_stats.items())
     }
 
@@ -294,6 +329,7 @@ def evaluate_task(
         "checkpoint_step": checkpoint_step,
         "num_questions": len(question_stats),
         "k_evaluated": k_max,
+        "pass_k_values": pass_ks,
         "decoding_overrides": decoding_overrides,
         "vllm_overrides": vllm_overrides,
         "metrics": overall_metrics,
@@ -318,6 +354,7 @@ def evaluate_task(
                     "data_file": os.path.abspath(data_file),
                     "num_questions": len(question_stats),
                     "k_evaluated": k_max,
+                    "pass_k_values": pass_ks,
                     "metrics": overall_metrics,
                     "metrics_file": os.path.abspath(metrics_path),
                 },
