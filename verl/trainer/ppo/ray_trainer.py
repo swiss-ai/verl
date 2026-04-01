@@ -1960,6 +1960,7 @@ class RayPPOTrainer:
         pending_prompt_count = 0
         pending_sample_count = 0
         pending_num_gen_batches = 0
+        pending_total_rollouts = 0
         pending_timing_raw: dict[str, float] = {}
         pending_adaptive_sampling_metrics: dict[str, float] | None = None
 
@@ -2016,6 +2017,8 @@ class RayPPOTrainer:
                     if missing_prompts < len(batch):
                         batch = batch.select_idxs(list(range(missing_prompts)))
                         gen_batch = gen_batch.select_idxs(list(range(missing_prompts)))
+                    if not adaptive_group_sampling_enabled:
+                        pending_total_rollouts += len(gen_batch) * rollout_n
                 gen_batch_output = None
 
                 is_last_step = self.global_steps >= self.total_training_steps
@@ -2264,6 +2267,8 @@ class RayPPOTrainer:
                         reward_precomputed = True
                         reward_extra_infos_dict = {}
                         metrics["train/num_gen_batches"] = float(pending_num_gen_batches)
+                        if not adaptive_group_sampling_enabled:
+                            metrics["adaptive_group_sampling/total_rollouts"] = float(pending_total_rollouts)
 
                     if filter_groups_enabled and adaptive_group_sampling_enabled:
                         metrics.update(self._finalize_adaptive_sampling_metrics(pending_adaptive_sampling_metrics))
@@ -2553,6 +2558,7 @@ class RayPPOTrainer:
                     pending_prompt_count = 0
                     pending_sample_count = 0
                     pending_num_gen_batches = 0
+                    pending_total_rollouts = 0
                     pending_timing_raw = {}
                     pending_adaptive_sampling_metrics = None
 
