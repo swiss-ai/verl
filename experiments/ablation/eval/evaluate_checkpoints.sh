@@ -22,6 +22,7 @@ Optional:
   --seed <int>                Override seed.
   --dtype <str>               Override vLLM dtype.
   --tensor-parallel-size <n>  Override tensor parallel size.
+  --data-parallel-size <n>    Override vLLM data parallel size.
   --gpu-memory-utilization <f>Override vLLM memory utilization.
   --max-model-len <int>       Override vLLM max_model_len.
   --max-num-seqs <int>        Override vLLM max_num_seqs.
@@ -44,6 +45,7 @@ TOP_P=""
 SEED=""
 DTYPE=""
 TENSOR_PARALLEL_SIZE=""
+DATA_PARALLEL_SIZE=""
 GPU_MEMORY_UTILIZATION=""
 MAX_MODEL_LEN=""
 MAX_NUM_SEQS=""
@@ -66,6 +68,7 @@ while [[ $# -gt 0 ]]; do
     --seed) SEED="$2"; shift 2 ;;
     --dtype) DTYPE="$2"; shift 2 ;;
     --tensor-parallel-size) TENSOR_PARALLEL_SIZE="$2"; shift 2 ;;
+    --data-parallel-size) DATA_PARALLEL_SIZE="$2"; shift 2 ;;
     --gpu-memory-utilization) GPU_MEMORY_UTILIZATION="$2"; shift 2 ;;
     --max-model-len) MAX_MODEL_LEN="$2"; shift 2 ;;
     --max-num-seqs) MAX_NUM_SEQS="$2"; shift 2 ;;
@@ -165,7 +168,6 @@ fi
 ckpt_output_dir="${OUTPUT_DIR}/${ckpt_name}"
 mkdir -p "${ckpt_output_dir}"
 cmd=(
-  python3 "${EVAL_SCRIPT}"
   --model-path "${model_path}"
   --eval-data-dir "${EVAL_DATA_DIR}"
   --tasks "${TASKS_CSV}"
@@ -181,6 +183,7 @@ cmd=(
 [[ -n "${SEED}" ]] && cmd+=(--seed "${SEED}")
 [[ -n "${DTYPE}" ]] && cmd+=(--dtype "${DTYPE}")
 [[ -n "${TENSOR_PARALLEL_SIZE}" ]] && cmd+=(--tensor-parallel-size "${TENSOR_PARALLEL_SIZE}")
+[[ -n "${DATA_PARALLEL_SIZE}" ]] && cmd+=(--data-parallel-size "${DATA_PARALLEL_SIZE}")
 [[ -n "${GPU_MEMORY_UTILIZATION}" ]] && cmd+=(--gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}")
 [[ -n "${MAX_MODEL_LEN}" ]] && cmd+=(--max-model-len "${MAX_MODEL_LEN}")
 [[ -n "${MAX_NUM_SEQS}" ]] && cmd+=(--max-num-seqs "${MAX_NUM_SEQS}")
@@ -188,6 +191,10 @@ cmd=(
 [[ "${FORCE}" == "true" ]] && cmd+=(--force)
 
 echo "[run] ${ckpt_name} tasks=${TASKS_CSV}"
-"${cmd[@]}"
+if [[ -n "${DATA_PARALLEL_SIZE}" && "${DATA_PARALLEL_SIZE}" -gt 1 ]]; then
+  python3 -m torch.distributed.run --standalone --nproc_per_node "${DATA_PARALLEL_SIZE}" -- "${EVAL_SCRIPT}" "${cmd[@]}"
+else
+  python3 "${EVAL_SCRIPT}" "${cmd[@]}"
+fi
 
 echo "Latest-checkpoint evaluation complete."

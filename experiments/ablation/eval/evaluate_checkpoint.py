@@ -53,6 +53,7 @@ def parse_args() -> argparse.Namespace:
     # vLLM/model overrides: if omitted, LLM defaults are used.
     parser.add_argument("--dtype", default=None, help="Override vLLM dtype.")
     parser.add_argument("--tensor-parallel-size", type=int, default=None, help="Override tensor parallel size.")
+    parser.add_argument("--data-parallel-size", type=int, default=None, help="Override vLLM data parallel size.")
     parser.add_argument(
         "--gpu-memory-utilization",
         type=float,
@@ -221,90 +222,116 @@ def resolve_task_specs(args: argparse.Namespace) -> list[tuple[str, str, str]]:
     return task_files
 
 
-def evaluate_task(
+def shard_bounds(total: int, rank: int, world_size: int) -> tuple[int, int]:
+    floor = total // world_size
+    remainder = total % world_size
+
+    def start(shard_rank: int) -> int:
+        return shard_rank * floor + min(shard_rank, remainder)
+
+    return start(rank), start(rank + 1)
+
+
+def score_outputs(
     *,
-    llm: LLM,
+    task_name: str,
+    rows: pd.DataFrame,
+    messages_batch: list[list[dict[str, str]]],
+    outputs: list[Any],
+    save_predictions: bool,
+) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    for (row_idx, row), model_input_messages, request_output in zip(rows.iterrows(), messages_batch, outputs, strict=True):
+        data_source = str(row.get("data_source", "unknown"))
+        ground_truth = extract_ground_truth(row)
+        extra_info = extract_extra_info(row)
+
+        num_samples = 0
+        num_correct = 0
+        response_lengths: list[int] = []
+        predictions: list[dict[str, Any]] = []
+        for sample_idx, sample_output in enumerate(request_output.outputs):
+            num_samples += 1
+            response_text = sample_output.text
+            response_length_tokens = len(sample_output.token_ids or [])
+            response_lengths.append(response_length_tokens)
+            score_raw = default_compute_score(
+                data_source=data_source,
+                solution_str=response_text,
+                ground_truth=ground_truth,
+                extra_info=extra_info,
+            )
+            score_value, is_correct, pred_value = parse_score(score_raw)
+            if is_correct:
+                num_correct += 1
+
+            if save_predictions:
+                predictions.append(
+                    {
+                        "task": task_name,
+                        "row_idx": int(row_idx),
+                        "question_id": str(row.get("question_id", row_idx)),
+                        "data_source": data_source,
+                        "response_index": sample_idx,
+                        "input": model_input_messages,
+                        "output": response_text,
+                        "response_length_tokens": response_length_tokens,
+                        "ground_truth": ground_truth,
+                        "score": score_value,
+                        "acc": bool(is_correct),
+                        "pred": pred_value,
+                    }
+                )
+
+        if num_samples == 0:
+            raise RuntimeError(f"Question {row.get('question_id', row_idx)} produced zero samples.")
+
+        results.append(
+            {
+                "row_idx": int(row_idx),
+                "data_source": data_source,
+                "num_samples": num_samples,
+                "num_correct": num_correct,
+                "response_lengths": response_lengths,
+                "predictions": predictions,
+            }
+        )
+
+    return results
+
+
+def save_task_outputs(
+    *,
     model_path: str,
     task_name: str,
     data_file: str,
     task_output_dir: str,
-    sampling_params: SamplingParams,
     decoding_overrides: dict[str, Any],
     vllm_overrides: dict[str, Any],
     save_predictions: bool,
     evaluation_log_file: str,
+    question_results: list[dict[str, Any]],
 ) -> None:
     os.makedirs(task_output_dir, exist_ok=True)
-
-    df = pd.read_parquet(data_file)
-    if len(df) == 0:
-        raise ValueError(f"Dataset is empty: {data_file}")
-    if "prompt" not in df.columns:
-        raise KeyError(f"Missing required 'prompt' column in {data_file}")
-
-    messages_batch = [normalize_prompt_messages(row["prompt"]) for _, row in df.iterrows()]
-    outputs = llm.chat(messages=messages_batch, sampling_params=sampling_params)
-
     predictions_path = os.path.join(task_output_dir, "predictions.jsonl")
     predictions_file = open(predictions_path, "w", encoding="utf-8") if save_predictions else None
 
     try:
-        question_stats: list[dict[str, int]] = []
+        question_stats: list[dict[str, Any]] = []
         per_source_stats: dict[str, list[dict[str, int]]] = {}
-
-        for row_idx, request_output in enumerate(outputs):
-            row = df.iloc[row_idx]
-            data_source = str(row.get("data_source", "unknown"))
-            question_id = str(row.get("question_id", row_idx))
-            ground_truth = extract_ground_truth(row)
-            extra_info = extract_extra_info(row)
-            model_input_messages = messages_batch[row_idx]
-
-            num_samples = 0
-            num_correct = 0
-            response_lengths: list[int] = []
-            for sample_idx, sample_output in enumerate(request_output.outputs):
-                num_samples += 1
-                response_text = sample_output.text
-                response_length_tokens = len(sample_output.token_ids or [])
-                response_lengths.append(response_length_tokens)
-                score_raw = default_compute_score(
-                    data_source=data_source,
-                    solution_str=response_text,
-                    ground_truth=ground_truth,
-                    extra_info=extra_info,
-                )
-                score_value, is_correct, pred_value = parse_score(score_raw)
-                if is_correct:
-                    num_correct += 1
-
-                if predictions_file is not None:
-                    predictions_file.write(
-                        json.dumps(
-                            {
-                                "task": task_name,
-                                "question_id": question_id,
-                                "data_source": data_source,
-                                "response_index": sample_idx,
-                                "input": model_input_messages,
-                                "output": response_text,
-                                "response_length_tokens": response_length_tokens,
-                                "ground_truth": ground_truth,
-                                "score": score_value,
-                                "acc": bool(is_correct),
-                                "pred": pred_value,
-                            },
-                            ensure_ascii=False,
-                        )
-                        + "\n"
-                    )
-
-            if num_samples == 0:
-                raise RuntimeError(f"Question {question_id} produced zero samples.")
-
-            stat = {"num_samples": num_samples, "num_correct": num_correct, "response_lengths": response_lengths}
+        for result in sorted(question_results, key=lambda item: item["row_idx"]):
+            stat = {
+                "num_samples": result["num_samples"],
+                "num_correct": result["num_correct"],
+                "response_lengths": result["response_lengths"],
+            }
             question_stats.append(stat)
-            per_source_stats.setdefault(data_source, []).append(stat)
+            per_source_stats.setdefault(result["data_source"], []).append(stat)
+            if predictions_file is not None:
+                for prediction in result["predictions"]:
+                    payload = dict(prediction)
+                    payload.pop("row_idx", None)
+                    predictions_file.write(json.dumps(payload, ensure_ascii=False) + "\n")
     finally:
         if predictions_file is not None:
             predictions_file.close()
@@ -370,16 +397,91 @@ def evaluate_task(
         print("[info] predictions.jsonl not saved (use --save-predictions to enable).")
 
 
+def evaluate_task(
+    *,
+    llm: LLM,
+    model_path: str,
+    task_name: str,
+    data_file: str,
+    task_output_dir: str,
+    sampling_params: SamplingParams,
+    decoding_overrides: dict[str, Any],
+    vllm_overrides: dict[str, Any],
+    save_predictions: bool,
+    evaluation_log_file: str,
+    data_parallel_rank: int = 0,
+    data_parallel_size: int = 1,
+) -> None:
+    df = pd.read_parquet(data_file)
+    if len(df) == 0:
+        raise ValueError(f"Dataset is empty: {data_file}")
+    if "prompt" not in df.columns:
+        raise KeyError(f"Missing required 'prompt' column in {data_file}")
+
+    start, end = shard_bounds(len(df), data_parallel_rank, data_parallel_size)
+    shard_df = df.iloc[start:end]
+    question_results: list[dict[str, Any]] = []
+    if len(shard_df) > 0:
+        messages_batch = [normalize_prompt_messages(row["prompt"]) for _, row in shard_df.iterrows()]
+        outputs = llm.chat(messages=messages_batch, sampling_params=sampling_params)
+        question_results = score_outputs(
+            task_name=task_name,
+            rows=shard_df,
+            messages_batch=messages_batch,
+            outputs=outputs,
+            save_predictions=save_predictions,
+        )
+
+    if data_parallel_size > 1:
+        import torch.distributed as dist
+
+        gather_group = None
+        if not dist.is_initialized():
+            dist.init_process_group(backend="gloo")
+        elif dist.get_backend() != "gloo":
+            gather_group = dist.new_group(backend="gloo")
+        gathered = [None] * data_parallel_size if data_parallel_rank == 0 else None
+        dist.gather_object(question_results, gathered, dst=0, group=gather_group)
+        if gather_group is not None:
+            dist.destroy_process_group(gather_group)
+        if data_parallel_rank != 0:
+            return
+        question_results = [item for shard_results in gathered for item in shard_results]
+
+    save_task_outputs(
+        model_path=model_path,
+        task_name=task_name,
+        data_file=data_file,
+        task_output_dir=task_output_dir,
+        decoding_overrides=decoding_overrides,
+        vllm_overrides=vllm_overrides,
+        save_predictions=save_predictions,
+        evaluation_log_file=evaluation_log_file,
+        question_results=question_results,
+    )
+
+
 def main() -> None:
     args = parse_args()
     if args.n is not None and args.n <= 0:
         raise ValueError("--n must be > 0 when provided.")
+    if args.data_parallel_size is not None and args.data_parallel_size <= 0:
+        raise ValueError("--data-parallel-size must be > 0 when provided.")
 
     task_specs = resolve_task_specs(args)
     os.makedirs(args.output_dir, exist_ok=True)
+    data_parallel_size = args.data_parallel_size or 1
+    data_parallel_rank = int(os.environ.get("RANK", "0"))
+    if data_parallel_size > 1:
+        world_size = int(os.environ.get("WORLD_SIZE", "0"))
+        if world_size != data_parallel_size:
+            raise ValueError(
+                f"--data-parallel-size={data_parallel_size} requires torchrun with WORLD_SIZE={data_parallel_size}, got {world_size}."
+            )
 
     evaluation_log_file = args.evaluation_log_file or os.path.join(args.output_dir, "evaluation_log.jsonl")
-    os.makedirs(os.path.dirname(evaluation_log_file) or ".", exist_ok=True)
+    if data_parallel_rank == 0:
+        os.makedirs(os.path.dirname(evaluation_log_file) or ".", exist_ok=True)
 
     llm_kwargs: dict[str, Any] = {"model": args.model_path}
     vllm_overrides: dict[str, Any] = {}
@@ -393,6 +495,10 @@ def main() -> None:
         if value is not None:
             llm_kwargs[key] = value
             vllm_overrides[key] = value
+    if data_parallel_size > 1:
+        llm_kwargs["data_parallel_size"] = args.data_parallel_size
+        llm_kwargs["distributed_executor_backend"] = "external_launcher"
+        vllm_overrides["data_parallel_size"] = args.data_parallel_size
 
     sampling_kwargs: dict[str, Any] = {}
     decoding_overrides: dict[str, Any] = {}
@@ -408,19 +514,20 @@ def main() -> None:
             sampling_kwargs[key] = value
             decoding_overrides[metric_key] = value
 
+    skipped = 0
+    completed = 0
     llm = LLM(**llm_kwargs)
     sampling_params = SamplingParams(**sampling_kwargs)
-
-    completed = 0
-    skipped = 0
     for task_name, data_file, task_output_dir in task_specs:
         metrics_file = os.path.join(task_output_dir, "metrics.json")
         if os.path.isfile(metrics_file) and not args.force:
-            print(f"[skip] {task_name}: metrics already exist")
+            if data_parallel_rank == 0:
+                print(f"[skip] {task_name}: metrics already exist")
             skipped += 1
             continue
 
-        print(f"[run] {task_name}")
+        if data_parallel_rank == 0:
+            print(f"[run] {task_name}")
         evaluate_task(
             llm=llm,
             model_path=args.model_path,
@@ -432,11 +539,20 @@ def main() -> None:
             vllm_overrides=vllm_overrides,
             save_predictions=args.save_predictions,
             evaluation_log_file=evaluation_log_file,
+            data_parallel_rank=data_parallel_rank,
+            data_parallel_size=data_parallel_size,
         )
         completed += 1
 
-    print(f"[saved] evaluation log append: {evaluation_log_file}")
-    print(f"Evaluation complete. completed={completed}, skipped={skipped}")
+    if data_parallel_size > 1:
+        import torch.distributed as dist
+
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+    if data_parallel_rank == 0:
+        print(f"[saved] evaluation log append: {evaluation_log_file}")
+        print(f"Evaluation complete. completed={completed}, skipped={skipped}")
 
 
 if __name__ == "__main__":

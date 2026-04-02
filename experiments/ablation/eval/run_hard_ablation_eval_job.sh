@@ -4,7 +4,7 @@
 #SBATCH --container-writable
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --time=04:00:00
+#SBATCH --time=08:00:00
 #SBATCH --environment=sdpo
 #SBATCH --output=slurm_logs/%x_%j.out
 #SBATCH --error=slurm_logs/%x_%j.err
@@ -30,7 +30,8 @@ TOP_K="${TOP_K:-}"
 TOP_P="${TOP_P:-}"
 SEED="${SEED:-}"
 DTYPE="${DTYPE:-}"
-TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-}"
+TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
+DATA_PARALLEL_SIZE="${DATA_PARALLEL_SIZE:-4}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-}"
@@ -58,6 +59,7 @@ append_common_overrides() {
   [[ -n "${SEED}" ]] && cmd_ref+=(--seed "${SEED}")
   [[ -n "${DTYPE}" ]] && cmd_ref+=(--dtype "${DTYPE}")
   [[ -n "${TENSOR_PARALLEL_SIZE}" ]] && cmd_ref+=(--tensor-parallel-size "${TENSOR_PARALLEL_SIZE}")
+  [[ -n "${DATA_PARALLEL_SIZE}" ]] && cmd_ref+=(--data-parallel-size "${DATA_PARALLEL_SIZE}")
   [[ -n "${GPU_MEMORY_UTILIZATION}" ]] && cmd_ref+=(--gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}")
   [[ -n "${MAX_MODEL_LEN}" ]] && cmd_ref+=(--max-model-len "${MAX_MODEL_LEN}")
   [[ -n "${MAX_NUM_SEQS}" ]] && cmd_ref+=(--max-num-seqs "${MAX_NUM_SEQS}")
@@ -119,7 +121,6 @@ run_base_model_eval() {
   mkdir -p "${output_dir}"
 
   cmd=(
-    python3 "${eval_script}"
     --model-path "${MODEL_PATH}"
     --eval-data-dir "${EVAL_DATA_DIR}"
     --tasks "${TASKS_CSV}"
@@ -129,7 +130,11 @@ run_base_model_eval() {
   append_common_overrides cmd
   [[ "${FORCE}" == "true" ]] && cmd+=(--force)
   echo "[run] ${model_name} tasks=${TASKS_CSV}"
-  "${cmd[@]}"
+  if [[ -n "${DATA_PARALLEL_SIZE}" && "${DATA_PARALLEL_SIZE}" -gt 1 ]]; then
+    python3 -m torch.distributed.run --standalone --nproc_per_node "${DATA_PARALLEL_SIZE}" -- "${eval_script}" "${cmd[@]}"
+  else
+    python3 "${eval_script}" "${cmd[@]}"
+  fi
 
   echo "Base-model evaluation complete."
 }
