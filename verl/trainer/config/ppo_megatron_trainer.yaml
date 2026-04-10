@@ -143,7 +143,6 @@ algorithm:
     enable: False
     metric: acc
     max_num_gen_batches: 0
-    batch_target: prompts
 
 trainer:
   balance_batch: True

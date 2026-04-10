@@ -585,15 +585,11 @@ class RayPPOTrainer:
         max_num_gen_batches = filter_cfg.get("max_num_gen_batches", 0)
         if max_num_gen_batches is None:
             max_num_gen_batches = 0
-        batch_target = filter_cfg.get("batch_target", "prompts")
-        if batch_target is None:
-            batch_target = "prompts"
 
         return {
             "enable": bool(filter_cfg.get("enable", False)),
             "metric": filter_cfg.get("metric", None),
             "max_num_gen_batches": int(max_num_gen_batches),
-            "batch_target": str(batch_target).lower(),
         }
 
     def _validate_filter_groups_config(self, filter_cfg: dict[str, Any]) -> None:
@@ -606,11 +602,6 @@ class RayPPOTrainer:
             raise ValueError("algorithm.filter_groups.metric must be set when algorithm.filter_groups.enable=True.")
         if self.config.actor_rollout_ref.rollout.n <= 1:
             raise ValueError("Filter groups requires actor_rollout_ref.rollout.n > 1.")
-        if filter_cfg["batch_target"] not in {"prompts", "samples"}:
-            raise ValueError(
-                "algorithm.filter_groups.batch_target must be one of {'prompts', 'samples'} "
-                f"when algorithm.filter_groups.enable=True, got {filter_cfg['batch_target']}."
-            )
 
     def _get_adaptive_group_sampling_config(self) -> dict[str, Any]:
         """Resolve adaptive group sampling config from algorithm.adaptive_group_sampling."""
@@ -2022,7 +2013,6 @@ class RayPPOTrainer:
         next_step_profile = False
         pending_filtered_batch = None
         pending_prompt_count = 0
-        pending_sample_count = 0
         pending_num_gen_batches = 0
         pending_total_rollouts = 0
         pending_timing_raw: dict[str, float] = {}
@@ -2064,7 +2054,6 @@ class RayPPOTrainer:
                 future_reward = None
                 rollout_n = int(self.config.actor_rollout_ref.rollout.n)
                 prompt_bsz = int(self.config.data.train_batch_size)
-                sample_bsz = prompt_bsz * rollout_n
                 adaptive_target_prompt_count = len(batch)
                 prompts_to_generate = len(batch)
 
@@ -2073,22 +2062,11 @@ class RayPPOTrainer:
                     # (or fewer when filter-groups only needs a smaller remainder),
                     # while allowing an oversampled candidate pool for prompt replacement.
                     oversampling_factor = float(adaptive_group_sampling_cfg["prompt_oversampling_factor"])
-                    if filter_groups_cfg["batch_target"] == "samples":
-                        if filter_groups_enabled:
-                            missing_samples = max(sample_bsz - pending_sample_count, 0)
-                            if not adaptive_group_sampling_cfg["apply_downsampling"]:
-                                missing_prompts = missing_samples
-                            else:
-                                missing_prompts = int(math.ceil(missing_samples / max(rollout_n, 1)))
-                            adaptive_target_prompt_count = max(1, min(len(batch), int(missing_prompts)))
-                        else:
-                            adaptive_target_prompt_count = max(1, min(len(batch), prompt_bsz))
+                    if filter_groups_enabled:
+                        missing_prompts = max(prompt_bsz - pending_prompt_count, 0)
+                        adaptive_target_prompt_count = max(1, min(len(batch), int(missing_prompts)))
                     else:
-                        if filter_groups_enabled:
-                            missing_prompts = max(prompt_bsz - pending_prompt_count, 0)
-                            adaptive_target_prompt_count = max(1, min(len(batch), int(missing_prompts)))
-                        else:
-                            adaptive_target_prompt_count = max(1, min(len(batch), prompt_bsz))
+                        adaptive_target_prompt_count = max(1, min(len(batch), prompt_bsz))
 
                     prompts_to_generate = int(math.ceil(adaptive_target_prompt_count * oversampling_factor))
                     prompts_to_generate = max(adaptive_target_prompt_count, prompts_to_generate)
@@ -2096,11 +2074,7 @@ class RayPPOTrainer:
                 elif filter_groups_enabled:
                     # Optimization when filter-groups is enabled: only generate the number of prompts
                     # needed to satisfy the current accumulation target.
-                    if filter_groups_cfg["batch_target"] == "samples":
-                        missing_samples = max(sample_bsz - pending_sample_count, 0)
-                        missing_prompts = int(math.ceil(missing_samples / max(rollout_n, 1)))
-                    else:
-                        missing_prompts = max(prompt_bsz - pending_prompt_count, 0)
+                    missing_prompts = max(prompt_bsz - pending_prompt_count, 0)
                     prompts_to_generate = max(1, min(len(batch), int(missing_prompts)))
 
                 if prompts_to_generate < len(batch):
@@ -2285,7 +2259,6 @@ class RayPPOTrainer:
                             if traj_from_prompt_uid in kept_prompt_uids
                         ]
                         kept_sample_count_this_round = len(kept_traj_idxs)
-                        pending_sample_count += kept_sample_count_this_round
                         batch = batch[kept_traj_idxs]
                         pending_filtered_batch = (
                             batch
@@ -2293,15 +2266,9 @@ class RayPPOTrainer:
                             else DataProto.concat([pending_filtered_batch, batch])
                         )
 
-                        batch_target = filter_groups_cfg["batch_target"]
-                        if batch_target == "samples":
-                            has_enough = pending_sample_count >= sample_bsz
-                            curr_count = pending_sample_count
-                            target_count = sample_bsz
-                        else:
-                            has_enough = pending_prompt_count >= prompt_bsz
-                            curr_count = pending_prompt_count
-                            target_count = prompt_bsz
+                        has_enough = pending_prompt_count >= prompt_bsz
+                        curr_count = pending_prompt_count
+                        target_count = prompt_bsz
 
                         if not has_enough:
                             print(
@@ -2309,7 +2276,7 @@ class RayPPOTrainer:
                                 f"round={pending_num_gen_batches}, "
                                 f"kept_prompts_this_round={kept_prompt_count_this_round}, "
                                 f"kept_samples_this_round={kept_sample_count_this_round}, "
-                                f"accumulated_{batch_target}={curr_count}/{target_count}"
+                                f"accumulated_prompts={curr_count}/{target_count}"
                             )
                             max_num_gen_batches = int(filter_groups_cfg["max_num_gen_batches"])
                             if max_num_gen_batches <= 0 or pending_num_gen_batches < max_num_gen_batches:
@@ -2328,28 +2295,20 @@ class RayPPOTrainer:
                             print(
                                 "[filter_groups] criteria met; "
                                 f"rounds_executed={pending_num_gen_batches}, "
-                                f"accumulated_{batch_target}={curr_count}/{target_count}"
+                                f"accumulated_prompts={curr_count}/{target_count}"
                             )
 
                         if pending_filtered_batch is None:
                             raise ValueError("No filtered samples collected. Please check filter_groups settings.")
-                        prompt_uid2sample_count = defaultdict(int)
-                        for prompt_uid in pending_filtered_batch.non_tensor_batch["uid"]:
-                            prompt_uid2sample_count[prompt_uid] += 1
 
                         selected_prompt_count = 0
-                        selected_sample_count = 0
                         selected_prompt_uid_set = set()
                         for prompt_uid in pending_filtered_batch.non_tensor_batch["uid"]:
                             if prompt_uid in selected_prompt_uid_set:
                                 continue
                             selected_prompt_uid_set.add(prompt_uid)
                             selected_prompt_count += 1
-                            selected_sample_count += prompt_uid2sample_count[prompt_uid]
-                            if (
-                                (batch_target == "samples" and selected_sample_count >= sample_bsz)
-                                or (batch_target == "prompts" and selected_prompt_count >= prompt_bsz)
-                            ):
+                            if selected_prompt_count >= prompt_bsz:
                                 break
                         selected_traj_idxs = [
                             idx
@@ -2649,7 +2608,6 @@ class RayPPOTrainer:
                 if filter_groups_enabled:
                     pending_filtered_batch = None
                     pending_prompt_count = 0
-                    pending_sample_count = 0
                     pending_num_gen_batches = 0
                     pending_total_rollouts = 0
                     pending_timing_raw = {}

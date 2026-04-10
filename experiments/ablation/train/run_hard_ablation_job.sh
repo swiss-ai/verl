@@ -35,7 +35,6 @@ APPLY_WITHIN_PROMPT_MASS_BALANCE="${APPLY_WITHIN_PROMPT_MASS_BALANCE:-false}"
 
 # DAPO-like filtering
 ENABLE_FILTER_GROUPS="${ENABLE_FILTER_GROUPS:-false}"
-FILTER_GROUPS_BATCH_TARGET="${FILTER_GROUPS_BATCH_TARGET:-prompts}"
 
 REPEAT_IDX="${REPEAT_IDX:-1}"
 SEED="${SEED:-42}"
@@ -75,7 +74,6 @@ build_overrides() {
     "trainer.max_actor_ckpt_to_keep=2"
     "trainer.max_critic_ckpt_to_keep=2"
     "algorithm.filter_groups.enable=${ENABLE_FILTER_GROUPS}"
-    "algorithm.filter_groups.batch_target=${FILTER_GROUPS_BATCH_TARGET}"
   )
 
   if [ "${ALGO}" = "rl_ada" ]; then
@@ -112,7 +110,6 @@ write_metadata() {
     echo "REPEAT_IDX=${REPEAT_IDX}"
     echo "BUDGET_TAG=${BUDGET_TAG}"
     echo "ENABLE_FILTER_GROUPS=${ENABLE_FILTER_GROUPS}"
-    echo "FILTER_GROUPS_BATCH_TARGET=${FILTER_GROUPS_BATCH_TARGET}"
     echo "APPLY_PROMPT_INVERSE_GROUP_WEIGHT=${APPLY_PROMPT_INVERSE_GROUP_WEIGHT}"
     echo "APPLY_WITHIN_PROMPT_MASS_BALANCE=${APPLY_WITHIN_PROMPT_MASS_BALANCE}"
     echo "DATE=$(date --iso-8601=seconds)"

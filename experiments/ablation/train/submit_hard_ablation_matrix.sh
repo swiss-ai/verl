@@ -16,7 +16,6 @@ START_SEED=42
 
 # DAPO-like filtering settings
 ENABLE_FILTER_GROUPS=true
-FILTER_GROUPS_BATCH_TARGET=prompts
 
 MODELS=(
   # "swiss-ai/Apertus-8B-Instruct-2509"
@@ -74,7 +73,7 @@ submit_job() {
 
   local filter_suffix=""
   if [ "${ENABLE_FILTER_GROUPS}" = "true" ]; then
-    filter_suffix="__DAPO-${FILTER_GROUPS_BATCH_TARGET}"
+    filter_suffix="__DAPO"
   fi
   DATASET_TAG="$(basename "${DATA_DIR}")"
   local run_name="${DATASET_TAG}__${algo}__${model_tag}${filter_suffix}__${budget_tag}__rep${rep}"
@@ -106,7 +105,6 @@ submit_job() {
   ENABLE_FILTER_GROUPS="${ENABLE_FILTER_GROUPS}" \
   FILTER_GROUPS_METRIC="acc" \
   FILTER_GROUPS_MAX_NUM_GEN_BATCHES=0 \
-  FILTER_GROUPS_BATCH_TARGET="${FILTER_GROUPS_BATCH_TARGET}" \
   sbatch \
     --job-name="${run_name}" \
     --output="${run_dir}/slurm.out" \

@@ -132,9 +132,6 @@ algorithm:
     # Maximum generation batches to try per update. Non-positive means no upper limit
     max_num_gen_batches: 0
 
-    # Stopping criterion for filtered oversampling: "prompts" or "samples"
-    batch_target: prompts
-
   # Adaptive group-size sampling for GRPO-style training
   adaptive_group_sampling:
     _target_: verl.trainer.config.AdaptiveGroupSamplingConfig
