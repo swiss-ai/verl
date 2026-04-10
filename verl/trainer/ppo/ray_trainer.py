@@ -355,10 +355,28 @@ class RayPPOTrainer:
             collate_fn = default_collate_fn
 
         num_workers = self.config.data["dataloader_num_workers"]
+        train_batch_size = int(self.config.data.train_batch_size)
+        gen_batch_size = int(self.config.data.get("gen_batch_size", train_batch_size))
+
+        adaptive_cfg = self.config.algorithm.get("adaptive_group_sampling", None) or {}
+        if bool(adaptive_cfg.get("enable", False)):
+            prompt_oversampling_factor = adaptive_cfg.get("prompt_oversampling_factor", 1.0)
+            if prompt_oversampling_factor is None:
+                prompt_oversampling_factor = 1.0
+            prompt_oversampling_factor = float(prompt_oversampling_factor)
+            required_gen_batch_size = int(math.ceil(train_batch_size * prompt_oversampling_factor))
+            if gen_batch_size < required_gen_batch_size:
+                print(
+                    "[Adaptive Sampling] Increasing train dataloader batch_size "
+                    f"from {gen_batch_size} to {required_gen_batch_size} to satisfy "
+                    f"train_batch_size={train_batch_size} and "
+                    f"prompt_oversampling_factor={prompt_oversampling_factor}."
+                )
+                gen_batch_size = required_gen_batch_size
 
         self.train_dataloader = StatefulDataLoader(
             dataset=self.train_dataset,
-            batch_size=self.config.data.get("gen_batch_size", self.config.data.train_batch_size),
+            batch_size=gen_batch_size,
             num_workers=num_workers,
             drop_last=True,
             collate_fn=collate_fn,
@@ -613,6 +631,9 @@ class RayPPOTrainer:
                 "Missing required adaptive_group_sampling config field(s): "
                 f"{', '.join(missing_fields)}."
             )
+        prompt_oversampling_factor = adaptive_cfg.get("prompt_oversampling_factor", 1.0)
+        if prompt_oversampling_factor is None:
+            prompt_oversampling_factor = 1.0
 
         return {
             "enable": bool(adaptive_cfg["enable"]),
@@ -620,6 +641,7 @@ class RayPPOTrainer:
             "min_negative_samples": int(adaptive_cfg["min_negative_samples"]),
             "max_rounds": int(adaptive_cfg["max_rounds"]),
             "rollouts_per_round": int(adaptive_cfg["rollouts_per_round"]),
+            "prompt_oversampling_factor": float(prompt_oversampling_factor),
             "positive_threshold": float(adaptive_cfg["positive_threshold"]),
             "apply_downsampling": bool(adaptive_cfg["apply_downsampling"]),
             "apply_inverse_pass_rate_weight": bool(adaptive_cfg["apply_inverse_pass_rate_weight"]),
@@ -644,6 +666,7 @@ class RayPPOTrainer:
         min_negative_samples = adaptive_cfg["min_negative_samples"]
         max_rounds = adaptive_cfg["max_rounds"]
         rollouts_per_round = adaptive_cfg["rollouts_per_round"]
+        prompt_oversampling_factor = adaptive_cfg["prompt_oversampling_factor"]
         apply_downsampling = adaptive_cfg["apply_downsampling"]
         apply_prompt_inverse_group_weight = adaptive_cfg["apply_prompt_inverse_group_weight"]
         apply_within_prompt_mass_balance = adaptive_cfg["apply_within_prompt_mass_balance"]
@@ -654,6 +677,10 @@ class RayPPOTrainer:
             raise ValueError("Adaptive group sampling requires max_rounds > 0.")
         if rollouts_per_round <= 0:
             raise ValueError("Adaptive group sampling requires rollouts_per_round > 0.")
+        if not math.isfinite(float(prompt_oversampling_factor)):
+            raise ValueError("Adaptive group sampling requires prompt_oversampling_factor to be finite.")
+        if prompt_oversampling_factor < 1.0:
+            raise ValueError("Adaptive group sampling requires prompt_oversampling_factor >= 1.0.")
         if not isinstance(apply_downsampling, bool):
             raise ValueError("Adaptive group sampling requires apply_downsampling to be a boolean.")
         if not isinstance(apply_prompt_inverse_group_weight, bool):
@@ -809,9 +836,12 @@ class RayPPOTrainer:
         curr_step_profile: bool,
         timing_raw: dict[str, float],
         sleep_replicas_after_sampling: bool = True,
+        target_num_prompts: Optional[int] = None,
     ) -> tuple[DataProto, dict[str, list[Any]], dict[str, float]]:
         """Generate adaptive-group rollouts and build the training batch."""
-        target_rollouts = int(self.config.actor_rollout_ref.rollout.n)  # NOTE: target_rollouts is only enforced when downsampling
+        target_rollouts = int(
+            self.config.actor_rollout_ref.rollout.n
+        )  # NOTE: target_rollouts is only enforced when downsampling
         rollouts_per_round = int(adaptive_cfg["rollouts_per_round"])
         max_rounds = int(adaptive_cfg["max_rounds"])
         min_positive_samples = int(adaptive_cfg["min_positive_samples"])
@@ -819,14 +849,23 @@ class RayPPOTrainer:
         positive_threshold = float(adaptive_cfg["positive_threshold"])
         apply_downsampling = bool(adaptive_cfg["apply_downsampling"])
 
-        num_prompts = len(batch)
+        num_prompt_candidates = len(batch)
+        target_num_prompts = num_prompt_candidates if target_num_prompts is None else int(target_num_prompts)
+        if target_num_prompts <= 0:
+            raise ValueError("Adaptive group sampling requires target_num_prompts > 0.")
+        if target_num_prompts > num_prompt_candidates:
+            raise ValueError(
+                "Adaptive group sampling target_num_prompts cannot exceed provided prompt candidates: "
+                f"{target_num_prompts} > {num_prompt_candidates}."
+            )
+
         prompt_uids = [str(uid) for uid in batch.non_tensor_batch["uid"].tolist()]
-        if len(set(prompt_uids)) != num_prompts:
+        if len(set(prompt_uids)) != num_prompt_candidates:
             raise ValueError("Adaptive group sampling requires unique prompt uids per prompt.")
         # Route sampled rollouts back to prompt states by uid
         prompt_uid_to_idx = {uid: idx for idx, uid in enumerate(prompt_uids)}
         prompt_states: list[dict[str, Any]] = []
-        for _ in range(num_prompts):
+        for _ in range(num_prompt_candidates):
             prompt_states.append(
                 {
                     # Running counts/statistics computed with ALL sampled rollouts
@@ -843,26 +882,28 @@ class RayPPOTrainer:
                     "selected_pos": 0,
                     "selected_neg": 0,
                     "finalized": False,
+                    "rounds": 0,
+                    "completed_early": False,
                 }
             )
 
-        # Prompt is active while it still needs additional sampled rollouts
-        active_mask = np.ones(num_prompts, dtype=bool)
-        prompts_completed_early = 0
+        # Keep a fixed-size active set and backfill from available prompt candidates
+        active_prompt_indices = list(range(target_num_prompts))
+        next_prompt_candidate_idx = target_num_prompts
+        completed_prompt_indices: list[int] = []
         rounds_executed = 0
 
-        for i in range(max_rounds):
+        while active_prompt_indices and len(completed_prompt_indices) < target_num_prompts:
             print(
-                f"[Adaptive Sampling] Round {i+1}/{max_rounds} - Executing rollouts for active prompts ({active_mask.sum()})"
+                "[Adaptive Sampling] "
+                f"Round {rounds_executed + 1} - Executing rollouts for active prompts ({len(active_prompt_indices)}), "
+                f"completed={len(completed_prompt_indices)}/{target_num_prompts}"
             )
 
-            active_indices = np.where(active_mask)[0]
-            if active_indices.size == 0:
-                break
             rounds_executed += 1
 
-            active_prompt_batch = batch.select_idxs(active_indices.tolist())
-            active_gen_batch = gen_batch.select_idxs(active_indices.tolist())
+            active_prompt_batch = batch.select_idxs(active_prompt_indices)
+            active_gen_batch = gen_batch.select_idxs(active_prompt_indices)
 
             round_prompt_batch = active_prompt_batch.repeat(repeat_times=rollouts_per_round, interleave=True)
             round_gen_batch = active_gen_batch.repeat(repeat_times=rollouts_per_round, interleave=True)
@@ -952,49 +993,56 @@ class RayPPOTrainer:
                 if apply_downsampling:
                     prune_prompt_caches(prompt_state, target_rollouts=target_rollouts)
 
-            # Prompt-level stopping/finalization check after processing current round
-            for prompt_idx in active_indices:
-                prompt_state = prompt_states[prompt_idx]
+            next_active_prompt_indices: list[int] = []
+            for prompt_idx in active_prompt_indices:
+                prompt_state = prompt_states[int(prompt_idx)]
                 if prompt_state["finalized"]:
                     continue
+                prompt_state["rounds"] += 1
                 meets_class_criteria = (
                     prompt_state["pos"] >= min_positive_samples and prompt_state["neg"] >= min_negative_samples
                 )
-                if meets_class_criteria and (
+                meets_finalization = meets_class_criteria and (
                     (apply_downsampling and prompt_state["total"] >= target_rollouts) or (not apply_downsampling)
-                ):
+                )
+                reached_max_rounds = prompt_state["rounds"] >= max_rounds
+
+                if meets_finalization or reached_max_rounds:
+                    if apply_downsampling and (prompt_state["total"] < target_rollouts):
+                        raise ValueError(
+                            f"Prompt sampled only {prompt_state['total']} rollouts; expected at least {target_rollouts}. "
+                            "Please increase max_rounds or rollouts_per_round."
+                        )
                     if apply_downsampling:
                         finalize_prompt_rollouts(prompt_state, target_rollouts=target_rollouts)
                     else:
                         finalize_prompt_rollouts_keep_all(prompt_state)
-                    active_mask[prompt_idx] = False
-                    prompts_completed_early += 1
+                    prompt_state["completed_early"] = bool(meets_finalization)
+                    completed_prompt_indices.append(int(prompt_idx))
+                else:
+                    next_active_prompt_indices.append(int(prompt_idx))
 
-        # Prompts still active after all rounds are exactly those that hit max_rounds
-        # without satisfying the early-finalization constraints.
-        active_at_max_rounds = np.where(active_mask)[0] if rounds_executed >= max_rounds else np.array([], dtype=int)
-        active_unmet_min_positive = 0
-        active_unmet_min_negative = 0
-        for prompt_idx in active_at_max_rounds:
-            prompt_state = prompt_states[int(prompt_idx)]
-            if prompt_state["pos"] < min_positive_samples:
-                active_unmet_min_positive += 1
-            if prompt_state["neg"] < min_negative_samples:
-                active_unmet_min_negative += 1
+            # Backfill active prompts set if below target and candidates are available
+            while (
+                len(next_active_prompt_indices) < target_num_prompts
+                and next_prompt_candidate_idx < num_prompt_candidates
+                and len(completed_prompt_indices) < target_num_prompts
+            ):
+                next_active_prompt_indices.append(next_prompt_candidate_idx)
+                next_prompt_candidate_idx += 1
 
-        # Finalize unresolved prompts with the best available balanced subset.
-        for prompt_state in prompt_states:
-            if prompt_state["finalized"]:
-                continue
-            if apply_downsampling and (prompt_state["total"] < target_rollouts):
-                raise ValueError(
-                    f"Prompt sampled only {prompt_state['total']} rollouts; expected at least {target_rollouts}. "
-                    "Please increase max_rounds or rollouts_per_round."
-                )
-            if apply_downsampling:
-                finalize_prompt_rollouts(prompt_state, target_rollouts=target_rollouts)
-            else:
-                finalize_prompt_rollouts_keep_all(prompt_state)
+            active_prompt_indices = next_active_prompt_indices
+
+        if len(completed_prompt_indices) < target_num_prompts:
+            raise ValueError(
+                "Adaptive group sampling ran out of active prompts before reaching target completions: "
+                f"completed={len(completed_prompt_indices)}, target={target_num_prompts}, "
+                f"prompt_candidates={num_prompt_candidates}."
+            )
+
+        selected_prompt_indices = completed_prompt_indices[:target_num_prompts]
+        if len(selected_prompt_indices) == 0:
+            raise ValueError("Adaptive group sampling produced zero completed prompts.")
 
         # Keep rollout KV cache between rounds and sleep only once after adaptive sampling.
         if self.async_rollout_mode and sleep_replicas_after_sampling:
@@ -1008,7 +1056,8 @@ class RayPPOTrainer:
         selected_pos = []
         selected_neg = []
 
-        for prompt_state in prompt_states:
+        for prompt_idx in selected_prompt_indices:
+            prompt_state = prompt_states[prompt_idx]
             total = int(prompt_state["total"])
             mean = float(prompt_state["sum"] / total)
             var = max(float(prompt_state["sumsq"] / total - mean * mean), 0.0)
@@ -1034,7 +1083,7 @@ class RayPPOTrainer:
                     reward_extra_infos_dict[key].append(value)
 
         if apply_downsampling:
-            expected_batch_size = num_prompts * target_rollouts
+            expected_batch_size = target_num_prompts * target_rollouts
             if len(selected_samples) != expected_batch_size:
                 raise ValueError(
                     f"Adaptive group sampling built {len(selected_samples)} selected samples, "
@@ -1043,7 +1092,8 @@ class RayPPOTrainer:
         else:
             if len(selected_samples) == 0:
                 raise ValueError("Adaptive keep-all sampling produced zero selected samples.")
-            for prompt_idx, prompt_state in enumerate(prompt_states):
+            for prompt_idx in selected_prompt_indices:
+                prompt_state = prompt_states[prompt_idx]
                 selected_count = len(prompt_state["selected"])
                 total_count = int(prompt_state["total"])
                 if selected_count != total_count:
@@ -1056,13 +1106,27 @@ class RayPPOTrainer:
 
         selected_pos_arr = np.array(selected_pos, dtype=np.float32)
         selected_neg_arr = np.array(selected_neg, dtype=np.float32)
+        prompts_completed_early = sum(
+            1 for prompt_idx in selected_prompt_indices if bool(prompt_states[prompt_idx]["completed_early"])
+        )
+        active_unmet_min_positive = 0
+        active_unmet_min_negative = 0
+        for prompt_idx in selected_prompt_indices:
+            prompt_state = prompt_states[prompt_idx]
+            if prompt_state["completed_early"]:
+                continue
+            if prompt_state["rounds"] >= max_rounds and (prompt_state["pos"] < min_positive_samples):
+                active_unmet_min_positive += 1
+            if prompt_state["rounds"] >= max_rounds and (prompt_state["neg"] < min_negative_samples):
+                active_unmet_min_negative += 1
+
         metrics = {
             "adaptive_group_sampling/total_rollouts": float(np.sum(rollouts_per_prompt)),
             "adaptive_group_sampling/rollouts_per_prompt_mean": float(np.mean(rollouts_per_prompt)),
             "adaptive_group_sampling/rollouts_per_prompt_min": float(np.min(rollouts_per_prompt)),
             "adaptive_group_sampling/rollouts_per_prompt_max": float(np.max(rollouts_per_prompt)),
             "adaptive_group_sampling/rounds_executed": float(rounds_executed),
-            "adaptive_group_sampling/prompts_not_completed_in_rounds": float(num_prompts - prompts_completed_early),
+            "adaptive_group_sampling/prompts_not_completed_in_rounds": float(target_num_prompts - prompts_completed_early),
             "adaptive_group_sampling/max_rounds_unmet_pos_min": float(active_unmet_min_positive),
             "adaptive_group_sampling/max_rounds_unmet_neg_min": float(active_unmet_min_negative),
             # NOTE: this is computed with all rollouts, while critic/rewards/mean only sees the rollouts in the final batch
@@ -2001,22 +2065,51 @@ class RayPPOTrainer:
                 rollout_n = int(self.config.actor_rollout_ref.rollout.n)
                 prompt_bsz = int(self.config.data.train_batch_size)
                 sample_bsz = prompt_bsz * rollout_n
+                adaptive_target_prompt_count = len(batch)
+                prompts_to_generate = len(batch)
 
-                if filter_groups_enabled:
+                if adaptive_group_sampling_enabled:
+                    # Adaptive sampling always targets `train_batch_size` prompts per step
+                    # (or fewer when filter-groups only needs a smaller remainder),
+                    # while allowing an oversampled candidate pool for prompt replacement.
+                    oversampling_factor = float(adaptive_group_sampling_cfg["prompt_oversampling_factor"])
+                    if filter_groups_cfg["batch_target"] == "samples":
+                        if filter_groups_enabled:
+                            missing_samples = max(sample_bsz - pending_sample_count, 0)
+                            if not adaptive_group_sampling_cfg["apply_downsampling"]:
+                                missing_prompts = missing_samples
+                            else:
+                                missing_prompts = int(math.ceil(missing_samples / max(rollout_n, 1)))
+                            adaptive_target_prompt_count = max(1, min(len(batch), int(missing_prompts)))
+                        else:
+                            adaptive_target_prompt_count = max(1, min(len(batch), prompt_bsz))
+                    else:
+                        if filter_groups_enabled:
+                            missing_prompts = max(prompt_bsz - pending_prompt_count, 0)
+                            adaptive_target_prompt_count = max(1, min(len(batch), int(missing_prompts)))
+                        else:
+                            adaptive_target_prompt_count = max(1, min(len(batch), prompt_bsz))
+
+                    prompts_to_generate = int(math.ceil(adaptive_target_prompt_count * oversampling_factor))
+                    prompts_to_generate = max(adaptive_target_prompt_count, prompts_to_generate)
+                    prompts_to_generate = max(1, min(len(batch), int(prompts_to_generate)))
+                elif filter_groups_enabled:
                     # Optimization when filter-groups is enabled: only generate the number of prompts
                     # needed to satisfy the current accumulation target.
                     if filter_groups_cfg["batch_target"] == "samples":
                         missing_samples = max(sample_bsz - pending_sample_count, 0)
-                        if adaptive_group_sampling_enabled and (not adaptive_group_sampling_cfg["apply_downsampling"]):
-                            missing_prompts = missing_samples
-                        else:
-                            missing_prompts = int(math.ceil(missing_samples / max(rollout_n, 1)))
+                        missing_prompts = int(math.ceil(missing_samples / max(rollout_n, 1)))
                     else:
                         missing_prompts = max(prompt_bsz - pending_prompt_count, 0)
-                    missing_prompts = max(1, min(len(batch), int(missing_prompts)))
-                    if missing_prompts < len(batch):
-                        batch = batch.select_idxs(list(range(missing_prompts)))
-                        gen_batch = gen_batch.select_idxs(list(range(missing_prompts)))
+                    prompts_to_generate = max(1, min(len(batch), int(missing_prompts)))
+
+                if prompts_to_generate < len(batch):
+                    selected_idxs = list(range(prompts_to_generate))
+                    batch = batch.select_idxs(selected_idxs)
+                    gen_batch = gen_batch.select_idxs(selected_idxs)
+                    adaptive_target_prompt_count = min(adaptive_target_prompt_count, len(batch))
+
+                if filter_groups_enabled:
                     if not adaptive_group_sampling_enabled:
                         pending_total_rollouts += len(gen_batch) * rollout_n
                 gen_batch_output = None
@@ -2026,7 +2119,6 @@ class RayPPOTrainer:
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
                         if adaptive_group_sampling_enabled:
-                            adaptive_prompt_count = len(batch)
                             batch, reward_extra_infos_dict, adaptive_sampling_metrics = (
                                 self._generate_batch_with_adaptive_group_sampling(
                                     batch=batch,
@@ -2035,13 +2127,14 @@ class RayPPOTrainer:
                                     curr_step_profile=curr_step_profile,
                                     timing_raw=timing_raw,
                                     sleep_replicas_after_sampling=False,
+                                    target_num_prompts=adaptive_target_prompt_count,
                                 )
                             )
                             if filter_groups_enabled:
                                 pending_adaptive_sampling_metrics = self._accumulate_adaptive_sampling_metrics(
                                     accumulator=pending_adaptive_sampling_metrics,
                                     adaptive_metrics=adaptive_sampling_metrics,
-                                    num_prompts=adaptive_prompt_count,
+                                    num_prompts=adaptive_target_prompt_count,
                                 )
                             else:
                                 metrics.update(adaptive_sampling_metrics)

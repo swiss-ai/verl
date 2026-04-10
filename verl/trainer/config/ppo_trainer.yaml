@@ -152,6 +152,10 @@ algorithm:
     # Number of rollouts sampled per active prompt in each round
     rollouts_per_round: 1
 
+    # Oversampling factor for prompt candidates passed into adaptive sampling
+    # (1.0 keeps existing behavior)
+    prompt_oversampling_factor: 1.0
+
     # A rollout is positive when sequence reward > positive_threshold
     positive_threshold: 0.5
 
