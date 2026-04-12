@@ -4,11 +4,11 @@ set -euo pipefail
 # --------------------------------------------------------------------
 # Self-contained experiment matrix
 # --------------------------------------------------------------------
-WORKING_DIR=/capstor/scratch/cscs/msantelmo/inverse_batch/verl
+WORKING_DIR=/iopsstor/scratch/cscs/msantelmo/inverse_batch/verl
 cd "${WORKING_DIR}"
 
 PROJECT_NAME="RLVR-Ada-Math"
-DATA_DIR="${WORKING_DIR}/data/hard_math"
+DATA_DIR="${WORKING_DIR}/data/DeepScaleR"
 OUTPUT_ROOT="${WORKING_DIR}/outputs/${PROJECT_NAME}"
 
 REPEATS=3
@@ -16,6 +16,7 @@ START_SEED=42
 
 # DAPO-like filtering settings
 ENABLE_FILTER_GROUPS=true
+OVERSAMPLING_FACTOR=1.0
 
 MODELS=(
   # "swiss-ai/Apertus-8B-Instruct-2509"
@@ -25,23 +26,20 @@ MODELS=(
 BASELINE_ALGOS=() # Set to e.g. (grpo maxrl f_grpo) to include baselines.
 BASELINE_NS=(8 32)
 # RL-Ada configs as tuples:
-# "<round_samples> <max_rounds> <min_pos> <min_neg> <downsample_n> <apply_downsampling> <apply_inv_pass_rate_weight>"
+# "<round_samples> <max_rounds> <min_pos> <min_neg> <n> <apply_downsampling>"
 RL_ADA_CONFIGS=(
-  # "2 8 1 1 8 false true"
-  "2 8 1 1 8 false false"
-  "2 8 1 1 2 false true"
-  "2 8 1 1 2 false false"
-  "2 8 1 1 2 true true"
-  "2 8 1 1 2 true false"
-  "2 32 1 1 16 false true"
+  "4 4 1 1 8 false"
+  # "8 4 1 1 16 false"
+  # "4 4 1 1 4 true"
+  # "8 4 1 1 8 true"
 )
 # Additional adaptive weighting switches (crossed with every RL_ADA_CONFIGS entry):
-# - apply_inv_pass_rate_weight: inverse pass-rate weighting.
-# - apply_prompt_inverse_group_weight: 1 / K_i prompt-level weighting.
 # - apply_within_prompt_mass_balance: within-prompt +/- mass balancing.
-INV_PASS_RATE_WEIGHT_OPTIONS=(false true)
-PROMPT_INVERSE_GROUP_WEIGHT_OPTIONS=(false true)
-WITHIN_PROMPT_MASS_BALANCE_OPTIONS=(false true)
+# - apply_prompt_inverse_group_weight: 1 / K_i prompt-level weighting.
+# - apply_inv_pass_rate_weight: inverse pass-rate weighting.
+WITHIN_PROMPT_MASS_BALANCE_OPTIONS=(true)
+PROMPT_INVERSE_GROUP_WEIGHT_OPTIONS=(true)
+INV_PASS_RATE_WEIGHT_OPTIONS=(true)
 
 mkdir -p "${OUTPUT_ROOT}"
 
@@ -73,10 +71,9 @@ submit_job() {
 
   local filter_suffix=""
   if [ "${ENABLE_FILTER_GROUPS}" = "true" ]; then
-    filter_suffix="__DAPO"
+    filter_suffix="__DAPO-${OVERSAMPLING_FACTOR}x"
   fi
-  DATASET_TAG="$(basename "${DATA_DIR}")"
-  local run_name="${DATASET_TAG}__${algo}__${model_tag}${filter_suffix}__${budget_tag}__rep${rep}"
+  local run_name="${algo}__${model_tag}${filter_suffix}__${budget_tag}__rep${rep}"
   local wandb_group="${run_name%__rep${rep}}"
   local run_dir="${OUTPUT_ROOT}/${run_name}"
   mkdir -p "${run_dir}"
@@ -85,7 +82,6 @@ submit_job() {
   DATA_DIR="${DATA_DIR}" \
   OUTPUT_ROOT="${OUTPUT_ROOT}" \
   PROJECT_NAME="${PROJECT_NAME}" \
-  DATASET_TAG="${DATASET_TAG}" \
   HF_HUB_CACHE_DIR="${HF_HUB_CACHE_DIR}" \
   RUN_NAME="${run_name}" \
   WANDB_RUN_GROUP="${wandb_group}" \
@@ -103,6 +99,7 @@ submit_job() {
   APPLY_PROMPT_INVERSE_GROUP_WEIGHT="${apply_prompt_inverse_group_weight}" \
   APPLY_WITHIN_PROMPT_MASS_BALANCE="${apply_within_prompt_mass_balance}" \
   ENABLE_FILTER_GROUPS="${ENABLE_FILTER_GROUPS}" \
+  OVERSAMPLING_FACTOR="${OVERSAMPLING_FACTOR}" \
   FILTER_GROUPS_METRIC="acc" \
   FILTER_GROUPS_MAX_NUM_GEN_BATCHES=0 \
   sbatch \

@@ -9,13 +9,15 @@ import os
 import re
 import statistics
 from datetime import datetime, timezone
-from math import comb
+from math import comb, exp, log
 from typing import Any
 
 import pandas as pd
 from vllm import LLM, SamplingParams
 
 from verl.utils.reward_score import default_compute_score
+
+DEFAULT_CONF_LOGPROBS = 20
 
 
 def parse_args() -> argparse.Namespace:
@@ -72,6 +74,14 @@ def parse_args() -> argparse.Namespace:
         "--evaluation-log-file",
         default=None,
         help="Append-only JSONL summary log. Default: <output-dir>/evaluation_log.jsonl.",
+    )
+    parser.add_argument(
+        "--record-conf",
+        action="store_true",
+        help=(
+            "If set, record per-response `log-prob` and average token-level `entropy` in predictions.jsonl. "
+            "This also enables prediction saving."
+        ),
     )
     return parser.parse_args()
 
@@ -232,6 +242,54 @@ def shard_bounds(total: int, rank: int, world_size: int) -> tuple[int, int]:
     return start(rank), start(rank + 1)
 
 
+def _get_logprob(value: Any) -> float:
+    if hasattr(value, "logprob"):
+        return float(value.logprob)
+    if isinstance(value, dict) and "logprob" in value:
+        return float(value["logprob"])
+    return float(value)
+
+
+def compute_conf_metrics(sample_output: Any) -> dict[str, float] | None:
+    token_ids = sample_output.token_ids or []
+    step_logprobs = getattr(sample_output, "logprobs", None) or []
+    if not token_ids:
+        return {"log-prob": 0.0, "entropy_topk": 0.0, "entropy": 0.0, "topk_mass": 1.0}
+    if not step_logprobs:
+        return None
+
+    response_logprob = 0.0
+    token_entropies_topk: list[float] = []
+    token_entropies_bucket: list[float] = []
+    token_topk_masses: list[float] = []
+    for token_id, token_logprobs in zip(token_ids, step_logprobs, strict=False):
+        if not token_logprobs or token_id not in token_logprobs:
+            return None
+
+        chosen_logprob = _get_logprob(token_logprobs[token_id])
+        response_logprob += chosen_logprob
+
+        probs_and_logprobs = [(exp(_get_logprob(item)), _get_logprob(item)) for item in token_logprobs.values()]
+        mass = min(sum(prob for prob, _ in probs_and_logprobs), 1.0)
+        entropy_topk = -sum(prob * logprob for prob, logprob in probs_and_logprobs)
+        entropy_bucket = entropy_topk
+        remaining_mass = max(0.0, 1.0 - mass)
+        if remaining_mass > 0.0:
+            entropy_bucket -= remaining_mass * log(remaining_mass)
+        token_entropies_topk.append(entropy_topk)
+        token_entropies_bucket.append(entropy_bucket)
+        token_topk_masses.append(mass)
+
+    if len(token_entropies_topk) != len(token_ids):
+        return None
+    return {
+        "log-prob": response_logprob,
+        "entropy_topk": float(sum(token_entropies_topk) / len(token_entropies_topk)),
+        "entropy": float(sum(token_entropies_bucket) / len(token_entropies_bucket)),
+        "topk_mass": float(sum(token_topk_masses) / len(token_topk_masses)),
+    }
+
+
 def score_outputs(
     *,
     task_name: str,
@@ -239,6 +297,7 @@ def score_outputs(
     messages_batch: list[list[dict[str, str]]],
     outputs: list[Any],
     save_predictions: bool,
+    record_conf: bool,
 ) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     for (row_idx, row), model_input_messages, request_output in zip(rows.iterrows(), messages_batch, outputs, strict=True):
@@ -255,6 +314,7 @@ def score_outputs(
             response_text = sample_output.text
             response_length_tokens = len(sample_output.token_ids or [])
             response_lengths.append(response_length_tokens)
+            conf_metrics = compute_conf_metrics(sample_output) if record_conf else None
             score_raw = default_compute_score(
                 data_source=data_source,
                 solution_str=response_text,
@@ -266,22 +326,31 @@ def score_outputs(
                 num_correct += 1
 
             if save_predictions:
-                predictions.append(
-                    {
-                        "task": task_name,
-                        "row_idx": int(row_idx),
-                        "question_id": str(row.get("question_id", row_idx)),
-                        "data_source": data_source,
-                        "response_index": sample_idx,
-                        "input": model_input_messages,
-                        "output": response_text,
-                        "response_length_tokens": response_length_tokens,
-                        "ground_truth": ground_truth,
-                        "score": score_value,
-                        "acc": bool(is_correct),
-                        "pred": pred_value,
-                    }
-                )
+                prediction = {
+                    "task": task_name,
+                    "row_idx": int(row_idx),
+                    "question_id": str(row.get("question_id", row_idx)),
+                    "data_source": data_source,
+                    "response_index": sample_idx,
+                    "input": model_input_messages,
+                    "output": response_text,
+                    "response_length_tokens": response_length_tokens,
+                    "ground_truth": ground_truth,
+                    "score": score_value,
+                    "acc": bool(is_correct),
+                    "pred": pred_value,
+                }
+                if record_conf:
+                    prediction.update(
+                        conf_metrics
+                        or {
+                            "log-prob": None,
+                            "entropy_topk": None,
+                            "entropy": None,
+                            "topk_mass": None,
+                        }
+                    )
+                predictions.append(prediction)
 
         if num_samples == 0:
             raise RuntimeError(f"Question {row.get('question_id', row_idx)} produced zero samples.")
@@ -311,6 +380,7 @@ def save_task_outputs(
     save_predictions: bool,
     evaluation_log_file: str,
     question_results: list[dict[str, Any]],
+    record_conf: bool,
 ) -> None:
     os.makedirs(task_output_dir, exist_ok=True)
     predictions_path = os.path.join(task_output_dir, "predictions.jsonl")
@@ -363,6 +433,7 @@ def save_task_outputs(
         "metrics_by_data_source": per_data_source_metrics,
         "saved_predictions": bool(save_predictions),
         "predictions_file": predictions_path if save_predictions else None,
+        "record_conf": bool(record_conf),
     }
 
     metrics_path = os.path.join(task_output_dir, "metrics.json")
@@ -411,6 +482,7 @@ def evaluate_task(
     evaluation_log_file: str,
     data_parallel_rank: int = 0,
     data_parallel_size: int = 1,
+    record_conf: bool = False,
 ) -> None:
     df = pd.read_parquet(data_file)
     if len(df) == 0:
@@ -430,6 +502,7 @@ def evaluate_task(
             messages_batch=messages_batch,
             outputs=outputs,
             save_predictions=save_predictions,
+            record_conf=record_conf,
         )
 
     if data_parallel_size > 1:
@@ -458,6 +531,7 @@ def evaluate_task(
         save_predictions=save_predictions,
         evaluation_log_file=evaluation_log_file,
         question_results=question_results,
+        record_conf=record_conf,
     )
 
 
@@ -480,6 +554,7 @@ def main() -> None:
             )
 
     evaluation_log_file = args.evaluation_log_file or os.path.join(args.output_dir, "evaluation_log.jsonl")
+    save_predictions = args.save_predictions or args.record_conf
     if data_parallel_rank == 0:
         os.makedirs(os.path.dirname(evaluation_log_file) or ".", exist_ok=True)
 
@@ -513,6 +588,9 @@ def main() -> None:
         if value is not None:
             sampling_kwargs[key] = value
             decoding_overrides[metric_key] = value
+    if args.record_conf:
+        sampling_kwargs["logprobs"] = DEFAULT_CONF_LOGPROBS
+        decoding_overrides["logprobs_top_k"] = DEFAULT_CONF_LOGPROBS
 
     skipped = 0
     completed = 0
@@ -537,10 +615,11 @@ def main() -> None:
             sampling_params=sampling_params,
             decoding_overrides=decoding_overrides,
             vllm_overrides=vllm_overrides,
-            save_predictions=args.save_predictions,
+            save_predictions=save_predictions,
             evaluation_log_file=evaluation_log_file,
             data_parallel_rank=data_parallel_rank,
             data_parallel_size=data_parallel_size,
+            record_conf=args.record_conf,
         )
         completed += 1
 

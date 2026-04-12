@@ -11,6 +11,9 @@
 
 set -xeuo pipefail
 
+# Prevent large core_nid* dumps when native libs crash inside the job.
+ulimit -c 0
+
 WORKING_DIR="${WORKING_DIR:-/iopsstor/scratch/cscs/msantelmo/inverse_batch/verl}"
 cd "${WORKING_DIR}"
 
@@ -35,6 +38,7 @@ APPLY_WITHIN_PROMPT_MASS_BALANCE="${APPLY_WITHIN_PROMPT_MASS_BALANCE:-false}"
 
 # DAPO-like filtering
 ENABLE_FILTER_GROUPS="${ENABLE_FILTER_GROUPS:-false}"
+OVERSAMPLING_FACTOR="${OVERSAMPLING_FACTOR:-1.0}"
 
 REPEAT_IDX="${REPEAT_IDX:-1}"
 SEED="${SEED:-42}"
@@ -69,10 +73,10 @@ build_overrides() {
     "actor_rollout_ref.actor.data_loader_seed=${SEED}"
     "actor_rollout_ref.actor.checkpoint.save_contents=['hf_model']"
     "critic.checkpoint.save_contents=[]"
-    "trainer.save_freq=5"
+    "trainer.save_freq=10"
     "trainer.test_freq=10"
-    "trainer.max_actor_ckpt_to_keep=2"
-    "trainer.max_critic_ckpt_to_keep=2"
+    "trainer.max_actor_ckpt_to_keep=null"
+    "trainer.max_critic_ckpt_to_keep=null"
     "algorithm.filter_groups.enable=${ENABLE_FILTER_GROUPS}"
   )
 
@@ -88,6 +92,7 @@ build_overrides() {
       "algorithm.adaptive_group_sampling.apply_inverse_pass_rate_weight=${APPLY_INV_PASS_RATE_WEIGHT}"
       "algorithm.adaptive_group_sampling.apply_prompt_inverse_group_weight=${APPLY_PROMPT_INVERSE_GROUP_WEIGHT}"
       "algorithm.adaptive_group_sampling.apply_within_prompt_mass_balance=${APPLY_WITHIN_PROMPT_MASS_BALANCE}"
+      "algorithm.adaptive_group_sampling.prompt_oversampling_factor=${OVERSAMPLING_FACTOR}"
     )
   else
     overrides+=(

@@ -4,12 +4,15 @@
 #SBATCH --container-writable
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --time=08:00:00
+#SBATCH --time=04:00:00
 #SBATCH --environment=sdpo
 #SBATCH --output=slurm_logs/%x_%j.out
 #SBATCH --error=slurm_logs/%x_%j.err
 
 set -xeuo pipefail
+
+# Prevent large core_nid* dumps when native libs crash inside the job.
+ulimit -c 0
 
 WORKING_DIR="${WORKING_DIR:-/iopsstor/scratch/cscs/msantelmo/inverse_batch/verl}"
 RUN_DIR="${RUN_DIR:-}"
@@ -19,9 +22,11 @@ EVAL_DATA_DIR="${EVAL_DATA_DIR:-${WORKING_DIR}/data/eval_benchmarks}"
 EVAL_OUTPUT_SUBDIR="${EVAL_OUTPUT_SUBDIR:-offline_eval}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${WORKING_DIR}/outputs/base_model_eval}"
 EVAL_OUTPUT_DIR="${EVAL_OUTPUT_DIR:-}"
+VLLM_CACHE_ROOT="/iopsstor/scratch/cscs/msantelmo/.cache/vllm"
 
 TASKS_CSV="${TASKS_CSV:-all}"
 EVALUATION_LOG_FILE="${EVALUATION_LOG_FILE:-}"
+ALL_CHECKPOINTS="${ALL_CHECKPOINTS:-false}"
 
 N="${N:-}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-}"
@@ -38,6 +43,7 @@ MAX_NUM_SEQS="${MAX_NUM_SEQS:-}"
 
 FORCE="${FORCE:-false}"
 SAVE_PREDICTIONS="${SAVE_PREDICTIONS:-false}"
+RECORD_CONF="${RECORD_CONF:-false}"
 
 if [[ ! -d "${EVAL_DATA_DIR}" ]]; then
   echo "Eval data directory does not exist: ${EVAL_DATA_DIR}"
@@ -45,6 +51,10 @@ if [[ ! -d "${EVAL_DATA_DIR}" ]]; then
 fi
 
 cd "${WORKING_DIR}"
+
+export VLLM_CACHE_ROOT
+mkdir -p "${VLLM_CACHE_ROOT}"
+echo "[cache] VLLM_CACHE_ROOT=${VLLM_CACHE_ROOT}"
 
 echo "[setup] Reinstalling local verl"
 pip install --no-deps --no-cache-dir --force-reinstall -e .
@@ -64,6 +74,7 @@ append_common_overrides() {
   [[ -n "${MAX_MODEL_LEN}" ]] && cmd_ref+=(--max-model-len "${MAX_MODEL_LEN}")
   [[ -n "${MAX_NUM_SEQS}" ]] && cmd_ref+=(--max-num-seqs "${MAX_NUM_SEQS}")
   [[ "${SAVE_PREDICTIONS}" == "true" ]] && cmd_ref+=(--save-predictions)
+  [[ "${RECORD_CONF}" == "true" ]] && cmd_ref+=(--record-conf)
   return 0
 }
 
@@ -97,6 +108,7 @@ run_checkpoint_eval() {
     --tasks "${TASKS_CSV}"
     --evaluation-log-file "${eval_log}"
   )
+  [[ "${ALL_CHECKPOINTS}" == "true" ]] && cmd+=(--all-checkpoints)
   append_common_overrides cmd
   [[ "${FORCE}" == "true" ]] && cmd+=(--force)
   "${cmd[@]}"
