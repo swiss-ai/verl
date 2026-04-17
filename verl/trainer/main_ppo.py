@@ -20,7 +20,7 @@ import socket
 
 import hydra
 import ray
-from omegaconf import OmegaConf
+from omegaconf import OmegaConf, open_dict
 
 from verl.experimental.dataset.sampler import AbstractSampler
 from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
@@ -30,6 +30,7 @@ from verl.trainer.ppo.utils import need_critic, need_reference_policy
 from verl.utils.config import validate_config
 from verl.utils.device import auto_set_device, is_cuda_available
 from verl.utils.import_utils import load_extern_object
+from verl.utils.mixed_policy import resolve_mixed_policy_counts
 
 
 @hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
@@ -146,6 +147,12 @@ class TaskRunner:
                 role = Role.ActorRollout
             self.role_worker_mapping[role] = ray.remote(actor_rollout_cls)
             self.mapping[role] = "global_pool"
+
+            mixed_policy_cfg = config.algorithm.get("mixed_policy", {})
+            mixed_policy_enabled = bool(mixed_policy_cfg.get("enable", False))
+            if mixed_policy_enabled and int(mixed_policy_cfg.get("k_off", 0)) > 0:
+                self.role_worker_mapping[Role.Rollout] = ray.remote(actor_rollout_cls)
+                self.mapping[Role.Rollout] = "mixed_rollout_pool"
             return actor_rollout_cls, ray_worker_group_cls
 
         # Note: sync mode validation is now handled in RolloutConfig.__post_init__
@@ -167,6 +174,12 @@ class TaskRunner:
 
         self.role_worker_mapping[Role.ActorRollout] = ray.remote(actor_rollout_cls)
         self.mapping[Role.ActorRollout] = "global_pool"
+
+        mixed_policy_cfg = config.algorithm.get("mixed_policy", {})
+        mixed_policy_enabled = bool(mixed_policy_cfg.get("enable", False))
+        if mixed_policy_enabled and int(mixed_policy_cfg.get("k_off", 0)) > 0:
+            self.role_worker_mapping[Role.Rollout] = ray.remote(actor_rollout_cls)
+            self.mapping[Role.Rollout] = "mixed_rollout_pool"
         return actor_rollout_cls, ray_worker_group_cls
 
     def add_critic_worker(self, config):
@@ -213,10 +226,91 @@ class TaskRunner:
             reward_pool = [config.reward_model.n_gpus_per_node] * config.reward_model.nnodes
             resource_pool_spec["reward_pool"] = reward_pool
 
+        mixed_policy_cfg = config.algorithm.get("mixed_policy", {})
+        mixed_policy_enabled = bool(mixed_policy_cfg.get("enable", False))
+        if mixed_policy_enabled and int(mixed_policy_cfg.get("k_off", 0)) > 0:
+            if config.mixed_rollout.n_gpus_per_node <= 0:
+                raise ValueError("config.mixed_rollout.n_gpus_per_node must be greater than 0")
+            if config.mixed_rollout.nnodes <= 0:
+                raise ValueError("config.mixed_rollout.nnodes must be greater than 0")
+            mixed_rollout_pool = [config.mixed_rollout.n_gpus_per_node] * config.mixed_rollout.nnodes
+            resource_pool_spec["mixed_rollout_pool"] = mixed_rollout_pool
+
         from verl.trainer.ppo.ray_trainer import ResourcePoolManager
 
         resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=self.mapping)
         return resource_pool_manager
+
+    def _normalize_mixed_policy_config(self, config):
+        mixed_policy_cfg = config.algorithm.get("mixed_policy", {})
+        mixed_policy_enabled = bool(mixed_policy_cfg.get("enable", False))
+        if not mixed_policy_enabled:
+            return
+
+        k_on, k_off, k_total = resolve_mixed_policy_counts(mixed_policy_cfg)
+        with open_dict(config):
+            # rollout.n is the single source used later by batching/advantage code,
+            # so we normalize it to k_on + k_off once at startup.
+            config.actor_rollout_ref.rollout.n = k_total
+            if config.actor_rollout_ref.actor.get("rollout_n", None) is not None:
+                config.actor_rollout_ref.actor.rollout_n = k_total
+            if config.get("critic", {}).get("rollout_n", None) is not None:
+                config.critic.rollout_n = k_total
+            # Default correction for mixed-policy rollouts: decoupled token-TIS.
+            if k_off > 0:
+                rollout_corr_cfg = config.algorithm.get("rollout_correction", None)
+                if rollout_corr_cfg is None:
+                    config.algorithm.rollout_correction = OmegaConf.create(
+                        {
+                            "rollout_is": "token",
+                            "rollout_is_threshold": 2.0,
+                            "rollout_rs": None,
+                            "rollout_rs_threshold": None,
+                            "bypass_mode": False,
+                            "loss_type": "ppo_clip",
+                            "rollout_is_batch_normalize": False,
+                        }
+                    )
+                elif (
+                    rollout_corr_cfg.get("rollout_is", None) is None
+                    and rollout_corr_cfg.get("rollout_rs", None) is None
+                    and not rollout_corr_cfg.get("bypass_mode", False)
+                ):
+                    config.algorithm.rollout_correction.rollout_is = "token"
+                    config.algorithm.rollout_correction.rollout_is_threshold = 2.0
+        print(f"[mixed_policy] enabled: k_on={k_on}, k_off={k_off}, k_total={k_total}")
+
+    @staticmethod
+    def _check_tokenizer_compatibility(config, tokenizer):
+        mixed_policy_cfg = config.algorithm.get("mixed_policy", {})
+        mixed_policy_enabled = bool(mixed_policy_cfg.get("enable", False))
+        if not mixed_policy_enabled or int(mixed_policy_cfg.get("k_off", 0)) <= 0:
+            return
+
+        teacher_model_path = config.actor_rollout_ref.get("mixed_policy", {}).get("teacher_model_path", None)
+        if not teacher_model_path:
+            raise ValueError("mixed_policy is enabled but teacher_model_path is missing.")
+
+        from verl.utils import hf_tokenizer
+        from verl.utils.fs import copy_to_local
+
+        trust_remote_code = config.data.get("trust_remote_code", False)
+        teacher_local_path = copy_to_local(
+            teacher_model_path, use_shm=config.actor_rollout_ref.model.get("use_shm", False)
+        )
+        teacher_tokenizer = hf_tokenizer(teacher_local_path, trust_remote_code=trust_remote_code)
+
+        # v1 relies on identical token-id mapping between actor and teacher.
+        # We fail fast here to avoid silently training with mismatched rollout log-probs.
+        if len(tokenizer) != len(teacher_tokenizer):
+            raise ValueError(
+                "mixed_policy requires teacher and actor tokenizers to share the same vocabulary size. "
+                f"Got actor={len(tokenizer)} and teacher={len(teacher_tokenizer)}."
+            )
+        actor_vocab = tokenizer.get_vocab() if hasattr(tokenizer, "get_vocab") else None
+        teacher_vocab = teacher_tokenizer.get_vocab() if hasattr(teacher_tokenizer, "get_vocab") else None
+        if actor_vocab is not None and teacher_vocab is not None and actor_vocab != teacher_vocab:
+            raise ValueError("mixed_policy requires teacher and actor tokenizers to have identical token-id mapping.")
 
     def add_reward_model_worker(self, config):
         """Add reward model worker if enabled."""
@@ -279,6 +373,10 @@ class TaskRunner:
         pprint(OmegaConf.to_container(config, resolve=True))
         OmegaConf.resolve(config)
 
+        # Normalize mixed-policy multiplicity before workers are created,
+        # so all worker configs observe the same effective rollout.n.
+        self._normalize_mixed_policy_config(config)
+
         actor_rollout_cls, ray_worker_group_cls = self.add_actor_rollout_worker(config)
         self.add_critic_worker(config)
 
@@ -311,6 +409,7 @@ class TaskRunner:
 
         trust_remote_code = config.data.get("trust_remote_code", False)
         tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
+        self._check_tokenizer_compatibility(config, tokenizer)
         # Used for multimodal LLM, could be None
         processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
 

@@ -55,6 +55,58 @@ actor_rollout_ref:
     # for huge model, layered summon can save memory (prevent OOM) but make it slower
     layered_summon: False
 
+  # Mixed-policy rollout configuration (teacher-target + student-draft).
+  mixed_policy:
+
+    # Path of the teacher model used as target model in speculative decoding.
+    teacher_model_path: null
+
+    # Optional vLLM gpu_memory_utilization override for mixed rollout lane.
+    # If null, mixed lane inherits actor_rollout_ref.rollout.gpu_memory_utilization.
+    rollout_gpu_memory_utilization: null
+
+    # Draft synchronization options.
+    draft_sync:
+
+      # Enable draft-only synchronization.
+      enabled: True
+
+      # Prefix added to actor parameter names when loading into vLLM draft model.
+      draft_prefix: "draft_model."
+
+      # Optional prefix removed from actor keys before applying draft_prefix.
+      strip_prefix: ""
+
+      # Optional include regex list for actor keys.
+      include_patterns: []
+
+      # Optional exclude regex list for actor keys.
+      exclude_patterns: []
+
+      # Weight streaming chunk size in megabytes.
+      sync_bucket_megabytes: 2048
+
+    # Speculative decoding options for the mixed rollout lane.
+    speculative:
+
+      # Speculative method used by vLLM.
+      method: draft_model
+
+      # Number of speculative tokens.
+      num_speculative_tokens: 4
+
+      # Enable entropy-aware mixture in rejection sampler.
+      use_entropy_aware_mixing: True
+
+      # Top-k used by entropy approximation.
+      entropy_top_k: 50
+
+      # Mixture type: geometric or convex.
+      entropy_aware_mixing: geometric
+
+      # Alpha shaping mode: linear, sqrt, sqrt2, sigmoid.
+      entropy_aware_alpha: linear
+
 # custom reward function definition
 custom_reward_function:
 
@@ -118,6 +170,30 @@ algorithm:
 
     # Power used for weight scaling in "pow" method
     weight_pow: 2.0
+
+  # Mixed-policy rollout settings.
+  mixed_policy:
+
+    # Enable dual-lane rollout collection.
+    enable: False
+
+    # Number of on-policy samples per prompt.
+    k_on: 1
+
+    # Number of mixed-policy samples per prompt.
+    k_off: 1
+
+    # Non-tensor key used to tag rollout provenance.
+    source_tag_key: rollout_source
+
+# Dedicated resource pool for mixed rollout lane.
+mixed_rollout:
+
+  # Number of nodes used by mixed rollout.
+  nnodes: 1
+
+  # Number of GPUs per node used by mixed rollout.
+  n_gpus_per_node: 4
 
 # config for the trainer
 trainer:

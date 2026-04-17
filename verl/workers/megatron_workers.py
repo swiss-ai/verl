@@ -25,6 +25,7 @@ import torch
 import torch.distributed
 from codetiming import Timer
 from omegaconf import DictConfig, OmegaConf
+from ray.util.collective import collective
 
 try:
     from verl.workers.engine.mindspeed.transformer_impl import repatch
@@ -63,6 +64,7 @@ from verl.utils.megatron_utils import (
     register_megatron_training_hooks,
 )
 from verl.utils.memory_utils import aggressive_empty_cache
+from verl.utils.mixed_policy import build_draft_key_rewriter
 from verl.utils.model import get_hf_model_path, load_mcore_dist_weights, load_megatron_gptmodel_weights
 from verl.utils.profiler import (
     DistProfiler,
@@ -978,6 +980,115 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
 
 
 class AsyncActorRolloutRefWorker(ActorRolloutRefWorker):
+    def _get_actor_params_generator_for_mixed_sync(self):
+        """Build the actor weight iterator used by mixed-policy draft sync."""
+        if self.bridge is not None:
+            if self.vanilla_bridge:
+                return self.bridge.export_weights(self.actor.actor_module)
+            if not self.peft_merge and self.peft_cls is not None:
+                return self.bridge.export_adapter_weights(self.actor.actor_module)
+            return self.bridge.export_hf_weights(self.actor.actor_module)
+
+        return per_tensor_generator(
+            self.actor.actor_module,
+            self.actor_model_config,
+            self.weight_converter,
+            self.tf_config,
+            self.layer_name_mapping,
+        )
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def get_actor_weights_info(self):
+        """Return ordered actor weight metadata used to drive mixed-policy sync.
+
+        The returned order is cached and shared with rollout workers to keep
+        tensor-by-tensor broadcast deterministic.
+        """
+        assert self._is_actor
+        if hasattr(self, "_mixed_weights_info"):
+            return self._mixed_weights_info
+        if self._is_offload_param:
+            load_megatron_model_to_gpu(self.actor_module)
+        params_generator = self._get_actor_params_generator_for_mixed_sync()
+        ret = []
+        for key, tensor in params_generator:
+            ret.append((key, tensor.size(), tensor.dtype))
+        self._mixed_weights_info = ret
+        if self._is_offload_param:
+            offload_megatron_model_to_cpu(self.actor_module)
+        return ret
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def set_actor_weights_info(self, weights_info):
+        """Store actor weight metadata on rollout workers before mixed sync."""
+        assert self._is_rollout
+        self._mixed_weights_info = weights_info
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    async def sync_mixed_rollout_weights(self, sync_config: dict):
+        """Synchronize actor weights into the mixed rollout draft model only.
+
+        Flow:
+        1. Actor rank0 exports each actor tensor and broadcasts it.
+        2. Rollout workers rewrite actor keys into the configured draft namespace.
+        3. Only rewritten keys are loaded into vLLM (teacher keys are skipped).
+        4. Loads are bucketed and the KV cache is cleared only on the final flush.
+        """
+        assert self._is_actor or self._is_rollout
+        assert hasattr(self, "_mixed_weights_info"), "missing mixed weights info for mixed rollout synchronization"
+
+        group_name = sync_config.get("group_name", "actor_mixed_rollout")
+        draft_sync_cfg = sync_config.get("draft_sync", {})
+        bucket_mb = int(draft_sync_cfg.get("sync_bucket_megabytes", 2048))
+        bucket_bytes = bucket_mb << 20
+        rewrite_key = build_draft_key_rewriter(draft_sync_cfg)
+
+        params_generator = None
+        if self._is_actor:
+            if self._is_offload_param:
+                load_megatron_model_to_gpu(self.actor_module)
+            params_generator = self._get_actor_params_generator_for_mixed_sync()
+
+        pending_weights = []
+        pending_bytes = 0
+        loaded_weight_count = 0
+        for key, shape, dtype in self._mixed_weights_info:
+            tensor = torch.empty(shape, dtype=dtype, device=get_torch_device().current_device())
+            if self._is_actor:
+                assert params_generator is not None
+                weight_key, weight = next(params_generator)
+                assert key == weight_key
+                if torch.distributed.get_rank() == 0:
+                    tensor.copy_(weight)
+
+            collective.broadcast(tensor, src_rank=0, group_name=group_name)
+
+            if self._is_rollout and not self._is_actor:
+                # Review guide: rollout-only workers map actor keys into the draft namespace.
+                # This is where we guarantee teacher target weights are never overwritten.
+                mapped_key = rewrite_key(key)
+                if mapped_key is None:
+                    continue
+                pending_weights.append((mapped_key, tensor))
+                loaded_weight_count += 1
+                pending_bytes += tensor.nbytes
+                if pending_bytes >= bucket_bytes:
+                    await self.rollout.update_weights(iter(pending_weights), clear_kv_cache=False)
+                    pending_weights = []
+                    pending_bytes = 0
+
+        if self._is_rollout and not self._is_actor and pending_weights:
+            await self.rollout.update_weights(iter(pending_weights), clear_kv_cache=True)
+        if self._is_rollout and not self._is_actor and loaded_weight_count == 0:
+            raise ValueError(
+                "No actor parameters were selected for mixed-policy draft sync. "
+                "Please check mixed_policy.draft_sync include/exclude settings."
+            )
+
+        if self._is_actor and self._is_offload_param:
+            offload_megatron_model_to_cpu(self.actor_module)
+        get_torch_device().empty_cache()
+
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     async def update_weights(self):
         await self.rollout_mode()

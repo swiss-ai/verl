@@ -97,6 +97,13 @@ class ServerAdapter(BaseRollout):
         self.device_uuid = get_device_uuid(get_device_id())
         self.zmq_context = zmq.Context()
         self.zmq_handle = f"ipc:///tmp/rl-colocate-zmq-{self.device_uuid}.sock"
+        custom_cfg = self.config.get("custom", {}) or {}
+        # Mixed rollout lane sets a prefix so actor and mixed servers can coexist.
+        self.server_name_prefix = custom_cfg.get("server_name_prefix", "")
+
+    def _server_actor_name(self) -> str:
+        prefix = f"{self.server_name_prefix}_" if self.server_name_prefix else ""
+        return f"{prefix}vllm_server_{self.replica_rank}_{self.node_rank}"
 
     async def _execute_method(
         self,
@@ -123,7 +130,7 @@ class ServerAdapter(BaseRollout):
 
         # Lazy init http server adapter because http server is launched after hybrid engine.
         if self.server_handle is None:
-            self.server_handle = ray.get_actor(f"vllm_server_{self.replica_rank}_{self.node_rank}")
+            self.server_handle = ray.get_actor(self._server_actor_name())
 
         future = self.server_handle.collective_rpc.remote(method, timeout=timeout, args=args, kwargs=kwargs)
         return future if non_block else await future
@@ -145,6 +152,7 @@ class ServerAdapter(BaseRollout):
     @torch.no_grad()
     async def update_weights(self, weights: Generator[tuple[str, torch.Tensor], None, None], **kwargs):
         """Update model weights via CUDA IPC to inference workers."""
+        clear_kv_cache = kwargs.pop("clear_kv_cache", True)
         start_time = time.time()
         future = await self._execute_method(
             "update_weights_from_ipc",
@@ -207,7 +215,7 @@ class ServerAdapter(BaseRollout):
             await future
 
         # reset prefix cache after updating weights
-        if self.rollout_rank == 0:
+        if self.rollout_rank == 0 and clear_kv_cache:
             await self.server_handle.clear_kv_cache.remote()
 
         if self.replica_rank == 0 and self.rollout_rank == 0:

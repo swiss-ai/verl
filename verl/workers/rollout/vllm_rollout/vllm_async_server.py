@@ -303,6 +303,12 @@ class vLLMHttpServer:
                 "method": self.config.mtp.method,
                 "num_speculative_tokens": self.config.mtp.num_speculative_tokens,
             }
+            speculative_overrides = {}
+            if self.config.custom and "speculative_config_overrides" in self.config.custom:
+                speculative_overrides = self.config.custom["speculative_config_overrides"] or {}
+            # Mixed-policy lane injects teacher/draft mixture knobs through
+            # `rollout.custom.speculative_config_overrides`, overriding base mtp values here.
+            speculative_config.update(speculative_overrides)
             args["speculative_config"] = speculative_config
 
         if self.config.expert_parallel_size > 1:
@@ -737,6 +743,11 @@ class vLLMReplica(RolloutReplica):
 
         # create server actor in each node with node affinity and cuda visible devices
         nnodes, gpus_per_replica_node = self.nnodes, self.gpus_per_replica_node
+        server_name_prefix = ""
+        if self.config.custom:
+            server_name_prefix = self.config.custom.get("server_name_prefix", "") or ""
+        # name prefix isolates actor and mixed lanes to avoid Ray actor-name collisions.
+        prefix = f"{server_name_prefix}_" if server_name_prefix else ""
         for node_rank in range(nnodes):
             workers = self.workers[node_rank * gpus_per_replica_node : (node_rank + 1) * gpus_per_replica_node]
             node_cuda_visible_devices = ",".join(
@@ -744,9 +755,9 @@ class vLLMReplica(RolloutReplica):
             )
             node_id = worker_node_ids[node_rank * gpus_per_replica_node]
             name = (
-                f"vllm_server_{self.replica_rank}_{node_rank}"
+                f"{prefix}vllm_server_{self.replica_rank}_{node_rank}"
                 if not self.is_reward_model
-                else f"vllm_server_reward_{self.replica_rank}_{node_rank}"
+                else f"{prefix}vllm_server_reward_{self.replica_rank}_{node_rank}"
             )
             server = self.server_class.options(
                 scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(

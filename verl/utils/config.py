@@ -83,8 +83,58 @@ def validate_config(
         use_reference_policy (bool): is ref policy needed
         use_critic (bool): is critic needed
     """
+    from verl.utils.mixed_policy import resolve_mixed_policy_counts
+
     # number of GPUs total
     n_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
+
+    mixed_policy_cfg = config.algorithm.get("mixed_policy", {})
+    mixed_policy_enabled = bool(mixed_policy_cfg.get("enable", False))
+    if mixed_policy_enabled:
+        k_on, k_off, k_total = resolve_mixed_policy_counts(mixed_policy_cfg)
+        if config.actor_rollout_ref.rollout.n != k_total:
+            raise ValueError(
+                "mixed_policy requires actor_rollout_ref.rollout.n == k_on + k_off. "
+                f"Got rollout.n={config.actor_rollout_ref.rollout.n}, k_on={k_on}, k_off={k_off}."
+            )
+        if k_off > 0:
+            if config.actor_rollout_ref.rollout.name != "vllm":
+                raise ValueError(
+                    "mixed_policy v1 currently supports vLLM rollout only when k_off > 0. "
+                    f"Got actor_rollout_ref.rollout.name={config.actor_rollout_ref.rollout.name}."
+                )
+            teacher_model_path = config.actor_rollout_ref.get("mixed_policy", {}).get("teacher_model_path", None)
+            if not teacher_model_path:
+                raise ValueError(
+                    "mixed_policy is enabled with k_off>0 but actor_rollout_ref.mixed_policy.teacher_model_path is not set."
+                )
+            mixed_rollout_cfg = config.get("mixed_rollout", None)
+            if mixed_rollout_cfg is None:
+                raise ValueError("mixed_policy is enabled with k_off>0 but top-level mixed_rollout config is missing.")
+            if mixed_rollout_cfg.n_gpus_per_node <= 0 or mixed_rollout_cfg.nnodes <= 0:
+                raise ValueError(
+                    "mixed_rollout.n_gpus_per_node and mixed_rollout.nnodes must both be positive "
+                    f"(got n_gpus_per_node={mixed_rollout_cfg.n_gpus_per_node}, nnodes={mixed_rollout_cfg.nnodes})."
+                )
+            if config.trainer.get("use_legacy_worker_impl", "auto") == "disable":
+                raise ValueError(
+                    "mixed_policy v1 currently requires legacy worker implementation (use_legacy_worker_impl!=disable)."
+                )
+            draft_sync_cfg = config.actor_rollout_ref.get("mixed_policy", {}).get("draft_sync", {})
+            if draft_sync_cfg.get("enabled", True):
+                draft_prefix = draft_sync_cfg.get("draft_prefix", "")
+                if not draft_prefix:
+                    raise ValueError(
+                        "mixed_policy requires actor_rollout_ref.mixed_policy.draft_sync.draft_prefix to be non-empty."
+                    )
+            mixed_gpu_mem_util = config.actor_rollout_ref.get("mixed_policy", {}).get(
+                "rollout_gpu_memory_utilization", None
+            )
+            if mixed_gpu_mem_util is not None and not (0 < float(mixed_gpu_mem_util) <= 1.0):
+                raise ValueError(
+                    "actor_rollout_ref.mixed_policy.rollout_gpu_memory_utilization must be in (0, 1], "
+                    f"got {mixed_gpu_mem_util}."
+                )
 
     if not config.actor_rollout_ref.actor.use_dynamic_bsz:
         if config.actor_rollout_ref.actor.strategy == "megatron":

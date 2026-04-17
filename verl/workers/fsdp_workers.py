@@ -30,6 +30,7 @@ import torch.distributed as dist
 from codetiming import Timer
 from omegaconf import DictConfig, OmegaConf, open_dict
 from peft import LoraConfig, TaskType, get_peft_model
+from ray.util.collective import collective
 from safetensors.torch import save_file
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -79,6 +80,7 @@ from verl.utils.fsdp_utils import (
 )
 from verl.utils.import_utils import import_external_libs
 from verl.utils.memory_utils import aggressive_empty_cache
+from verl.utils.mixed_policy import build_draft_key_rewriter
 from verl.utils.model import compute_position_id_with_mask, convert_weight_keys
 from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerConfig, log_gpu_memory_usage, simple_timer
 from verl.utils.profiler.performance import reduce_timing, topk_reduce_ratio_min_max
@@ -1995,6 +1997,102 @@ class RewardModelWorker(Worker, DistProfilerExtension):
 
 # ================================= Async related workers =================================
 class AsyncActorRolloutRefWorker(ActorRolloutRefWorker):
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def get_actor_weights_info(self):
+        """Return ordered actor weight metadata used to drive mixed-policy sync.
+        The returned order is reused by both actor and rollout workers so they
+        iterate tensors in exactly the same sequence during broadcast.
+        """
+        assert self._is_actor
+        if hasattr(self, "_mixed_weights_info"):
+            return self._mixed_weights_info
+        params = self.actor_module_fsdp.state_dict()
+        params = convert_weight_keys(
+            params, getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
+        )
+        ret = []
+        for key, tensor in params.items():
+            ret.append((key, tensor.size(), tensor.dtype))
+        self._mixed_weights_info = ret
+        return ret
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def set_actor_weights_info(self, weights_info):
+        """Store actor weight metadata on rollout workers before mixed-policy sync."""
+        assert self._is_rollout
+        self._mixed_weights_info = weights_info
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    async def sync_mixed_rollout_weights(self, sync_config: dict):
+        """Synchronize actor weights into the mixed-policy rollout **draft model only**.
+
+        Flow:
+        1. Actor rank0 materializes each actor tensor and broadcasts it.
+        2. Rollout workers rewrite actor keys into the configured draft namespace.
+        3. Only rewritten keys are loaded into vLLM (teacher/target keys are skipped).
+        4. Loads are bucketed and the KV cache is cleared only on the final flush.
+        """
+        assert self._is_actor or self._is_rollout
+        assert hasattr(self, "_mixed_weights_info"), "missing mixed-policy weights info for mixed-policy rollout synchronization"
+
+        group_name = sync_config.get("group_name", "actor_mixed_rollout")
+        draft_sync_cfg = sync_config.get("draft_sync", {})
+        bucket_mb = int(draft_sync_cfg.get("sync_bucket_megabytes", 2048))
+        bucket_bytes = bucket_mb << 20
+        rewrite_key = build_draft_key_rewriter(draft_sync_cfg)
+
+        if self._is_actor and self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+
+        params = None
+        if self._is_actor:
+            params = self.actor_module_fsdp.state_dict()
+            params = convert_weight_keys(
+                params, getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
+            )
+
+        pending_weights = []
+        pending_bytes = 0
+        loaded_weight_count = 0
+
+        for key, shape, dtype in self._mixed_weights_info:
+            tensor = torch.empty(shape, dtype=dtype, device=get_torch_device().current_device())
+            if self._is_actor:
+                assert params is not None and key in params
+                origin_data = params[key]
+                if hasattr(origin_data, "full_tensor"):
+                    origin_data = origin_data.full_tensor()
+                if torch.distributed.get_rank() == 0:
+                    tensor.copy_(origin_data)
+
+            collective.broadcast(tensor, src_rank=0, group_name=group_name)
+
+            if self._is_rollout and not self._is_actor:
+                # Rollout-only workers map actor keys into the draft namespace.
+                # This is where we guarantee teacher target weights are never overwritten.
+                mapped_key = rewrite_key(key)
+                if mapped_key is None:
+                    continue
+                pending_weights.append((mapped_key, tensor))
+                loaded_weight_count += 1
+                pending_bytes += tensor.nbytes
+                if pending_bytes >= bucket_bytes:
+                    await self.rollout.update_weights(iter(pending_weights), clear_kv_cache=False)
+                    pending_weights = []
+                    pending_bytes = 0
+
+        if self._is_rollout and not self._is_actor and pending_weights:
+            await self.rollout.update_weights(iter(pending_weights), clear_kv_cache=True)
+        if self._is_rollout and not self._is_actor and loaded_weight_count == 0:
+            raise ValueError(
+                "No actor parameters were selected for mixed-policy draft sync. "
+                "Please check mixed_policy.draft_sync include/exclude settings."
+            )
+
+        if self._is_actor and self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+        get_torch_device().empty_cache()
+
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     async def update_weights(self):
         await self.rollout_mode()

@@ -17,7 +17,13 @@ from typing import Any, Optional
 
 from verl.base_config import BaseConfig
 
-__all__ = ["AlgoConfig", "FilterGroupsConfig", "KLControlConfig", "RolloutCorrectionConfig"]
+__all__ = [
+    "AlgoConfig",
+    "FilterGroupsConfig",
+    "KLControlConfig",
+    "MixedPolicyConfig",
+    "RolloutCorrectionConfig",
+]
 
 
 @dataclass
@@ -565,6 +571,23 @@ class RolloutCorrectionConfig(BaseConfig):
 
 
 @dataclass
+class MixedPolicyConfig(BaseConfig):
+    """Configuration for mixed-policy rollout collection.
+
+    Args:
+        enable (bool): Enable dual-lane rollout collection.
+        k_on (int): Number of on-policy samples per prompt.
+        k_off (int): Number of mixed-policy samples per prompt.
+        source_tag_key (str): Non-tensor batch key used to store rollout provenance.
+    """
+
+    enable: bool = False
+    k_on: int = 1
+    k_off: int = 1
+    source_tag_key: str = "rollout_source"
+
+
+@dataclass
 class AlgoConfig(BaseConfig):
     """Configuration for the algorithm.
 
@@ -609,6 +632,7 @@ class AlgoConfig(BaseConfig):
     use_pf_ppo: bool = False
     pf_ppo: dict[str, Any] = field(default_factory=dict)
     filter_groups: Optional[FilterGroupsConfig] = None
+    mixed_policy: MixedPolicyConfig = field(default_factory=MixedPolicyConfig)
     # Rollout Correction: corrects off-policy issues (policy mismatch, model staleness, distribution shifts)
     # Set to None to disable, use RolloutCorrectionConfig presets (e.g., .tis(), .mis()), or pass dict
     rollout_correction: Optional[RolloutCorrectionConfig] = None

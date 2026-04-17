@@ -58,6 +58,7 @@ from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
 from verl.utils.import_utils import load_class_from_fqn
 from verl.utils.metric import reduce_metrics
+from verl.utils.mixed_policy import resolve_mixed_policy_counts
 from verl.utils.py_functional import rename_dict
 from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
@@ -308,6 +309,28 @@ class RayPPOTrainer:
 
         self.use_prefix_grouper = self.config.actor_rollout_ref.actor.get("use_prefix_grouper", False)
         self.use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
+
+        # - `use_mixed_policy` gates the second rollout lane (k_off > 0).
+        # - `mixed_draft_sync_enabled` only gates actor->draft weight sync, not mixed sampling itself.
+        mixed_policy_cfg = self.config.algorithm.get("mixed_policy", {})
+        self.mixed_policy_enabled = bool(mixed_policy_cfg.get("enable", False))
+        if self.mixed_policy_enabled:
+            self.mixed_k_on, self.mixed_k_off, self.mixed_k_total = resolve_mixed_policy_counts(mixed_policy_cfg)
+            self.use_mixed_policy = self.mixed_k_off > 0
+            draft_sync_cfg = self.config.actor_rollout_ref.get("mixed_policy", {}).get("draft_sync", {})
+            self.mixed_draft_sync_enabled = bool(draft_sync_cfg.get("enabled", True))
+            self.mixed_source_tag_key = mixed_policy_cfg.get("source_tag_key", "rollout_source")
+            self.mixed_source_on_value = "on"
+            self.mixed_source_off_value = "mixed"
+        else:
+            self.use_mixed_policy = False
+            self.mixed_draft_sync_enabled = False
+            self.mixed_k_on = 0
+            self.mixed_k_off = 0
+            self.mixed_k_total = self.config.actor_rollout_ref.rollout.n
+            self.mixed_source_tag_key = "rollout_source"
+            self.mixed_source_on_value = "on"
+            self.mixed_source_off_value = "mixed"
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
@@ -728,6 +751,125 @@ class RayPPOTrainer:
 
         return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
 
+    def _build_mixed_rollout_ref_config(self):
+        mixed_policy_cfg = self.config.actor_rollout_ref.get("mixed_policy", {})
+        teacher_model_path = mixed_policy_cfg.get("teacher_model_path", None)
+        if not teacher_model_path:
+            raise ValueError("mixed_policy is enabled but actor_rollout_ref.mixed_policy.teacher_model_path is missing.")
+
+        mixed_rollout_ref_cfg = deepcopy(self.config.actor_rollout_ref)
+        with open_dict(mixed_rollout_ref_cfg):
+            # Mixed lane loads the teacher as target policy.
+            mixed_rollout_ref_cfg.model.path = teacher_model_path
+            # Mixed lane needs a real teacher target model.
+            # The actor lane can start from dummy weights and then receive synced
+            # actor checkpoints, but mixed lane only syncs draft weights.
+            # Keep user-provided non-dummy values untouched.
+            if str(mixed_rollout_ref_cfg.rollout.get("load_format", "dummy")).lower() == "dummy":
+                mixed_rollout_ref_cfg.rollout.load_format = "auto"
+            mixed_rollout_ref_cfg.rollout.custom = mixed_rollout_ref_cfg.rollout.get("custom", {}) or {}
+            mixed_rollout_ref_cfg.rollout.custom["server_name_prefix"] = "mixed"
+            # Draft model path points to current actor checkpoint.
+            # vLLM's speculative verifier then samples from the configured teacher/draft mixture.
+            mixed_rollout_ref_cfg.rollout.custom["speculative_config_overrides"] = {
+                "model": self.config.actor_rollout_ref.model.path,
+                "use_entropy_aware_mixing": mixed_policy_cfg.get("speculative", {}).get(
+                    "use_entropy_aware_mixing", True
+                ),
+                "entropy_top_k": mixed_policy_cfg.get("speculative", {}).get("entropy_top_k", 50),
+                "entropy_aware_mixing": mixed_policy_cfg.get("speculative", {}).get("entropy_aware_mixing", "geometric"),
+                "entropy_aware_alpha": mixed_policy_cfg.get("speculative", {}).get("entropy_aware_alpha", "linear"),
+            }
+
+            mixed_rollout_ref_cfg.rollout.mtp.enable = True
+            mixed_rollout_ref_cfg.rollout.mtp.enable_rollout = True
+            mixed_rollout_ref_cfg.rollout.mtp.method = mixed_policy_cfg.get("speculative", {}).get(
+                "method", "draft_model"
+            )
+            mixed_rollout_ref_cfg.rollout.mtp.num_speculative_tokens = mixed_policy_cfg.get("speculative", {}).get(
+                "num_speculative_tokens", 4
+            )
+            # Optional override for mixed rollout lane memory budget.
+            # Useful when on-policy rollout is colocated with training workers
+            # but mixed rollout has dedicated GPUs.
+            mixed_rollout_gpu_mem_util = mixed_policy_cfg.get("rollout_gpu_memory_utilization", None)
+            if mixed_rollout_gpu_mem_util is not None:
+                mixed_rollout_ref_cfg.rollout.gpu_memory_utilization = float(mixed_rollout_gpu_mem_util)
+            mixed_rollout_ref_cfg.rollout.n = max(1, self.mixed_k_off)
+
+        return mixed_rollout_ref_cfg
+
+    def _build_mixed_runtime_config(self):
+        mixed_runtime_cfg = deepcopy(self.config)
+        with open_dict(mixed_runtime_cfg):
+            mixed_runtime_cfg.actor_rollout_ref = self.mixed_rollout_ref_cfg
+        return mixed_runtime_cfg
+
+    def _append_rollout_source_tag(self, batch: DataProto, source_value: str):
+        if len(batch) == 0:
+            return
+        # This non-tensor tag is used for per-source metrics/debug only.
+        batch.non_tensor_batch[self.mixed_source_tag_key] = np.array([source_value] * len(batch), dtype=object)
+
+    def _concat_on_off_batches(self, on_batch: DataProto | None, off_batch: DataProto | None) -> DataProto:
+        if on_batch is None and off_batch is None:
+            raise ValueError("No rollout data generated: both on-policy and mixed-policy batches are empty.")
+        if on_batch is None:
+            return off_batch
+        if off_batch is None:
+            return on_batch
+        # Keep deterministic concat order [on, mixed] to simplify source-wise inspection.
+        return DataProto.concat([on_batch, off_batch])
+
+    def _compute_rollout_source_metrics(self, batch: DataProto, metrics: dict):
+        if self.mixed_source_tag_key not in batch.non_tensor_batch:
+            return
+        src = np.asarray(batch.non_tensor_batch[self.mixed_source_tag_key], dtype=object)
+        token_scores = batch.batch["token_level_scores"].sum(dim=-1).detach().cpu().numpy()
+        response_mask = batch.batch["response_mask"].detach().cpu().numpy()
+        response_lens = response_mask.sum(axis=-1)
+        for name in [self.mixed_source_on_value, self.mixed_source_off_value]:
+            mask = src == name
+            if not np.any(mask):
+                continue
+            metrics[f"mixed_policy/{name}/count"] = int(mask.sum())
+            metrics[f"mixed_policy/{name}/reward_mean"] = float(token_scores[mask].mean())
+            metrics[f"mixed_policy/{name}/response_len_mean"] = float(response_lens[mask].mean())
+
+    def _create_mixed_sync_group(self):
+        from ray.util.collective import collective
+
+        from verl.utils.device import get_nccl_backend
+
+        if self.mixed_rollout_wg is None:
+            return
+        self.mixed_sync_group_name = "actor_mixed_rollout"
+        # Metadata comes from actor lane and is reused by mixed rollout receivers
+        # so broadcast order matches tensor shapes/dtypes exactly.
+        weights_info = self.actor_rollout_wg.get_actor_weights_info()[0]
+        self.mixed_rollout_wg.set_actor_weights_info(weights_info)
+        all_workers = self.actor_rollout_wg.workers + self.mixed_rollout_wg.workers
+        collective.create_collective_group(
+            all_workers,
+            len(all_workers),
+            list(range(0, len(all_workers))),
+            backend=get_nccl_backend(),
+            group_name=self.mixed_sync_group_name,
+        )
+
+    def sync_mixed_rollout_weights(self):
+        if not self.use_mixed_policy or self.mixed_rollout_wg is None or not self.mixed_draft_sync_enabled:
+            return
+        draft_sync_cfg = self.config.actor_rollout_ref.get("mixed_policy", {}).get("draft_sync", {})
+        # This RPC only updates mixed-lane draft weights;
+        # teacher target weights remain untouched in that lane.
+        sync_config = {
+            "group_name": self.mixed_sync_group_name,
+            "draft_sync": draft_sync_cfg,
+        }
+        self.actor_rollout_wg.sync_mixed_rollout_weights(sync_config)
+        ray.get(self.mixed_rollout_wg.sync_mixed_rollout_weights(sync_config))
+
     def init_workers(self):
         """Initialize distributed training workers using Ray backend.
 
@@ -741,6 +883,7 @@ class RayPPOTrainer:
 
         # create actor and rollout
         actor_role = Role.ActorRolloutRef if Role.ActorRolloutRef in self.role_worker_mapping else Role.ActorRollout
+        mixed_rollout_resource_pool = None
         if self.hybrid_engine:
             actor_rollout_resource_pool = self.resource_pool_manager.get_resource_pool(actor_role)
             actor_rollout_cls = RayClassWithInitArgs(
@@ -749,6 +892,20 @@ class RayPPOTrainer:
                 role=str(actor_role),
             )
             self.resource_pool_to_cls[actor_rollout_resource_pool][str(actor_role)] = actor_rollout_cls
+
+            if self.use_mixed_policy:
+                if Role.Rollout not in self.role_worker_mapping:
+                    raise ValueError("mixed_policy is enabled but Role.Rollout worker is not registered.")
+                # Mixed rollout lane runs in its own resource pool to avoid
+                # interfering with actor/critic scheduling in the main lane.
+                mixed_rollout_resource_pool = self.resource_pool_manager.get_resource_pool(Role.Rollout)
+                self.mixed_rollout_ref_cfg = self._build_mixed_rollout_ref_config()
+                mixed_rollout_cls = RayClassWithInitArgs(
+                    cls=self.role_worker_mapping[Role.Rollout],
+                    config=self.mixed_rollout_ref_cfg,
+                    role=str(Role.Rollout),
+                )
+                self.resource_pool_to_cls[mixed_rollout_resource_pool]["mixed_rollout"] = mixed_rollout_cls
         else:
             raise NotImplementedError
 
@@ -890,6 +1047,11 @@ class RayPPOTrainer:
         self.actor_rollout_wg = all_wg[str(actor_role)]
         self.actor_rollout_wg.init_model()
 
+        self.mixed_rollout_wg = None
+        if self.use_mixed_policy:
+            self.mixed_rollout_wg = all_wg["mixed_rollout"]
+            self.mixed_rollout_wg.init_model()
+
         if self.ref_in_actor:
             self.ref_policy_wg = self.actor_rollout_wg
 
@@ -915,6 +1077,18 @@ class RayPPOTrainer:
             rollout_resource_pool=actor_rollout_resource_pool,
             rm_resource_pool=rm_resource_pool,
         )
+
+        self.mixed_async_rollout_manager = None
+        if self.use_mixed_policy:
+            self.mixed_runtime_cfg = self._build_mixed_runtime_config()
+            self.mixed_async_rollout_manager = AgentLoopManager(
+                config=self.mixed_runtime_cfg,
+                worker_group=self.mixed_rollout_wg,
+                rollout_resource_pool=mixed_rollout_resource_pool,
+                rm_resource_pool=None,
+            )
+            if self.mixed_draft_sync_enabled:
+                self._create_mixed_sync_group()
 
         self.checkpoint_manager = CheckpointEngineManager(
             backend=self.config.actor_rollout_ref.rollout.checkpoint_engine.backend,
@@ -1322,6 +1496,9 @@ class RayPPOTrainer:
         # load checkpoint and update weights before doing anything
         self._load_checkpoint()
         self.checkpoint_manager.update_weights()
+        if self.use_mixed_policy:
+            self.sync_mixed_rollout_weights()
+            self.mixed_async_rollout_manager.clear_kv_cache()
 
         current_epoch = self.global_steps // len(self.train_dataloader)
 
@@ -1380,26 +1557,60 @@ class RayPPOTrainer:
 
                 # pass global_steps to trace
                 gen_batch.meta_info["global_steps"] = self.global_steps
-                gen_batch_output = gen_batch.repeat(
-                    repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
-                )
+                gen_batch_output = None
+                gen_batch_output_on = None
+                gen_batch_output_off = None
 
                 is_last_step = self.global_steps >= self.total_training_steps
                 with marked_timer("step", timing_raw):
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
-                        if not self.async_rollout_mode:
-                            gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)
-                        else:
-                            if curr_step_profile:
-                                self.async_rollout_manager.start_profile(global_step=self.global_steps)
-                            gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
-                            self.checkpoint_manager.sleep_replicas()
-                            if curr_step_profile:
-                                self.async_rollout_manager.stop_profile()
+                        if self.use_mixed_policy:
+                            # Dual-generation path
+                            # 1) on-policy samples from actor lane
+                            # 2) mixed-policy samples from teacher+draft lane
+                            if self.mixed_k_on > 0:
+                                on_input = gen_batch.repeat(repeat_times=self.mixed_k_on, interleave=True)
+                                print(f"[debug-gen][actor] start step={self.global_steps} batch_size={len(on_input)}")
+                                if curr_step_profile:
+                                    self.async_rollout_manager.start_profile(global_step=self.global_steps)
+                                gen_batch_output_on = self.async_rollout_manager.generate_sequences(on_input)
+                                self.checkpoint_manager.sleep_replicas()
+                                if curr_step_profile:
+                                    self.async_rollout_manager.stop_profile()
+                                print(f"[debug-gen][actor] end step={self.global_steps} batch_size={len(gen_batch_output_on)}")
+                                timing_raw.update(
+                                    rename_dict(gen_batch_output_on.meta_info["timing"], "gen/on_")
+                                )
+                                gen_batch_output_on.meta_info.pop("timing", None)
 
-                        timing_raw.update(gen_batch_output.meta_info["timing"])
-                        gen_batch_output.meta_info.pop("timing", None)
+                            if self.mixed_k_off > 0:
+                                off_input = gen_batch.repeat(repeat_times=self.mixed_k_off, interleave=True)
+                                print(f"[debug-gen][mixed_easd] start step={self.global_steps} batch_size={len(off_input)}")
+                                gen_batch_output_off = self.mixed_async_rollout_manager.generate_sequences(off_input)
+                                print(f"[debug-gen][mixed_easd] end step={self.global_steps} batch_size={len(gen_batch_output_off)}")
+                                timing_raw.update(
+                                    rename_dict(gen_batch_output_off.meta_info["timing"], "gen/mixed_")
+                                )
+                                gen_batch_output_off.meta_info.pop("timing", None)
+                        else:
+                            gen_batch_output = gen_batch.repeat(
+                                repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
+                            )
+                            print(f"[debug-gen][actor] start step={self.global_steps} batch_size={len(gen_batch_output)}")
+                            if not self.async_rollout_mode:
+                                gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)
+                            else:
+                                if curr_step_profile:
+                                    self.async_rollout_manager.start_profile(global_step=self.global_steps)
+                                gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
+                                self.checkpoint_manager.sleep_replicas()
+                                if curr_step_profile:
+                                    self.async_rollout_manager.stop_profile()
+                            print(f"[debug-gen][actor] end step={self.global_steps} batch_size={len(gen_batch_output)}")
+
+                            timing_raw.update(gen_batch_output.meta_info["timing"])
+                            gen_batch_output.meta_info.pop("timing", None)
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         if self.reward_fn is None:
@@ -1441,9 +1652,24 @@ class RayPPOTrainer:
                             batch.batch["reward_baselines"] = reward_baseline_tensor
 
                             del rm_scores, gen_baseline_batch, gen_baseline_output
-                    # repeat to align with repeated responses in rollout
-                    batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
-                    batch = batch.union(gen_batch_output)
+                    if self.use_mixed_policy:
+                        batch_on = None
+                        batch_off = None
+                        if gen_batch_output_on is not None:
+                            batch_on = batch.repeat(repeat_times=self.mixed_k_on, interleave=True)
+                            batch_on = batch_on.union(gen_batch_output_on)
+                            self._append_rollout_source_tag(batch_on, self.mixed_source_on_value)
+                        if gen_batch_output_off is not None:
+                            batch_off = batch.repeat(repeat_times=self.mixed_k_off, interleave=True)
+                            batch_off = batch_off.union(gen_batch_output_off)
+                            self._append_rollout_source_tag(batch_off, self.mixed_source_off_value)
+                        # Merged batch preserves original uid values across both sources,
+                        # so GRPO-style grouping still spans on+mixed samples for the same prompt.
+                        batch = self._concat_on_off_batches(batch_on, batch_off)
+                    else:
+                        # repeat to align with repeated responses in rollout
+                        batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                        batch = batch.union(gen_batch_output)
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
@@ -1550,6 +1776,9 @@ class RayPPOTrainer:
                         if self.config.reward_model.launch_reward_fn_async:
                             reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
                         batch.batch["token_level_scores"] = reward_tensor
+                        # Compute metrics to compare on.policy vs. mixed/off-policy samples
+                        if self.use_mixed_policy:
+                            self._compute_rollout_source_metrics(batch, metrics)
 
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
@@ -1609,6 +1838,10 @@ class RayPPOTrainer:
                         # update weights from trainer to rollout
                         with marked_timer("update_weights", timing_raw, color="red"):
                             self.checkpoint_manager.update_weights()
+                            # Trigger the update of draft model weigths for mixed-policy
+                            if self.use_mixed_policy:
+                                self.sync_mixed_rollout_weights()
+                                self.mixed_async_rollout_manager.clear_kv_cache()
 
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
@@ -1653,6 +1886,10 @@ class RayPPOTrainer:
                         self._save_checkpoint()
                         # wake replicas to avoid OOM during checkpoint saving
                         self.checkpoint_manager.update_weights()
+                        # Trigger the update of draft model weigths for mixed-policy
+                        if self.use_mixed_policy:
+                            self.sync_mixed_rollout_weights()
+                            self.mixed_async_rollout_manager.clear_kv_cache()
 
                 with marked_timer("stop_profile", timing_raw):
                     next_step_profile = (

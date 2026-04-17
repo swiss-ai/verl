@@ -214,16 +214,45 @@ class vLLMColocateWorkerExtension:
             self.add_lora(lora_request)
             logger.info(f"vLLM load weights, loaded_params: {len(weights)}")
         else:
+            # Mixed-policy draft sync sends actor weights into a draft namespace
+            # (e.g., "draft_model.*"). Route those tensors to the draft proposer
+            # model instead of the target model.
+            draft_prefixes = ("draft_model.", "drafter.model.")
+            draft_weights: list[tuple[str, torch.Tensor]] = []
+            target_weights: list[tuple[str, torch.Tensor]] = []
+            for name, tensor in weights:
+                mapped = False
+                for prefix in draft_prefixes:
+                    if name.startswith(prefix):
+                        # Draft proposer load_weights expects canonical model keys
+                        # (e.g., "model.layers..."), so remove the sync prefix.
+                        draft_weights.append((name[len(prefix) :], tensor))
+                        mapped = True
+                        break
+                if not mapped:
+                    target_weights.append((name, tensor))
+
+            if draft_weights:
+                drafter = getattr(self.model_runner, "drafter", None)
+                draft_model = getattr(drafter, "model", None) if drafter is not None else None
+                if draft_model is None:
+                    raise ValueError(
+                        "Received draft-prefixed weights but model runner has no loaded draft model "
+                        f"(first draft key={draft_weights[0][0]})."
+                    )
+                logger.info("Loading draft model weights (async), loaded_params: %d", len(draft_weights))
+                draft_model.load_weights(draft_weights)
+
             # Add the FP8 related logic here as sharding manager has been deprecated.
             # Check if FP8 quantization is enabled and apply appropriate weight loading
-            if is_fp8_model(self.model_runner.vllm_config):
+            if target_weights and is_fp8_model(self.model_runner.vllm_config):
                 logger.info(f"FP8 model detected (async): {self.model_runner.vllm_config.quant_config}")
                 # Convert bf16 weights to fp8 format before loading
-                loaded_params = load_quanted_weights(weights, self.model_runner)
+                loaded_params = load_quanted_weights(target_weights, self.model_runner)
                 logger.info(f"FP8 weights loaded (async), loaded_params: {len(loaded_params)}")
-            else:
+            elif target_weights:
                 logger.info("Loading standard weights (non-FP8, async)")
-                self.model_runner.model.load_weights(weights)
+                self.model_runner.model.load_weights(target_weights)
 
     def _get_zmq_handle(self) -> str:
         """Get ZMQ handle for communication."""
