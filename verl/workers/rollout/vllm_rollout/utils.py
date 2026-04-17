@@ -155,8 +155,27 @@ class vLLMColocateWorkerExtension:
         # patch weight loader to support MoE model
         patch_vllm_moe_model_weight_loader(self.model_runner.model)
 
-    def update_weights_from_ipc(self, peft_config: dict = None, base_sync_done=False):
-        """Update the weights of the rollout model."""
+    def update_weights_from_ipc(
+        self,
+        peft_config: dict = None,
+        base_sync_done: bool = False,
+        draft_prefixes: list[str] | tuple[str, ...] | str | None = None,
+    ):
+        """Apply streamed weight updates sent by the training worker via CUDA IPC.
+
+        Protocol overview:
+        1. The sender shares a CUDA buffer handle once over ZMQ.
+        2. The sender then streams bucket metadata (`name`, `shape`, `dtype`, `offset`).
+        3. The receiver reconstructs each tensor view from the shared buffer,
+           clones it (to detach from IPC lifetime), and applies the bucket.
+
+        Args:
+            peft_config: LoRA tensor update config. If set with ``base_sync_done``,
+                incoming tensors are treated as adapter tensors.
+            base_sync_done: Whether base model sync was completed before LoRA updates.
+            draft_prefixes: Optional draft namespace prefixes used to route mixed-policy
+                updates to the draft model (instead of the target/teacher model).
+        """
         from vllm.platforms import current_platform
 
         if current_platform.device_type == "npu" and self.device is None:
@@ -189,7 +208,12 @@ class vLLMColocateWorkerExtension:
                 weights.append((name, tensor))
             get_torch_device().synchronize()
             socket.send(b"")
-            self._update_weights(weights, peft_config=peft_config, base_sync_done=base_sync_done)
+            self._update_weights(
+                weights,
+                peft_config=peft_config,
+                base_sync_done=base_sync_done,
+                draft_prefixes=draft_prefixes,
+            )
             del weights
             if metadata["is_last"]:
                 break
@@ -201,7 +225,22 @@ class vLLMColocateWorkerExtension:
         get_torch_device().ipc_collect()
         get_torch_device().empty_cache()
 
-    def _update_weights(self, weights: list[tuple[str, torch.Tensor]], peft_config: dict, base_sync_done: bool):
+    def _update_weights(
+        self,
+        weights: list[tuple[str, torch.Tensor]],
+        peft_config: dict,
+        base_sync_done: bool,
+        draft_prefixes: list[str] | tuple[str, ...] | str | None = None,
+    ):
+        """Apply one decoded bucket of weights to LoRA, draft, and/or target model.
+
+        Routing rules:
+        - LoRA path (`peft_config` + `base_sync_done`): apply tensors as adapter weights.
+        - Dense path:
+          - keys with `draft_prefixes` -> draft proposer model.
+          - remaining keys -> target model (`self.model_runner.model`), with optional
+            FP8 conversion when enabled.
+        """
         if peft_config and base_sync_done:
             weights = dict(weights)
             lora_request = TensorLoRARequest(
@@ -217,12 +256,21 @@ class vLLMColocateWorkerExtension:
             # Mixed-policy draft sync sends actor weights into a draft namespace
             # (e.g., "draft_model.*"). Route those tensors to the draft proposer
             # model instead of the target model.
-            draft_prefixes = ("draft_model.", "drafter.model.")
+            if isinstance(draft_prefixes, str):
+                normalized_draft_prefixes = (draft_prefixes,)
+            elif draft_prefixes is not None:
+                normalized_draft_prefixes = tuple(str(prefix) for prefix in draft_prefixes if prefix)
+            else:
+                normalized_draft_prefixes = ()
+            # Backward-compatible fallback for non-mixed and older callers.
+            if not normalized_draft_prefixes:
+                normalized_draft_prefixes = ("draft_model.", "drafter.model.")
+
             draft_weights: list[tuple[str, torch.Tensor]] = []
             target_weights: list[tuple[str, torch.Tensor]] = []
             for name, tensor in weights:
                 mapped = False
-                for prefix in draft_prefixes:
+                for prefix in normalized_draft_prefixes:
                     if name.startswith(prefix):
                         # Draft proposer load_weights expects canonical model keys
                         # (e.g., "model.layers..."), so remove the sync prefix.

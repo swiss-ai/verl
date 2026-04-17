@@ -2039,6 +2039,7 @@ class AsyncActorRolloutRefWorker(ActorRolloutRefWorker):
         draft_sync_cfg = sync_config.get("draft_sync", {})
         bucket_mb = int(draft_sync_cfg.get("sync_bucket_megabytes", 2048))
         bucket_bytes = bucket_mb << 20
+        draft_prefix = str(draft_sync_cfg.get("draft_prefix", "") or "")
         rewrite_key = build_draft_key_rewriter(draft_sync_cfg)
 
         if self._is_actor and self._is_offload_param:
@@ -2077,12 +2078,20 @@ class AsyncActorRolloutRefWorker(ActorRolloutRefWorker):
                 loaded_weight_count += 1
                 pending_bytes += tensor.nbytes
                 if pending_bytes >= bucket_bytes:
-                    await self.rollout.update_weights(iter(pending_weights), clear_kv_cache=False)
+                    await self.rollout.update_weights(
+                        iter(pending_weights),
+                        clear_kv_cache=False,
+                        draft_prefixes=[draft_prefix] if draft_prefix else None,
+                    )
                     pending_weights = []
                     pending_bytes = 0
 
         if self._is_rollout and not self._is_actor and pending_weights:
-            await self.rollout.update_weights(iter(pending_weights), clear_kv_cache=True)
+            await self.rollout.update_weights(
+                iter(pending_weights),
+                clear_kv_cache=True,
+                draft_prefixes=[draft_prefix] if draft_prefix else None,
+            )
         if self._is_rollout and not self._is_actor and loaded_weight_count == 0:
             raise ValueError(
                 "No actor parameters were selected for mixed-policy draft sync. "

@@ -596,10 +596,12 @@ class DataParallelPPOActor(BasePPOActor):
                     loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
                     # vanilla -> verl.trainer.ppo.core_algos.compute_policy_loss_vanilla
 
-                    # Extract pre-computed rollout correction weights if present
-                    # Weights are computed centrally in trainer and added when algorithm.rollout_is=True
-                    # NOTE: mixed-policy samples reuse this exact path after merge;
-                    # no separate actor-loss branch exists for `rollout_source`.
+                    # Extract pre-computed rollout correction weights if present.
+                    # Weights are computed centrally in trainer and added when
+                    # algorithm.rollout_is is enabled.
+                    # NOTE: mixed-policy samples reuse this exact path after merge:
+                    # on-policy and mixed-lane samples are corrected uniformly by
+                    # rollout-log-prob ratios before contributing to policy loss.
                     rollout_is_weights = model_inputs.get("rollout_is_weights", None)
 
                     # gpg -> verl.trainer.ppo.core_algos.compute_policy_loss_gpg

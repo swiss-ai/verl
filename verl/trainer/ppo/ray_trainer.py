@@ -752,6 +752,13 @@ class RayPPOTrainer:
         return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
 
     def _build_mixed_rollout_ref_config(self):
+        """Build dedicated rollout config for the mixed teacher+draft lane.
+
+        This relies on vLLM extensions used in this project:
+        - speculative config overrides for the lane-specific teacher/draft setup
+        - draft-target split during weight loading (draft-prefixed keys)
+        - lane-specific server naming to avoid actor-name collisions
+        """
         mixed_policy_cfg = self.config.actor_rollout_ref.get("mixed_policy", {})
         teacher_model_path = mixed_policy_cfg.get("teacher_model_path", None)
         if not teacher_model_path:
@@ -861,14 +868,23 @@ class RayPPOTrainer:
         if not self.use_mixed_policy or self.mixed_rollout_wg is None or not self.mixed_draft_sync_enabled:
             return
         draft_sync_cfg = self.config.actor_rollout_ref.get("mixed_policy", {}).get("draft_sync", {})
-        # This RPC only updates mixed-lane draft weights;
-        # teacher target weights remain untouched in that lane.
+        # This RPC only updates mixed-lane draft weights; teacher target weights
+        # remain untouched. Keeping the teacher fixed is required so rollout
+        # log-probs stay interpretable as behavior-policy probabilities.
         sync_config = {
             "group_name": self.mixed_sync_group_name,
             "draft_sync": draft_sync_cfg,
         }
         self.actor_rollout_wg.sync_mixed_rollout_weights(sync_config)
         ray.get(self.mixed_rollout_wg.sync_mixed_rollout_weights(sync_config))
+
+    def _sleep_on_policy_replicas_if_unused(self):
+        """Sleep on-policy rollout replicas when mixed mode does not sample from them."""
+        if self.use_mixed_policy and self.mixed_k_on == 0:
+            # checkpoint_manager.update_weights() wakes actor-rollout replicas.
+            # In k_on=0 mode they are not used for generation and should be put
+            # back to sleep to avoid keeping rollout weights/KV cache resident.
+            self.checkpoint_manager.sleep_replicas()
 
     def init_workers(self):
         """Initialize distributed training workers using Ray backend.
@@ -1499,6 +1515,7 @@ class RayPPOTrainer:
         if self.use_mixed_policy:
             self.sync_mixed_rollout_weights()
             self.mixed_async_rollout_manager.clear_kv_cache()
+        self._sleep_on_policy_replicas_if_unused()
 
         current_epoch = self.global_steps // len(self.train_dataloader)
 
@@ -1792,9 +1809,14 @@ class RayPPOTrainer:
                         else:
                             batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
 
-                        # Compute rollout correction: IS weights, rejection sampling, and metrics
-                        # Only runs in decoupled mode (computes once per batch using stable π_old)
-                        # In bypass mode, this is skipped - actor computes metrics from evolving π_θ vs π_rollout
+                        # Compute rollout correction: IS weights, rejection sampling, and metrics.
+                        # Why it matters for mixed-policy:
+                        # - batch now contains samples from at least two behavior policies
+                        #   (on-policy actor lane + mixed teacher/draft lane);
+                        # - correction reweights gradients by π_old/π_rollout (decoupled mode)
+                        #   and can reject high-divergence tails, reducing off-policy bias.
+                        # Only runs in decoupled mode (stable π_old per batch). In bypass mode,
+                        # correction is handled in actor-side loss computation against evolving π_θ.
                         if (
                             rollout_corr_config is not None
                             and "rollout_log_probs" in batch.batch
@@ -1842,6 +1864,7 @@ class RayPPOTrainer:
                             if self.use_mixed_policy:
                                 self.sync_mixed_rollout_weights()
                                 self.mixed_async_rollout_manager.clear_kv_cache()
+                            self._sleep_on_policy_replicas_if_unused()
 
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
@@ -1890,6 +1913,7 @@ class RayPPOTrainer:
                         if self.use_mixed_policy:
                             self.sync_mixed_rollout_weights()
                             self.mixed_async_rollout_manager.clear_kv_cache()
+                        self._sleep_on_policy_replicas_if_unused()
 
                 with marked_timer("stop_profile", timing_raw):
                     next_step_profile = (

@@ -242,6 +242,15 @@ class TaskRunner:
         return resource_pool_manager
 
     def _normalize_mixed_policy_config(self, config):
+        """Normalize mixed-policy sampling counts and safe default correction.
+
+        Mixed-policy collects samples from two behavior distributions:
+        1) actor on-policy rollout, and
+        2) mixed teacher+draft rollout.
+        Because these are not identical, training is off-policy for at least the
+        mixed lane. We therefore default to decoupled token-level TIS when
+        `k_off > 0` unless the user explicitly configured rollout correction.
+        """
         mixed_policy_cfg = config.algorithm.get("mixed_policy", {})
         mixed_policy_enabled = bool(mixed_policy_cfg.get("enable", False))
         if not mixed_policy_enabled:
@@ -257,6 +266,12 @@ class TaskRunner:
             if config.get("critic", {}).get("rollout_n", None) is not None:
                 config.critic.rollout_n = k_total
             # Default correction for mixed-policy rollouts: decoupled token-TIS.
+            # Rationale:
+            # - mixed samples come from a teacher+draft behavior policy, not π_old.
+            # - PPO update still optimizes actor policy; without correction this
+            #   introduces an avoidable off-policy bias.
+            # - token-level truncation is a conservative default (lower variance
+            #   than sequence-level IS in long responses).
             if k_off > 0:
                 rollout_corr_cfg = config.algorithm.get("rollout_correction", None)
                 if rollout_corr_cfg is None:
