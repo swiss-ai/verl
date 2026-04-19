@@ -164,12 +164,13 @@ def summarize_length_metrics(lengths: list[int]) -> dict[str, float]:
     }
 
 
-def summarize_metrics(stats: list[dict[str, Any]], k: int, pass_ks: list[int]) -> dict[str, float]:
+def summarize_metrics(stats: list[dict[str, Any]], k: int, ks: list[int]) -> dict[str, float]:
     if not stats:
         return {
             "num_questions": 0.0,
             f"acc_mean@{k}": 0.0,
-            **{f"pass@{pass_k}": 0.0 for pass_k in pass_ks},
+            **{f"pass@{pass_k}": 0.0 for pass_k in ks},
+            **{f"mean@{mean_k}": 0.0 for mean_k in ks},
             **summarize_length_metrics([]),
         }
 
@@ -186,7 +187,22 @@ def summarize_metrics(stats: list[dict[str, Any]], k: int, pass_ks: list[int]) -
             f"pass@{pass_k}": float(
                 sum(pass_at_k_estimator(n=item["num_samples"], c=item["num_correct"], k=pass_k) for item in stats) / len(stats)
             )
-            for pass_k in pass_ks
+            for pass_k in ks
+        }
+    )
+    metrics.update(
+        {
+            f"mean@{mean_k}": float(
+                sum(
+                    (
+                        float(sum(item["sample_scores"][: min(mean_k, len(item["sample_scores"]))]))
+                        / min(mean_k, len(item["sample_scores"]))
+                    )
+                    for item in stats
+                )
+                / len(stats)
+            )
+            for mean_k in ks
         }
     )
     metrics.update(summarize_length_metrics([length for item in stats for length in item["response_lengths"]]))
@@ -308,6 +324,7 @@ def score_outputs(
         num_samples = 0
         num_correct = 0
         response_lengths: list[int] = []
+        sample_scores: list[float] = []
         predictions: list[dict[str, Any]] = []
         for sample_idx, sample_output in enumerate(request_output.outputs):
             num_samples += 1
@@ -322,6 +339,7 @@ def score_outputs(
                 extra_info=extra_info,
             )
             score_value, is_correct, pred_value = parse_score(score_raw)
+            sample_scores.append(float(score_value))
             if is_correct:
                 num_correct += 1
 
@@ -362,6 +380,7 @@ def score_outputs(
                 "num_samples": num_samples,
                 "num_correct": num_correct,
                 "response_lengths": response_lengths,
+                "sample_scores": sample_scores,
                 "predictions": predictions,
             }
         )
@@ -394,6 +413,7 @@ def save_task_outputs(
                 "num_samples": result["num_samples"],
                 "num_correct": result["num_correct"],
                 "response_lengths": result["response_lengths"],
+                "sample_scores": result["sample_scores"],
             }
             question_stats.append(stat)
             per_source_stats.setdefault(result["data_source"], []).append(stat)
@@ -408,9 +428,9 @@ def save_task_outputs(
 
     k_max = min(stat["num_samples"] for stat in question_stats) if question_stats else 1
     pass_ks = [2**i for i in range(k_max.bit_length()) if 2**i <= k_max]
-    overall_metrics = summarize_metrics(question_stats, k=k_max, pass_ks=pass_ks)
+    overall_metrics = summarize_metrics(question_stats, k=k_max, ks=pass_ks)
     per_data_source_metrics = {
-        source: summarize_metrics(source_stats, k=k_max, pass_ks=pass_ks)
+        source: summarize_metrics(source_stats, k=k_max, ks=pass_ks)
         for source, source_stats in sorted(per_source_stats.items())
     }
 
