@@ -6,7 +6,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 WORKING_DIR="${WORKING_DIR:-${REPO_ROOT}}"
 cd "${WORKING_DIR}"
 
-RUN_SCRIPT="${RUN_SCRIPT:-${WORKING_DIR}/experiments/ablation/run_mixed_policy_ablation_job.sh}"
+RUN_SCRIPT="${RUN_SCRIPT:-${WORKING_DIR}/experiments/ablation/run_single_job.sh}"
 PROJECT_NAME="${PROJECT_NAME:-RLVR-policy-mix-ablation}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${WORKING_DIR}/outputs/${PROJECT_NAME}}"
 

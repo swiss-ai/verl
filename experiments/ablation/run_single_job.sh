@@ -6,8 +6,6 @@
 #SBATCH --ntasks=1
 #SBATCH --time=08:00:00
 #SBATCH --environment=reasoning
-#SBATCH --output=slurm_logs/%x_%j.out
-#SBATCH --error=slurm_logs/%x_%j.err
 
 set -xeuo pipefail
 ulimit -c 0
