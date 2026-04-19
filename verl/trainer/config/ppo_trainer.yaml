@@ -160,6 +160,9 @@ algorithm:
     # If false, keep all collected rollouts (variable samples per prompt / per step)
     apply_downsampling: False
 
+    # Whether to include prompts that hit max_rounds without meeting min pos/neg criteria
+    include_unmet_max_rounds: True
+
     # Whether to scale adaptive GRPO advantages by inverse pass-rate (1 / p)
     apply_inverse_pass_rate_weight: False
 

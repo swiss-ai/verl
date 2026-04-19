@@ -76,6 +76,8 @@ class AdaptiveGroupSamplingConfig(BaseConfig):
             sampling. The adaptive loop keeps a fixed active set size and backfills from this candidate pool.
         positive_threshold (float): A rollout is positive when sequence reward > positive_threshold.
         apply_downsampling (bool): Whether to downsample each prompt to rollout.n samples after adaptive sampling.
+        include_unmet_max_rounds (bool): Whether to keep prompts that hit max_rounds without satisfying
+            min_positive_samples/min_negative_samples.
         apply_inverse_pass_rate_weight (bool): Whether to scale adaptive GRPO advantages by 1 / pass_rate.
         apply_prompt_inverse_group_weight (bool): Whether to multiply each prompt's retained samples by 1 / K_i
             in actor loss, where K_i is retained samples for prompt i.
@@ -91,6 +93,7 @@ class AdaptiveGroupSamplingConfig(BaseConfig):
     prompt_oversampling_factor: float = 1.0
     positive_threshold: float = 0.0
     apply_downsampling: bool = True
+    include_unmet_max_rounds: bool = True
     apply_inverse_pass_rate_weight: bool = True
     apply_prompt_inverse_group_weight: bool = False
     apply_within_prompt_mass_balance: bool = False

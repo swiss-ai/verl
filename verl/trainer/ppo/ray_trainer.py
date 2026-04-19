@@ -625,6 +625,9 @@ class RayPPOTrainer:
         prompt_oversampling_factor = adaptive_cfg.get("prompt_oversampling_factor", 1.0)
         if prompt_oversampling_factor is None:
             prompt_oversampling_factor = 1.0
+        include_unmet_max_rounds = adaptive_cfg.get(
+            "include_unmet_max_rounds", adaptive_cfg.get("include_max_rounds_unmet_criteria", True)
+        )
 
         return {
             "enable": bool(adaptive_cfg["enable"]),
@@ -635,6 +638,7 @@ class RayPPOTrainer:
             "prompt_oversampling_factor": float(prompt_oversampling_factor),
             "positive_threshold": float(adaptive_cfg["positive_threshold"]),
             "apply_downsampling": bool(adaptive_cfg["apply_downsampling"]),
+            "include_unmet_max_rounds": bool(include_unmet_max_rounds),
             "apply_inverse_pass_rate_weight": bool(adaptive_cfg["apply_inverse_pass_rate_weight"]),
             "apply_prompt_inverse_group_weight": bool(adaptive_cfg.get("apply_prompt_inverse_group_weight", False)),
             "apply_within_prompt_mass_balance": bool(adaptive_cfg.get("apply_within_prompt_mass_balance", False)),
@@ -659,6 +663,7 @@ class RayPPOTrainer:
         rollouts_per_round = adaptive_cfg["rollouts_per_round"]
         prompt_oversampling_factor = adaptive_cfg["prompt_oversampling_factor"]
         apply_downsampling = adaptive_cfg["apply_downsampling"]
+        include_unmet_max_rounds = adaptive_cfg["include_unmet_max_rounds"]
         apply_prompt_inverse_group_weight = adaptive_cfg["apply_prompt_inverse_group_weight"]
         apply_within_prompt_mass_balance = adaptive_cfg["apply_within_prompt_mass_balance"]
 
@@ -674,6 +679,8 @@ class RayPPOTrainer:
             raise ValueError("Adaptive group sampling requires prompt_oversampling_factor >= 1.0.")
         if not isinstance(apply_downsampling, bool):
             raise ValueError("Adaptive group sampling requires apply_downsampling to be a boolean.")
+        if not isinstance(include_unmet_max_rounds, bool):
+            raise ValueError("Adaptive group sampling requires include_unmet_max_rounds to be a boolean.")
         if not isinstance(apply_prompt_inverse_group_weight, bool):
             raise ValueError(
                 "Adaptive group sampling requires apply_prompt_inverse_group_weight to be a boolean."
@@ -839,6 +846,7 @@ class RayPPOTrainer:
         min_negative_samples = int(adaptive_cfg["min_negative_samples"])
         positive_threshold = float(adaptive_cfg["positive_threshold"])
         apply_downsampling = bool(adaptive_cfg["apply_downsampling"])
+        include_unmet_max_rounds = bool(adaptive_cfg["include_unmet_max_rounds"])
 
         num_prompt_candidates = len(batch)
         target_num_prompts = num_prompt_candidates if target_num_prompts is None else int(target_num_prompts)
@@ -984,7 +992,7 @@ class RayPPOTrainer:
                 if apply_downsampling:
                     prune_prompt_caches(prompt_state, target_rollouts=target_rollouts)
 
-            next_active_prompt_indices: list[int] = []
+            next_round_active_prompt_indices: list[int] = []
             for prompt_idx in active_prompt_indices:
                 prompt_state = prompt_states[int(prompt_idx)]
                 if prompt_state["finalized"]:
@@ -997,8 +1005,9 @@ class RayPPOTrainer:
                     (apply_downsampling and prompt_state["total"] >= target_rollouts) or (not apply_downsampling)
                 )
                 reached_max_rounds = prompt_state["rounds"] >= max_rounds
+                max_rounds_unmet_criteria = reached_max_rounds and (not meets_class_criteria)
 
-                if meets_finalization or reached_max_rounds:
+                if meets_finalization or (reached_max_rounds and include_unmet_max_rounds):
                     if apply_downsampling and (prompt_state["total"] < target_rollouts):
                         raise ValueError(
                             f"Prompt sampled only {prompt_state['total']} rollouts; expected at least {target_rollouts}. "
@@ -1010,21 +1019,32 @@ class RayPPOTrainer:
                         finalize_prompt_rollouts_keep_all(prompt_state)
                     prompt_state["completed_early"] = bool(meets_finalization)
                     completed_prompt_indices.append(int(prompt_idx))
+                elif max_rounds_unmet_criteria:
+                    # Drop this prompt from the active set and try to backfill with another candidate prompt.
+                    continue
                 else:
-                    next_active_prompt_indices.append(int(prompt_idx))
+                    next_round_active_prompt_indices.append(int(prompt_idx))
 
             # Backfill active prompts set if below target and candidates are available
             while (
-                len(next_active_prompt_indices) < target_num_prompts
+                len(next_round_active_prompt_indices) < target_num_prompts
                 and next_prompt_candidate_idx < num_prompt_candidates
                 and len(completed_prompt_indices) < target_num_prompts
             ):
-                next_active_prompt_indices.append(next_prompt_candidate_idx)
+                next_round_active_prompt_indices.append(next_prompt_candidate_idx)
                 next_prompt_candidate_idx += 1
 
-            active_prompt_indices = next_active_prompt_indices
+            active_prompt_indices = next_round_active_prompt_indices
 
         if len(completed_prompt_indices) < target_num_prompts:
+            if not include_unmet_max_rounds:
+                raise ValueError(
+                    "Adaptive group sampling could not reach target completions with strict min-pos/min-neg filtering: "
+                    f"completed={len(completed_prompt_indices)}, target={target_num_prompts}, "
+                    f"prompt_candidates={num_prompt_candidates}. "
+                    "Increase prompt_oversampling_factor/max_rounds/rollouts_per_round, relax min thresholds, "
+                    "or set include_unmet_max_rounds=True."
+                )
             raise ValueError(
                 "Adaptive group sampling ran out of active prompts before reaching target completions: "
                 f"completed={len(completed_prompt_indices)}, target={target_num_prompts}, "
