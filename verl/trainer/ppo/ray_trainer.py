@@ -843,6 +843,28 @@ class RayPPOTrainer:
             metrics[f"mixed_policy/{name}/reward_mean"] = float(token_scores[mask].mean())
             metrics[f"mixed_policy/{name}/response_len_mean"] = float(response_lens[mask].mean())
 
+        if "uid" not in batch.non_tensor_batch:
+            return
+        uids = np.asarray(batch.non_tensor_batch["uid"], dtype=object)
+        unique_uids = np.unique(uids)
+        recovered_groups = 0
+        groups_with_on_policy = 0
+        for uid in unique_uids:
+            group_mask = uids == uid
+            on_mask = group_mask & (src == self.mixed_source_on_value)
+            if not np.any(on_mask):
+                continue
+            groups_with_on_policy += 1
+            off_mask = group_mask & (src == self.mixed_source_off_value)
+            on_max_reward = float(token_scores[on_mask].max())
+            off_max_reward = float(token_scores[off_mask].max()) if np.any(off_mask) else 0.0
+            if on_max_reward == 0.0 and off_max_reward > 0.0:
+                recovered_groups += 1
+
+        metrics["mixed_policy/recovered_groups/count"] = int(recovered_groups)
+        if groups_with_on_policy > 0:
+            metrics["mixed_policy/recovered_groups/rate"] = float(recovered_groups / groups_with_on_policy)
+
     def _create_mixed_sync_group(self):
         from ray.util.collective import collective
 

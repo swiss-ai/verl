@@ -1,0 +1,119 @@
+defaults:
+  - ppo_trainer
+  - _self_
+
+algorithm:
+  adv_estimator: grpo
+  norm_adv_by_std_in_grpo: false
+  use_kl_in_reward: false
+
+  mixed_policy:
+    enable: true
+    k_on: 7
+    k_off: 1
+    source_tag_key: rollout_source
+
+  rollout_correction:
+    rollout_is: token
+    rollout_is_threshold: 2.0
+    rollout_rs: null
+    bypass_mode: false
+
+data:
+  train_files: ./data/math-12k/train.parquet
+  val_files: ./data/math-12k/test.parquet
+  train_batch_size: 512
+  max_prompt_length: 1024
+  max_response_length: 2048
+  truncation: left
+  filter_overlong_prompts: true
+
+actor_rollout_ref:
+  nccl_timeout: 1800
+  
+  model:
+    path: meta-llama/Llama-3.2-1B-Instruct
+    use_remove_padding: true
+    enable_gradient_checkpointing: true
+    use_shm: false
+    override_config:
+      attn_implementation: flash_attention_3
+  
+  actor:
+    ppo_mini_batch_size: 128
+    ppo_micro_batch_size_per_gpu: 16
+    optim:
+      optimizer: _AdamW
+      lr: 1e-6
+      weight_decay: 0.01
+      clip_grad: 1.0
+      optimizer_impl: torchao.optim
+      override_optimizer_config:
+        bf16_stochastic_round: true
+    
+    strategy: fsdp2
+    fsdp_config:
+      strategy: fsdp2
+      param_offload: false
+      optimizer_offload: false
+      entropy_from_logits_with_chunking: ${oc.select:actor_rollout_ref.actor.entropy_from_logits_with_chunking,false}
+      entropy_checkpointing: ${oc.select:actor_rollout_ref.actor.entropy_checkpointing,false}
+      model_dtype: bf16
+      mixed_precision:
+        param_dtype: bf16
+        reduce_dtype: bf16
+        buffer_dtype: bf16
+
+    clip_ratio_high: 0.28
+    clip_ratio_low: 0.2
+    use_kl_loss: false
+    loss_agg_mode: token-mean
+
+  
+  rollout:
+    name: vllm
+    n: 8  # NOTE: must be n = k_on + k_off 
+    temperature: 1
+    dtype: bfloat16
+    tensor_model_parallel_size: 1
+    gpu_memory_utilization: 0.6
+    calculate_log_probs: true
+    log_prob_micro_batch_size_per_gpu: 32
+    val_kwargs:
+      do_sample: True
+      n: 4
+      top_p: 0.95
+      temperature: 0.6
+
+  
+  mixed_policy:
+    teacher_model_path: meta-llama/Llama-3.1-8B-Instruct
+    rollout_gpu_memory_utilization: 0.6
+    draft_sync:
+      enabled: true
+      draft_prefix: 'draft_model.'
+    
+    speculative:
+      method: draft_model
+      num_speculative_tokens: 4
+      use_entropy_aware_mixing: true
+      entropy_top_k: 64
+      entropy_aware_mixing: geometric
+      entropy_aware_alpha: linear
+
+mixed_rollout:
+  nnodes: 1
+  n_gpus_per_node: 2
+
+trainer:
+  logger: ["console", "wandb"]
+  project_name: RLVR-mixed-policy
+  experiment_name: mixed-policy
+  nnodes: 1
+  n_gpus_per_node: 2
+  # use_legacy_worker_impl: enable
+  critic_warmup: 0
+  save_freq: 20
+  test_freq: 5
+  total_epochs: 10
+  val_before_train: true

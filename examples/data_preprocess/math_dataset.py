@@ -29,58 +29,119 @@ def extract_solution(solution_str):
     return remove_boxed(last_boxed_only_string(solution_str))
 
 
+def make_map_fn(dataset_cfg, instruction_following):
+    split = dataset_cfg["split"]
+    question_key = dataset_cfg["question_key"]
+    answer_key = dataset_cfg["answer_key"]
+    answer_is_boxed = dataset_cfg["answer_is_boxed"]
+    data_source = dataset_cfg["output_data_source"]
+
+    def process_fn(example, idx):
+        if question_key not in example:
+            raise KeyError(f"Missing question key `{question_key}` in sample keys: {list(example.keys())}")
+        if answer_key not in example:
+            raise KeyError(f"Missing answer key `{answer_key}` in sample keys: {list(example.keys())}")
+
+        question = str(example[question_key]).strip()
+        answer = example[answer_key]
+        if isinstance(answer, list):
+            answer = answer[0] if answer else ""
+        answer = str(answer).strip()
+
+        ground_truth = extract_solution(answer) if answer_is_boxed else answer
+        question = f"{question} {instruction_following}"
+
+        return {
+            "data_source": data_source,
+            "prompt": [{"role": "user", "content": question}],
+            "ability": "math",
+            "reward_model": {"style": "rule", "ground_truth": ground_truth},
+            "extra_info": {"split": split, "index": idx, "dataset": data_source},
+        }
+
+    return process_fn
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--local_dir", default=None)
     parser.add_argument("--hdfs_dir", default=None)
     parser.add_argument("--local_dataset_path", default=None, help="The local path to the raw dataset, if it exists.")
     parser.add_argument(
-        "--local_save_dir", default="~/data/math", help="The save directory for the preprocessed dataset."
+        "--local_save_dir", default="./data/math", help="The save directory for the preprocessed dataset."
     )
 
     args = parser.parse_args()
     local_dataset_path = args.local_dataset_path
 
-    # 'lighteval/MATH' is no longer available on huggingface.
-    # Use mirror repo: DigitalLearningGmbH/MATH-lighteval
-    data_source = "DigitalLearningGmbH/MATH-lighteval"
-    print(f"Loading the {data_source} dataset from huggingface...", flush=True)
-    if local_dataset_path is not None:
-        dataset = datasets.load_dataset(
-            local_dataset_path,
-        )
-    else:
-        dataset = datasets.load_dataset(
-            data_source,
-        )
+    # Dataset schema config:
+    # split: split to load from HF dataset
+    # question_key: question field name
+    # answer_key: answer field name
+    # answer_is_boxed: whether answer value is a worked solution containing \boxed{...}
+    train_dataset_cfg = {
+        "dataset_path": "DigitalLearningGmbH/MATH-lighteval",
+        "split": "train",
+        "question_key": "problem",
+        "answer_key": "solution",
+        "answer_is_boxed": True,
+        "output_data_source": "DigitalLearningGmbH/MATH-lighteval",
+    }
+    test_dataset_cfgs = [
+        {
+            "dataset_path": "HuggingFaceH4/MATH-500",
+            "split": "test",
+            "question_key": "problem",
+            "answer_key": "answer",
+            "answer_is_boxed": False,
+            "output_data_source": "HuggingFaceH4/MATH-500",
+        },
+        {
+            "dataset_path": "math-ai/aime24",
+            "split": "test",
+            "question_key": "problem",
+            "answer_key": "solution",
+            "answer_is_boxed": True,
+            "output_data_source": "aime2024",
+        },
+        {
+            "dataset_path": "math-ai/aime25",
+            "split": "test",
+            "question_key": "problem",
+            "answer_key": "answer",
+            "answer_is_boxed": False,
+            "output_data_source": "aime2025",
+        },
+    ]
 
-    train_dataset = dataset["train"]
-    test_dataset = dataset["test"]
+    print(f"Loading training dataset: {train_dataset_cfg['output_data_source']}", flush=True)
+    if local_dataset_path is not None:
+        train_raw = datasets.load_dataset(local_dataset_path)
+    else:
+        train_raw = datasets.load_dataset(train_dataset_cfg["dataset_path"])
+
+    train_dataset = train_raw[train_dataset_cfg["split"]]
 
     instruction_following = "Let's think step by step and output the final answer within \\boxed{}."
+    train_dataset = train_dataset.map(
+        function=make_map_fn(train_dataset_cfg, instruction_following),
+        with_indices=True,
+        remove_columns=train_dataset.column_names,
+    )
 
-    # add a row to each data item that represents a unique id
-    def make_map_fn(split):
-        def process_fn(example, idx):
-            question = example.pop("problem")
+    test_datasets = []
+    for dataset_cfg in test_dataset_cfgs:
+        print(f"Loading validation/test dataset: {dataset_cfg['dataset_path']}", flush=True)
+        raw = datasets.load_dataset(dataset_cfg["dataset_path"])
+        split_dataset = raw[dataset_cfg["split"]]
+        processed = split_dataset.map(
+            function=make_map_fn(dataset_cfg, instruction_following),
+            with_indices=True,
+            remove_columns=split_dataset.column_names,
+        )
+        test_datasets.append(processed)
 
-            question = question + " " + instruction_following
-
-            answer = example.pop("solution")
-            solution = extract_solution(answer)
-            data = {
-                "data_source": data_source,
-                "prompt": [{"role": "user", "content": question}],
-                "ability": "math",
-                "reward_model": {"style": "rule", "ground_truth": solution},
-                "extra_info": {"split": split, "index": idx},
-            }
-            return data
-
-        return process_fn
-
-    train_dataset = train_dataset.map(function=make_map_fn("train"), with_indices=True)
-    test_dataset = test_dataset.map(function=make_map_fn("test"), with_indices=True)
+    test_dataset = datasets.concatenate_datasets(test_datasets)
 
     local_save_dir = args.local_dir
     if local_save_dir is not None:
@@ -90,6 +151,7 @@ if __name__ == "__main__":
 
     local_dir = os.path.expanduser(local_save_dir)
     hdfs_dir = args.hdfs_dir
+    os.makedirs(local_dir, exist_ok=True)
 
     train_dataset.to_parquet(os.path.join(local_dir, "train.parquet"))
     test_dataset.to_parquet(os.path.join(local_dir, "test.parquet"))
