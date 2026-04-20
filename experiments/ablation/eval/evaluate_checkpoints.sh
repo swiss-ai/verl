@@ -1,0 +1,242 @@
+#!/bin/bash
+set -euo pipefail
+
+# Prevent large core_nid* dumps when native libs crash inside eval.
+ulimit -c 0
+
+usage() {
+  cat <<USAGE
+Usage:
+  $0 --run-dir <path> --eval-data-dir <path> [options]
+
+Required:
+  --run-dir <path>            Training run directory containing checkpoints.
+  --eval-data-dir <path>      Directory with per-task parquet files.
+
+Optional:
+  --output-dir <path>         Output root (default: <run-dir>/offline_eval).
+  --tasks <csv>               Comma-separated task names (default: all parquet files).
+  --evaluation-log-file <p>   Shared append-only JSONL log (default: <output-dir>/evaluation_log.jsonl).
+  --all-checkpoints           Evaluate every checkpoint instead of only the latest one.
+  --n <int>                   Override responses per prompt.
+  --max-new-tokens <int>      Override max new output tokens.
+  --temperature <float>       Override sampling temperature.
+  --top-k <int>               Override top-k.
+  --top-p <float>             Override top-p.
+  --seed <int>                Override seed.
+  --dtype <str>               Override vLLM dtype.
+  --tensor-parallel-size <n>  Override tensor parallel size.
+  --data-parallel-size <n>    Override vLLM data parallel size.
+  --gpu-memory-utilization <f>Override vLLM memory utilization.
+  --max-model-len <int>       Override vLLM max_model_len.
+  --max-num-seqs <int>        Override vLLM max_num_seqs.
+  --save-predictions          Save predictions.jsonl (default: off).
+  --record-conf              Record response confidence metrics (default: off).
+  --force                     Re-run even if metrics.json exists.
+USAGE
+}
+
+RUN_DIR=""
+EVAL_DATA_DIR=""
+OUTPUT_DIR=""
+TASKS_CSV="all"
+EVALUATION_LOG_FILE=""
+
+N=""
+MAX_NEW_TOKENS=""
+TEMPERATURE=""
+TOP_K=""
+TOP_P=""
+SEED=""
+DTYPE=""
+TENSOR_PARALLEL_SIZE=""
+DATA_PARALLEL_SIZE=""
+GPU_MEMORY_UTILIZATION=""
+MAX_MODEL_LEN=""
+MAX_NUM_SEQS=""
+
+SAVE_PREDICTIONS=false
+RECORD_CONF=false
+FORCE=false
+ALL_CHECKPOINTS=false
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --run-dir) RUN_DIR="$2"; shift 2 ;;
+    --eval-data-dir) EVAL_DATA_DIR="$2"; shift 2 ;;
+    --output-dir) OUTPUT_DIR="$2"; shift 2 ;;
+    --tasks) TASKS_CSV="$2"; shift 2 ;;
+    --evaluation-log-file) EVALUATION_LOG_FILE="$2"; shift 2 ;;
+    --all-checkpoints) ALL_CHECKPOINTS=true; shift ;;
+    --n) N="$2"; shift 2 ;;
+    --max-new-tokens) MAX_NEW_TOKENS="$2"; shift 2 ;;
+    --temperature) TEMPERATURE="$2"; shift 2 ;;
+    --top-k) TOP_K="$2"; shift 2 ;;
+    --top-p) TOP_P="$2"; shift 2 ;;
+    --seed) SEED="$2"; shift 2 ;;
+    --dtype) DTYPE="$2"; shift 2 ;;
+    --tensor-parallel-size) TENSOR_PARALLEL_SIZE="$2"; shift 2 ;;
+    --data-parallel-size) DATA_PARALLEL_SIZE="$2"; shift 2 ;;
+    --gpu-memory-utilization) GPU_MEMORY_UTILIZATION="$2"; shift 2 ;;
+    --max-model-len) MAX_MODEL_LEN="$2"; shift 2 ;;
+    --max-num-seqs) MAX_NUM_SEQS="$2"; shift 2 ;;
+    --save-predictions) SAVE_PREDICTIONS=true; shift ;;
+    --record-conf) RECORD_CONF=true; shift ;;
+    --force) FORCE=true; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *)
+      echo "Unknown argument: $1"
+      usage
+      exit 1
+      ;;
+  esac
+done
+
+if [[ -z "${RUN_DIR}" || -z "${EVAL_DATA_DIR}" ]]; then
+  echo "--run-dir and --eval-data-dir are required."
+  usage
+  exit 1
+fi
+if [[ ! -d "${RUN_DIR}" ]]; then
+  echo "Run directory does not exist: ${RUN_DIR}"
+  exit 1
+fi
+if [[ ! -d "${EVAL_DATA_DIR}" ]]; then
+  echo "Eval data directory does not exist: ${EVAL_DATA_DIR}"
+  exit 1
+fi
+
+if [[ -z "${OUTPUT_DIR}" ]]; then
+  OUTPUT_DIR="${RUN_DIR}/offline_eval"
+fi
+mkdir -p "${OUTPUT_DIR}"
+
+if [[ -z "${EVALUATION_LOG_FILE}" ]]; then
+  EVALUATION_LOG_FILE="${OUTPUT_DIR}/evaluation_log.jsonl"
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+EVAL_SCRIPT="${SCRIPT_DIR}/evaluate_checkpoint.py"
+if [[ ! -f "${EVAL_SCRIPT}" ]]; then
+  echo "Evaluator script not found: ${EVAL_SCRIPT}"
+  exit 1
+fi
+
+echo "[setup] Reinstalling local verl"
+pip install --no-deps --no-cache-dir --force-reinstall -e .
+
+resolve_latest_checkpoint_dir() {
+  local run_dir="$1"
+  local tracker="${run_dir}/latest_checkpointed_iteration.txt"
+  local latest_dir=""
+
+  if [[ -f "${tracker}" ]]; then
+    local step
+    step="$(tr -d '[:space:]' < "${tracker}")"
+    if [[ "${step}" =~ ^[0-9]+$ ]]; then
+      local candidate="${run_dir}/global_step_${step}"
+      if [[ -d "${candidate}" ]]; then
+        latest_dir="${candidate}"
+      fi
+    fi
+  fi
+
+  if [[ -z "${latest_dir}" ]]; then
+    latest_dir="$(find "${run_dir}" -maxdepth 1 -mindepth 1 -type d -name 'global_step_*' | sort -V | tail -n 1)"
+  fi
+
+  # Fallback for non-standard checkpoint folder names:
+  # pick the latest run_dir/* that actually contains actor/huggingface.
+  if [[ -z "${latest_dir}" ]]; then
+    latest_dir="$(
+      find "${run_dir}" -maxdepth 1 -mindepth 1 -type d -exec test -d "{}/actor/huggingface" ';' -print \
+        | sort -V \
+        | tail -n 1
+    )"
+  fi
+
+  if [[ -z "${latest_dir}" || ! -d "${latest_dir}" ]]; then
+    return 1
+  fi
+
+  echo "${latest_dir}"
+}
+
+resolve_all_checkpoint_dirs() {
+  local run_dir="$1"
+
+  find "${run_dir}" -maxdepth 1 -mindepth 1 -type d -name 'global_step_*' | sort -V
+}
+
+run_eval() {
+  local ckpt_dir="$1"
+  local ckpt_name model_path ckpt_output_dir
+
+  ckpt_name="$(basename "${ckpt_dir}")"
+  model_path="${ckpt_dir}/actor/huggingface"
+  if [[ ! -d "${model_path}" ]]; then
+    echo "[skip] ${ckpt_name}: missing actor/huggingface"
+    return 0
+  fi
+
+  ckpt_output_dir="${OUTPUT_DIR}/${ckpt_name}"
+  mkdir -p "${ckpt_output_dir}"
+  cmd=(
+    --model-path "${model_path}"
+    --eval-data-dir "${EVAL_DATA_DIR}"
+    --tasks "${TASKS_CSV}"
+    --output-dir "${ckpt_output_dir}"
+    --evaluation-log-file "${EVALUATION_LOG_FILE}"
+  )
+
+  [[ -n "${N}" ]] && cmd+=(--n "${N}")
+  [[ -n "${MAX_NEW_TOKENS}" ]] && cmd+=(--max-new-tokens "${MAX_NEW_TOKENS}")
+  [[ -n "${TEMPERATURE}" ]] && cmd+=(--temperature "${TEMPERATURE}")
+  [[ -n "${TOP_K}" ]] && cmd+=(--top-k "${TOP_K}")
+  [[ -n "${TOP_P}" ]] && cmd+=(--top-p "${TOP_P}")
+  [[ -n "${SEED}" ]] && cmd+=(--seed "${SEED}")
+  [[ -n "${DTYPE}" ]] && cmd+=(--dtype "${DTYPE}")
+  [[ -n "${TENSOR_PARALLEL_SIZE}" ]] && cmd+=(--tensor-parallel-size "${TENSOR_PARALLEL_SIZE}")
+  [[ -n "${DATA_PARALLEL_SIZE}" ]] && cmd+=(--data-parallel-size "${DATA_PARALLEL_SIZE}")
+  [[ -n "${GPU_MEMORY_UTILIZATION}" ]] && cmd+=(--gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}")
+  [[ -n "${MAX_MODEL_LEN}" ]] && cmd+=(--max-model-len "${MAX_MODEL_LEN}")
+  [[ -n "${MAX_NUM_SEQS}" ]] && cmd+=(--max-num-seqs "${MAX_NUM_SEQS}")
+  [[ "${SAVE_PREDICTIONS}" == "true" ]] && cmd+=(--save-predictions)
+  [[ "${RECORD_CONF}" == "true" ]] && cmd+=(--record-conf)
+  [[ "${FORCE}" == "true" ]] && cmd+=(--force)
+
+  echo "[run] ${ckpt_name} tasks=${TASKS_CSV}"
+  if [[ -n "${DATA_PARALLEL_SIZE}" && "${DATA_PARALLEL_SIZE}" -gt 1 ]]; then
+    python3 -m torch.distributed.run --standalone --nproc_per_node "${DATA_PARALLEL_SIZE}" -- "${EVAL_SCRIPT}" "${cmd[@]}"
+  else
+    python3 "${EVAL_SCRIPT}" "${cmd[@]}"
+  fi
+}
+
+checkpoint_dirs=()
+if [[ "${ALL_CHECKPOINTS}" == "true" ]]; then
+  while IFS= read -r ckpt_dir; do
+    [[ -n "${ckpt_dir}" ]] && checkpoint_dirs+=("${ckpt_dir}")
+  done < <(resolve_all_checkpoint_dirs "${RUN_DIR}")
+else
+  latest_ckpt_dir="$(resolve_latest_checkpoint_dir "${RUN_DIR}")" || {
+    echo "No checkpoint found in ${RUN_DIR}"
+    exit 1
+  }
+  checkpoint_dirs=("${latest_ckpt_dir}")
+fi
+
+if [[ ${#checkpoint_dirs[@]} -eq 0 ]]; then
+  echo "No checkpoints found in ${RUN_DIR}"
+  exit 1
+fi
+
+for ckpt_dir in "${checkpoint_dirs[@]}"; do
+  run_eval "${ckpt_dir}"
+done
+
+if [[ "${ALL_CHECKPOINTS}" == "true" ]]; then
+  echo "All-checkpoint evaluation complete. count=${#checkpoint_dirs[@]}"
+else
+  echo "Latest-checkpoint evaluation complete."
+fi

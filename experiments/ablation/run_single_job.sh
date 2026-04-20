@@ -16,7 +16,7 @@ WORKING_DIR="${WORKING_DIR:-${REPO_ROOT}}"
 cd "${WORKING_DIR}"
 
 ALGO="${ALGO:-mixed_policy}" # mixed_policy | grpo
-PROJECT_NAME="${PROJECT_NAME:-RLVR-policy-mix-ablation}"
+PROJECT_NAME="${PROJECT_NAME:-RLVR-policy-mix}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${WORKING_DIR}/outputs/${PROJECT_NAME}}"
 
 TRAIN_FILE="${TRAIN_FILE:-./data/hendrycks_math/train.parquet}"
@@ -37,6 +37,7 @@ ROLLOUT_N="${ROLLOUT_N:-$((K_ON + K_OFF))}"
 ENTROPY_TOP_K="${ENTROPY_TOP_K:-50}"
 ENTROPY_AWARE_MIXING="${ENTROPY_AWARE_MIXING:-geometric}"
 ENTROPY_AWARE_ALPHA="${ENTROPY_AWARE_ALPHA:-linear}"
+USE_ENTROPY_AWARE_MIXING="${USE_ENTROPY_AWARE_MIXING:-true}"
 
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-512}"
 MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-1024}"
@@ -76,6 +77,7 @@ export HF_HOME="${HF_HOME:-/iopsstor/scratch/cscs/msantelmo/huggingface}"
 export HF_HUB_CACHE="${HF_HUB_CACHE:-${HF_HUB_CACHE_DIR}}"
 export HF_HUB_OFFLINE="1"
 export TRANSFORMERS_OFFLINE="1"
+export PYTHONNOUSERSITE=1
 export VLLM_USE_V2_MODEL_RUNNER=0
 export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-/iopsstor/scratch/cscs/msantelmo/.cache/vllm}"
 
@@ -91,7 +93,7 @@ cp -f "${VLLM_PATCH_ROOT}/v1/worker/gpu_model_runner.py" /usr/local/lib/python3.
 cp -f "${VLLM_PATCH_ROOT}/compilation/decorators.py" /usr/local/lib/python3.12/dist-packages/vllm/compilation/decorators.py
 
 python3 -m pip install --no-deps --no-cache-dir --force-reinstall -e .
-python3 -m pip install --user --ignore-installed --no-cache-dir "cupy-cuda13x==13.6.0"
+python3 -m pip install --ignore-installed --no-cache-dir "cupy-cuda13x==13.6.0"
 python3 -m pip install --no-deps --no-cache-dir "numpy<=2.2.0"
 
 STUDENT_RESOLVED="$(resolve_model_path "${STUDENT_MODEL_PATH}")"
@@ -134,7 +136,7 @@ case "${ALGO}" in
       "algorithm.mixed_policy.k_on=${K_ON}"
       "algorithm.mixed_policy.k_off=${K_OFF}"
       "actor_rollout_ref.mixed_policy.teacher_model_path=${TEACHER_RESOLVED}"
-      "actor_rollout_ref.mixed_policy.speculative.use_entropy_aware_mixing=true"
+      "actor_rollout_ref.mixed_policy.speculative.use_entropy_aware_mixing=${USE_ENTROPY_AWARE_MIXING}"
       "actor_rollout_ref.mixed_policy.speculative.entropy_top_k=${ENTROPY_TOP_K}"
       "actor_rollout_ref.mixed_policy.speculative.entropy_aware_mixing=${ENTROPY_AWARE_MIXING}"
       "actor_rollout_ref.mixed_policy.speculative.entropy_aware_alpha=${ENTROPY_AWARE_ALPHA}"
@@ -169,6 +171,7 @@ esac
   echo "ENTROPY_TOP_K=${ENTROPY_TOP_K}"
   echo "ENTROPY_AWARE_MIXING=${ENTROPY_AWARE_MIXING}"
   echo "ENTROPY_AWARE_ALPHA=${ENTROPY_AWARE_ALPHA}"
+  echo "USE_ENTROPY_AWARE_MIXING=${USE_ENTROPY_AWARE_MIXING}"
   echo "DATE=$(date --iso-8601=seconds)"
 } > "${RUN_DIR}/run_meta.txt"
 

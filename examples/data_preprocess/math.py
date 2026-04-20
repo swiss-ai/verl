@@ -76,15 +76,15 @@ TEST_DATASET_CFGS = [
         "answer_format": "plain",
         "output_data_source": "math500",
     },
-    # {
-    #     "dataset_path": "ByteDance-Seed/BeyondAIME",
-    #     "split": "test",
-    #     "config_name": None,
-    #     "question_key": "problem",
-    #     "answer_key": "answer",
-    #     "answer_format": "plain",
-    #     "output_data_source": "beyondaime",
-    # },
+    {
+        "dataset_path": "ByteDance-Seed/BeyondAIME",
+        "split": "test",
+        "config_name": None,
+        "question_key": "problem",
+        "answer_key": "answer",
+        "answer_format": "plain",
+        "output_data_source": "beyondaime",
+    },
 ]
 
 def _extract_gsm8k_hash_answer(text: str) -> str:
