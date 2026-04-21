@@ -38,6 +38,7 @@ ENTROPY_TOP_K="${ENTROPY_TOP_K:-50}"
 ENTROPY_AWARE_MIXING="${ENTROPY_AWARE_MIXING:-geometric}"
 ENTROPY_AWARE_ALPHA="${ENTROPY_AWARE_ALPHA:-linear}"
 USE_ENTROPY_AWARE_MIXING="${USE_ENTROPY_AWARE_MIXING:-true}"
+USE_ROLLOUT_CORRECTION="${USE_ROLLOUT_CORRECTION:-true}"
 
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-512}"
 MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-1024}"
@@ -84,13 +85,16 @@ export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-/iopsstor/scratch/cscs/msantelmo/.cac
 export WANDB_NAME="${RUN_NAME}"
 export WANDB_RUN_GROUP
 
-cp -f "${VLLM_PATCH_ROOT}/config/speculative.py" /usr/local/lib/python3.12/dist-packages/vllm/config/speculative.py
-cp -f "${VLLM_PATCH_ROOT}/engine/arg_utils.py" /usr/local/lib/python3.12/dist-packages/vllm/engine/arg_utils.py
-cp -f "${VLLM_PATCH_ROOT}/v1/sample/rejection_sampler.py" /usr/local/lib/python3.12/dist-packages/vllm/v1/sample/rejection_sampler.py
-cp -f "${VLLM_PATCH_ROOT}/v1/spec_decode/eagle.py" /usr/local/lib/python3.12/dist-packages/vllm/v1/spec_decode/eagle.py
-cp -f "${VLLM_PATCH_ROOT}/v1/spec_decode/draft_model.py" /usr/local/lib/python3.12/dist-packages/vllm/v1/spec_decode/draft_model.py
-cp -f "${VLLM_PATCH_ROOT}/v1/worker/gpu_model_runner.py" /usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu_model_runner.py
-cp -f "${VLLM_PATCH_ROOT}/compilation/decorators.py" /usr/local/lib/python3.12/dist-packages/vllm/compilation/decorators.py
+# Apply local vLLM patch only for entropy-aware mixed-policy runs (EASD).
+if [ "${ALGO}" = "mixed_policy" ] && [ "${USE_ENTROPY_AWARE_MIXING}" = "true" ]; then
+  cp -f "${VLLM_PATCH_ROOT}/config/speculative.py" /usr/local/lib/python3.12/dist-packages/vllm/config/speculative.py
+  cp -f "${VLLM_PATCH_ROOT}/engine/arg_utils.py" /usr/local/lib/python3.12/dist-packages/vllm/engine/arg_utils.py
+  cp -f "${VLLM_PATCH_ROOT}/v1/sample/rejection_sampler.py" /usr/local/lib/python3.12/dist-packages/vllm/v1/sample/rejection_sampler.py
+  cp -f "${VLLM_PATCH_ROOT}/v1/spec_decode/eagle.py" /usr/local/lib/python3.12/dist-packages/vllm/v1/spec_decode/eagle.py
+  cp -f "${VLLM_PATCH_ROOT}/v1/spec_decode/draft_model.py" /usr/local/lib/python3.12/dist-packages/vllm/v1/spec_decode/draft_model.py
+  cp -f "${VLLM_PATCH_ROOT}/v1/worker/gpu_model_runner.py" /usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu_model_runner.py
+  cp -f "${VLLM_PATCH_ROOT}/compilation/decorators.py" /usr/local/lib/python3.12/dist-packages/vllm/compilation/decorators.py
+fi
 
 python3 -m pip install --no-deps --no-cache-dir --force-reinstall -e .
 python3 -m pip install --ignore-installed --no-cache-dir "cupy-cuda13x==13.6.0"
@@ -141,6 +145,16 @@ case "${ALGO}" in
       "actor_rollout_ref.mixed_policy.speculative.entropy_aware_mixing=${ENTROPY_AWARE_MIXING}"
       "actor_rollout_ref.mixed_policy.speculative.entropy_aware_alpha=${ENTROPY_AWARE_ALPHA}"
     )
+    if [ "${USE_ROLLOUT_CORRECTION}" = "false" ]; then
+      overrides+=(
+        "algorithm.rollout_correction.rollout_is=null"
+        "algorithm.rollout_correction.rollout_is_threshold=null"
+        "algorithm.rollout_correction.rollout_rs=null"
+        "algorithm.rollout_correction.rollout_rs_threshold=null"
+        "algorithm.rollout_correction.bypass_mode=true"
+        "algorithm.rollout_correction.loss_type=ppo_clip"
+      )
+    fi
     ;;
   grpo)
     CONFIG_NAME="grpo"
@@ -172,6 +186,8 @@ esac
   echo "ENTROPY_AWARE_MIXING=${ENTROPY_AWARE_MIXING}"
   echo "ENTROPY_AWARE_ALPHA=${ENTROPY_AWARE_ALPHA}"
   echo "USE_ENTROPY_AWARE_MIXING=${USE_ENTROPY_AWARE_MIXING}"
+  echo "USE_ROLLOUT_CORRECTION=${USE_ROLLOUT_CORRECTION}"
+  echo "APPLY_VLLM_PATCH=$([ "${ALGO}" = "mixed_policy" ] && [ "${USE_ENTROPY_AWARE_MIXING}" = "true" ] && echo true || echo false)"
   echo "DATE=$(date --iso-8601=seconds)"
 } > "${RUN_DIR}/run_meta.txt"
 

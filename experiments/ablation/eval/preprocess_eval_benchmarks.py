@@ -95,6 +95,16 @@ TASK_SPECS: dict[str, dict[str, Any]] = {
         "prompt_style": "gsm8k_hash",
         "data_source": "openai/gsm8k",
     },
+    "gsm8k_boxed": {
+        "dataset_path": "openai/gsm8k",
+        "config_name": "main",
+        "split": "test",
+        "question_keys": ["question", "problem"],
+        "answer_keys": ["answer", "solution"],
+        "answer_format": "gsm8k_hash",
+        "prompt_style": "boxed",
+        "data_source": "gsm8k_boxed",
+    },
 }
 
 
@@ -150,6 +160,24 @@ def resolve_key(sample: dict[str, Any], candidates: list[str], field: str, task:
         if key in sample:
             return key
     raise KeyError(f"Task '{task}': no {field} found. Tried keys: {candidates}. Available keys: {list(sample.keys())}")
+
+
+def extract_question_from_prompt(prompt: Any) -> str:
+    content = ""
+    if isinstance(prompt, list) and prompt:
+        first = prompt[0]
+        if isinstance(first, dict):
+            content = str(first.get("content", "")).strip()
+    elif isinstance(prompt, dict):
+        content = str(prompt.get("content", "")).strip()
+    else:
+        content = str(prompt).strip()
+
+    for instruction in (BOXED_INSTRUCTION, GSM8K_INSTRUCTION):
+        suffix = f" {instruction}"
+        if content.endswith(suffix):
+            return content[: -len(suffix)].rstrip()
+    return content
 
 
 def extract_boxed_answer(answer_text: str) -> str:
@@ -222,14 +250,26 @@ def preprocess_task(task: str, spec: dict[str, Any], max_samples: int, seed: int
         raise ValueError(f"Task '{task}' produced an empty dataset.")
 
     probe = raw_split[0]
-    question_key = resolve_key(probe, spec["question_keys"], "question key", task)
-    answer_key = resolve_key(probe, spec["answer_keys"], "answer key", task)
+    question_key = None
+    answer_key = None
+    if "prompt" not in probe:
+        question_key = resolve_key(probe, spec["question_keys"], "question key", task)
+    if "reward_model" not in probe:
+        answer_key = resolve_key(probe, spec["answer_keys"], "answer key", task)
 
     rows: list[dict[str, Any]] = []
     id_candidates = ["question_id", "id", "problem_id", "uid"]
     for idx, sample in enumerate(raw_split):
-        question = str(sample[question_key]).strip()
-        ground_truth = normalize_answer(sample[answer_key], spec["answer_format"])
+        if question_key is not None:
+            question = str(sample[question_key]).strip()
+        else:
+            question = extract_question_from_prompt(sample.get("prompt", ""))
+
+        if answer_key is not None:
+            ground_truth = normalize_answer(sample[answer_key], spec["answer_format"])
+        else:
+            reward_model = sample.get("reward_model", {})
+            ground_truth = str(reward_model.get("ground_truth", "")).strip() if isinstance(reward_model, dict) else ""
         qid = next(
             (str(sample[key]) for key in id_candidates if key in sample and sample[key] is not None),
             f"{task}_{idx}",
