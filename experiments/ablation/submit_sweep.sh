@@ -6,46 +6,47 @@ cd "${WORKING_DIR}"
 
 #####################################################################
 
-PROJECT_NAME=RLVR-policy-mix
+PROJECT_NAME=policy-mix
 OUTPUT_ROOT=${WORKING_DIR}/outputs/${PROJECT_NAME}
 
 TRAIN_FILE=./data/hendrycks_math/train.parquet
 VAL_FILE=./data/hendrycks_math/test.parquet
 
 REPEATS=3
-START_SEED=42
+START_SEED=85
+MAX_CONCURRENT_RUNS=4
 
 STUDENT_MODEL_PATH=meta-llama/Llama-3.2-1B-Instruct
-TEACHER_MODEL_PATH=meta-llama/Llama-3.1-8B-Instruct	# nvidia/OpenMath2-Llama3.1-8B
+TEACHER_MODEL_PATH=nvidia/OpenMath2-Llama3.1-8B # meta-llama/Llama-3.1-8B-Instruct
 
-TRAIN_BATCH_SIZE=512
-TOTAL_EPOCHS=10
+TRAIN_BATCH_SIZE=128
+TOTAL_EPOCHS=3
 # EASD parameters
 ENTROPY_TOP_K=32
 ENTROPY_AWARE_MIXING=geometric
-ENTROPY_AWARE_ALPHA=linear
-# Sweep over speculative mixing mode in mixed policy:
-# - true: entropy-aware mixture of student/teacher (EASD)
-# - false: fully off-policy teacher drafts
+ENTROPY_AWARE_ALPHA=sqrt
+
 USE_ENTROPY_AWARE_MIXING_OPTIONS=(
 	true
 	false
 )
-# Sweep over rollout correction usage:
-# - true: use rollout correction config from mixed_policy.yaml
-# - false: disable rollout correction (no IS / no RS)
+
 USE_ROLLOUT_CORRECTION_OPTIONS=(
-	true
-	# false
+	true # false
 )
-# K_on/K_off pairs for mixed policy. GRPO will use n = k_on + k_off.
+
+FILTER_GROUPS_ENABLE_OPTIONS=(
+	false
+	# true
+)
+
 MIXED_SPLIT_PAIRS=(
 	"7 1"
 	"6 2"
 )
-# Rollout budgets to run GRPO on.
+
 GRPO_ROLLOUT_NS=(
-	# 8
+	8
 )
 
 #####################################################################
@@ -54,6 +55,13 @@ STUDENT_MODEL_TAG="$(basename "${STUDENT_MODEL_PATH}" | tr '/:.' '-' | tr -c '[:
 TEACHER_MODEL_TAG="$(basename "${TEACHER_MODEL_PATH}" | tr '/:.' '-' | tr -c '[:alnum:]_-' '-')"
 
 mkdir -p "${OUTPUT_ROOT}"
+
+submitted_job_ids=()
+
+normalize_job_id() {
+  local raw_job_id="$1"
+  printf '%s' "${raw_job_id%%;*}"
+}
 
 submit_job() {
   local algo="$1"
@@ -64,28 +72,45 @@ submit_job() {
   local rollout_n="$6"
   local use_entropy_aware_mixing="${7:-true}"
   local use_rollout_correction="${8:-true}"
+  local filter_groups_enable="${9:-false}"
 
   local budget_tag
   local run_name
   if [ "${algo}" = "mixed_policy" ]; then
     if [ "${use_entropy_aware_mixing}" = "true" ]; then
-      run_name="mixed__${STUDENT_MODEL_TAG}--${TEACHER_MODEL_TAG}__bs${TRAIN_BATCH_SIZE}__${k_on}on${k_off}off__rc-${use_rollout_correction}__EASD-topk${ENTROPY_TOP_K}_${ENTROPY_AWARE_MIXING}_${ENTROPY_AWARE_ALPHA}__rep${rep}"
+      run_name="mixed__${STUDENT_MODEL_TAG}--${TEACHER_MODEL_TAG}__bs${TRAIN_BATCH_SIZE}__${k_on}on${k_off}off__rc-${use_rollout_correction}__fg-${filter_groups_enable}__EASD-topk${ENTROPY_TOP_K}_${ENTROPY_AWARE_MIXING}_${ENTROPY_AWARE_ALPHA}__rep${rep}"
     else
-      run_name="mixed__${STUDENT_MODEL_TAG}--${TEACHER_MODEL_TAG}__bs${TRAIN_BATCH_SIZE}__${k_on}on${k_off}off__rc-${use_rollout_correction}__SD__rep${rep}"
+      run_name="mixed__${STUDENT_MODEL_TAG}--${TEACHER_MODEL_TAG}__bs${TRAIN_BATCH_SIZE}__${k_on}on${k_off}off__rc-${use_rollout_correction}__fg-${filter_groups_enable}__SD__rep${rep}"
     fi
   else
-    run_name="${algo}__${STUDENT_MODEL_TAG}__bs${TRAIN_BATCH_SIZE}__n${rollout_n}__rep${rep}"
+    run_name="${algo}__${STUDENT_MODEL_TAG}__bs${TRAIN_BATCH_SIZE}__n${rollout_n}__fg-${filter_groups_enable}__rep${rep}"
   fi
   local wandb_group="${run_name%__rep${rep}}"
   local run_dir="${OUTPUT_ROOT}/${run_name}"
   mkdir -p "${run_dir}"
 
-  sbatch \
+  local dependency_arg=()
+  local current_idx="${#submitted_job_ids[@]}"
+  if (( current_idx >= MAX_CONCURRENT_RUNS )); then
+    local dep_idx=$((current_idx - MAX_CONCURRENT_RUNS))
+    dependency_arg=(--dependency="afterany:${submitted_job_ids[dep_idx]}")
+  fi
+
+  local sbatch_output
+  sbatch_output="$(
+    sbatch \
+    --parsable \
+    "${dependency_arg[@]}" \
     --job-name="${run_name}" \
     --output="${run_dir}/slurm.out" \
     --error="${run_dir}/slurm.err" \
-    --export=ALL,WORKING_DIR="${WORKING_DIR}",PROJECT_NAME="${PROJECT_NAME}",OUTPUT_ROOT="${OUTPUT_ROOT}",RUN_NAME="${run_name}",WANDB_RUN_GROUP="${wandb_group}",ALGO="${algo}",REPEAT_IDX="${rep}",SEED="${seed}",TRAIN_FILE="${TRAIN_FILE}",VAL_FILE="${VAL_FILE}",STUDENT_MODEL_PATH="${STUDENT_MODEL_PATH}",TEACHER_MODEL_PATH="${TEACHER_MODEL_PATH}",TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE}",TOTAL_EPOCHS="${TOTAL_EPOCHS}",K_ON="${k_on}",K_OFF="${k_off}",ROLLOUT_N="${rollout_n}",ENTROPY_TOP_K="${ENTROPY_TOP_K}",ENTROPY_AWARE_MIXING="${ENTROPY_AWARE_MIXING}",ENTROPY_AWARE_ALPHA="${ENTROPY_AWARE_ALPHA}",USE_ENTROPY_AWARE_MIXING="${use_entropy_aware_mixing}",USE_ROLLOUT_CORRECTION="${use_rollout_correction}" \
+    --export=ALL,WORKING_DIR="${WORKING_DIR}",PROJECT_NAME="${PROJECT_NAME}",OUTPUT_ROOT="${OUTPUT_ROOT}",RUN_NAME="${run_name}",WANDB_RUN_GROUP="${wandb_group}",ALGO="${algo}",REPEAT_IDX="${rep}",SEED="${seed}",TRAIN_FILE="${TRAIN_FILE}",VAL_FILE="${VAL_FILE}",STUDENT_MODEL_PATH="${STUDENT_MODEL_PATH}",TEACHER_MODEL_PATH="${TEACHER_MODEL_PATH}",TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE}",TOTAL_EPOCHS="${TOTAL_EPOCHS}",K_ON="${k_on}",K_OFF="${k_off}",ROLLOUT_N="${rollout_n}",ENTROPY_TOP_K="${ENTROPY_TOP_K}",ENTROPY_AWARE_MIXING="${ENTROPY_AWARE_MIXING}",ENTROPY_AWARE_ALPHA="${ENTROPY_AWARE_ALPHA}",USE_ENTROPY_AWARE_MIXING="${use_entropy_aware_mixing}",USE_ROLLOUT_CORRECTION="${use_rollout_correction}",FILTER_GROUPS_ENABLE="${filter_groups_enable}" \
     "${WORKING_DIR}/experiments/ablation/run_single_job.sh"
+  )"
+
+  local job_id
+  job_id="$(normalize_job_id "${sbatch_output}")"
+  submitted_job_ids+=("${job_id}")
 
   sleep 2
 }
@@ -100,10 +125,12 @@ for rep in $(seq 1 "${REPEATS}"); do
     rollout_n=$((k_on + k_off))
 
     # Mixed policy with (k_on, k_off), for each mixing/correction mode.
-    for use_entropy_aware_mixing in "${USE_ENTROPY_AWARE_MIXING_OPTIONS[@]}"; do
-      for use_rollout_correction in "${USE_ROLLOUT_CORRECTION_OPTIONS[@]}"; do
-        submit_job "mixed_policy" "${rep}" "${seed}" "${k_on}" "${k_off}" "${rollout_n}" "${use_entropy_aware_mixing}" "${use_rollout_correction}"
-        submitted=$((submitted + 1))
+    for filter_groups_enable in "${FILTER_GROUPS_ENABLE_OPTIONS[@]}"; do
+      for use_entropy_aware_mixing in "${USE_ENTROPY_AWARE_MIXING_OPTIONS[@]}"; do
+        for use_rollout_correction in "${USE_ROLLOUT_CORRECTION_OPTIONS[@]}"; do
+          submit_job "mixed_policy" "${rep}" "${seed}" "${k_on}" "${k_off}" "${rollout_n}" "${use_entropy_aware_mixing}" "${use_rollout_correction}" "${filter_groups_enable}"
+          submitted=$((submitted + 1))
+        done
       done
     done
   done
@@ -111,11 +138,14 @@ for rep in $(seq 1 "${REPEATS}"); do
   # GRPO baseline runs over explicit rollout budgets n.
   for rollout_n in "${GRPO_ROLLOUT_NS[@]}"; do
     # k_on and k_off are ignored for GRPO; pass placeholders.
-    submit_job "grpo" "${rep}" "${seed}" 0 0 "${rollout_n}" "true" "true"
-    submitted=$((submitted + 1))
+    for filter_groups_enable in "${FILTER_GROUPS_ENABLE_OPTIONS[@]}"; do
+      submit_job "grpo" "${rep}" "${seed}" 0 0 "${rollout_n}" "true" "true" "${filter_groups_enable}"
+      submitted=$((submitted + 1))
+    done
   done
 done
 
 echo "Submitted ${submitted} jobs."
+echo "Max concurrent runs: ${MAX_CONCURRENT_RUNS}"
 echo "Methods: mixed_policy + grpo"
-echo "Repeats: ${REPEATS}, start seed: ${START_SEED}, split pairs: ${MIXED_SPLIT_PAIRS[*]}, mixing options: ${USE_ENTROPY_AWARE_MIXING_OPTIONS[*]}, rollout correction options: ${USE_ROLLOUT_CORRECTION_OPTIONS[*]}, grpo n list: ${GRPO_ROLLOUT_NS[*]}"
+echo "Repeats: ${REPEATS}, start seed: ${START_SEED}, split pairs: ${MIXED_SPLIT_PAIRS[*]}, mixing options: ${USE_ENTROPY_AWARE_MIXING_OPTIONS[*]}, rollout correction options: ${USE_ROLLOUT_CORRECTION_OPTIONS[*]}, filter groups options: ${FILTER_GROUPS_ENABLE_OPTIONS[*]}, filter metric: seq_reward, max gen batches: 0, grpo n list: ${GRPO_ROLLOUT_NS[*]}"
