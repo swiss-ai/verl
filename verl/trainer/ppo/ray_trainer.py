@@ -317,6 +317,12 @@ class RayPPOTrainer:
         if self.mixed_policy_enabled:
             self.mixed_k_on, self.mixed_k_off, self.mixed_k_total = resolve_mixed_policy_counts(mixed_policy_cfg)
             self.use_mixed_policy = self.mixed_k_off > 0
+            rollout_n = int(self.config.actor_rollout_ref.rollout.n)
+            if rollout_n != self.mixed_k_total:
+                raise ValueError(
+                    "mixed_policy requires actor_rollout_ref.rollout.n == k_on + k_off, "
+                    f"got rollout.n={rollout_n}, k_on+k_off={self.mixed_k_total}."
+                )
             draft_sync_cfg = self.config.actor_rollout_ref.get("mixed_policy", {}).get("draft_sync", {})
             self.mixed_draft_sync_enabled = bool(draft_sync_cfg.get("enabled", True))
             self.mixed_source_tag_key = mixed_policy_cfg.get("source_tag_key", "rollout_source")
@@ -888,7 +894,7 @@ class RayPPOTrainer:
         )
 
     def _filter_groups_by_std(
-        self, batch: DataProto, metric_name: str
+        self, batch: DataProto, metric_name: str, expected_group_size: int | None = None
     ) -> tuple[DataProto, dict[str, float | int]]:
         if "uid" not in batch.non_tensor_batch:
             raise ValueError("filter_groups requires `uid` in batch.non_tensor_batch.")
@@ -907,6 +913,10 @@ class RayPPOTrainer:
         zero_std_prompt_count = 0
         prompt_reward_sum = 0.0
         for uid, traj_idxs in uid2traj_idxs.items():
+            # Enforce prompt-level completeness so filtering never keeps partial rollout groups for a uid.
+            if expected_group_size is not None and len(traj_idxs) != expected_group_size:
+                prompt_reward_sum += float(np.mean(seq_rewards[traj_idxs]))
+                continue
             prompt_metric_std = float(np.std(uid2metric_vals[uid]))
             # Keep singleton prompts to avoid dead loops when rollout_n == 1.
             if (not np.isclose(prompt_metric_std, 0.0)) or len(traj_idxs) == 1:
@@ -1670,6 +1680,9 @@ class RayPPOTrainer:
         filter_metric_name = filter_groups_cfg.get("metric", None) if filter_groups_enabled else None
         if filter_groups_enabled and not filter_metric_name:
             filter_metric_name = "seq_reward"
+        expected_prompt_group_size = int(
+            self.mixed_k_total if self.use_mixed_policy else self.config.actor_rollout_ref.rollout.n
+        )
 
         accumulated_batch = None
         num_prompt_in_batch = 0
@@ -1726,7 +1739,6 @@ class RayPPOTrainer:
                                 if curr_step_profile:
                                     self.async_rollout_manager.start_profile(global_step=self.global_steps)
                                 gen_batch_output_on = self.async_rollout_manager.generate_sequences(on_input)
-                                self.checkpoint_manager.sleep_replicas()
                                 if curr_step_profile:
                                     self.async_rollout_manager.stop_profile()
                                 print(f"[debug-gen][actor] end step={self.global_steps} batch_size={len(gen_batch_output_on)}")
@@ -1755,7 +1767,6 @@ class RayPPOTrainer:
                                 if curr_step_profile:
                                     self.async_rollout_manager.start_profile(global_step=self.global_steps)
                                 gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
-                                self.checkpoint_manager.sleep_replicas()
                                 if curr_step_profile:
                                     self.async_rollout_manager.stop_profile()
                             print(f"[debug-gen][actor] end step={self.global_steps} batch_size={len(gen_batch_output)}")
@@ -1776,7 +1787,6 @@ class RayPPOTrainer:
                                 if curr_step_profile:
                                     self.async_rollout_manager.start_profile()
                                 gen_baseline_output = self.async_rollout_manager.generate_sequences(gen_baseline_batch)
-                                self.checkpoint_manager.sleep_replicas()
                                 if curr_step_profile:
                                     self.async_rollout_manager.stop_profile()
                             batch = batch.union(gen_baseline_output)
@@ -1844,6 +1854,124 @@ class RayPPOTrainer:
                                 batch, reward_fn=self.reward_fn, reward_for_val=False
                             )
 
+                    # Resolve reward and apply filter-groups before log_prob computation
+                    if self.config.reward_model.launch_reward_fn_async:
+                        reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
+                    batch.batch["token_level_scores"] = reward_tensor
+
+                    if reward_extra_infos_dict:
+                        batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
+
+                    # compute rewards. apply_kl_penalty if available
+                    if self.config.algorithm.use_kl_in_reward:
+                        batch, kl_metrics = apply_kl_penalty(
+                            batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
+                        )
+                        metrics.update(kl_metrics)
+                    else:
+                        batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+
+                    if filter_groups_enabled:
+                        filtered_batch, filter_stats = self._filter_groups_by_std(
+                            batch=batch,
+                            metric_name=filter_metric_name,
+                            expected_group_size=expected_prompt_group_size,
+                        )
+
+                        pre_filter_prompt_count += int(filter_stats["total_prompt_count"])
+                        pre_filter_traj_count += int(filter_stats["total_traj_count"])
+                        pre_filter_zero_std_prompt_count += int(filter_stats["zero_std_prompt_count"])
+                        pre_filter_prompt_reward_sum += float(filter_stats["total_prompt_reward_sum"])
+                        pre_filter_traj_reward_sum += float(filter_stats["total_traj_reward_sum"])
+                        num_prompt_in_batch += int(filter_stats["kept_prompt_count"])
+
+                        if len(filtered_batch) > 0:
+                            accumulated_batch = (
+                                filtered_batch
+                                if accumulated_batch is None
+                                else DataProto.concat([accumulated_batch, filtered_batch])
+                            )
+
+                        prompt_bsz = self.config.data.train_batch_size
+                        if num_prompt_in_batch < prompt_bsz:
+                            print(f"{num_prompt_in_batch=} < {prompt_bsz=}")
+                            max_num_gen_batches = filter_groups_cfg.get("max_num_gen_batches", 0)
+                            if max_num_gen_batches <= 0 or num_gen_batches < max_num_gen_batches:
+                                print(f"{num_gen_batches=}. Keep generating...")
+                                continue
+                            raise ValueError(
+                                f"{num_gen_batches=} >= {max_num_gen_batches=}."
+                                + " Generated too many. Please check if your data are too difficult."
+                                + " You could also try set max_num_gen_batches=0 to enable endless trials."
+                            )
+
+                        if accumulated_batch is None:
+                            raise ValueError("No samples left after filtering; cannot build a training batch.")
+
+                        # Build the training batch from complete prompt groups only.
+                        accumulated_uids = np.asarray(accumulated_batch.non_tensor_batch["uid"], dtype=object)
+                        uid2traj_idxs = defaultdict(list)
+                        ordered_uids = []
+                        for traj_idx, uid in enumerate(accumulated_uids):
+                            if uid not in uid2traj_idxs:
+                                ordered_uids.append(uid)
+                            uid2traj_idxs[uid].append(traj_idx)
+
+                        complete_uids = [
+                            uid for uid in ordered_uids if len(uid2traj_idxs[uid]) == expected_prompt_group_size
+                        ]
+
+                        if len(complete_uids) < prompt_bsz:
+                            max_num_gen_batches = filter_groups_cfg.get("max_num_gen_batches", 0)
+                            if max_num_gen_batches <= 0 or num_gen_batches < max_num_gen_batches:
+                                print(
+                                    f"Only {len(complete_uids)} complete prompt groups available; "
+                                    "keep generating..."
+                                )
+                                continue
+                            raise ValueError(
+                                f"Only {len(complete_uids)} complete prompt groups after {num_gen_batches} "
+                                f"generation batches; expected at least {prompt_bsz} with group size "
+                                f"{expected_prompt_group_size}."
+                            )
+
+                        selected_uids = complete_uids[:prompt_bsz]
+                        selected_traj_idxs = [idx for uid in selected_uids for idx in uid2traj_idxs[uid]]
+                        batch = accumulated_batch[selected_traj_idxs]
+                        if reward_extra_infos_dict:
+                            reward_extra_infos_dict = {
+                                k: batch.non_tensor_batch[k].tolist()
+                                for k in reward_extra_infos_dict
+                                if k in batch.non_tensor_batch and len(batch.non_tensor_batch[k]) == len(batch)
+                            }
+
+                        metrics.update(
+                            {
+                                "filter_groups/pre/num_prompts": float(pre_filter_prompt_count),
+                                "filter_groups/pre/num_trajectories": float(pre_filter_traj_count),
+                                "filter_groups/pre/prompt_reward_mean": pre_filter_prompt_reward_sum
+                                / max(1, pre_filter_prompt_count),
+                                "filter_groups/pre/sequence_reward_mean": pre_filter_traj_reward_sum
+                                / max(1, pre_filter_traj_count),
+                                "filter_groups/pre/zero_std_prompt_ratio": pre_filter_zero_std_prompt_count
+                                / max(1, pre_filter_prompt_count),
+                            }
+                        )
+                        metrics.update(
+                            self._compute_filter_group_batch_metrics(
+                                batch=batch, metric_name=filter_metric_name, prefix="filter_groups/post"
+                            )
+                        )
+                    else:
+                        accumulated_batch = batch
+
+                    # Sleep on-policy rollout replicas only after we're sure we
+                    # have a full training batch (i.e., no early continue).
+                    # This prevents generate-retry loops from calling generation
+                    # on sleeping replicas when filter-groups is enabled.
+                    if self.async_rollout_mode and ((not self.use_mixed_policy) or self.mixed_k_on > 0):
+                        self.checkpoint_manager.sleep_replicas()
+
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
                     # - Decoupled mode: Recomputes old_log_probs as proximal anchor (3 policies: π_rollout, π_old, π_θ)
@@ -1906,88 +2034,6 @@ class RayPPOTrainer:
                             batch = batch.union(values)
 
                     with marked_timer("adv", timing_raw, color="brown"):
-                        # we combine with rule-based rm
-                        if self.config.reward_model.launch_reward_fn_async:
-                            reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
-                        batch.batch["token_level_scores"] = reward_tensor
-
-                        if reward_extra_infos_dict:
-                            batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
-
-                        # compute rewards. apply_kl_penalty if available
-                        if self.config.algorithm.use_kl_in_reward:
-                            batch, kl_metrics = apply_kl_penalty(
-                                batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
-                            )
-                            metrics.update(kl_metrics)
-                        else:
-                            batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
-
-                        if filter_groups_enabled:
-                            filtered_batch, filter_stats = self._filter_groups_by_std(
-                                batch=batch, metric_name=filter_metric_name
-                            )
-
-                            pre_filter_prompt_count += int(filter_stats["total_prompt_count"])
-                            pre_filter_traj_count += int(filter_stats["total_traj_count"])
-                            pre_filter_zero_std_prompt_count += int(filter_stats["zero_std_prompt_count"])
-                            pre_filter_prompt_reward_sum += float(filter_stats["total_prompt_reward_sum"])
-                            pre_filter_traj_reward_sum += float(filter_stats["total_traj_reward_sum"])
-                            num_prompt_in_batch += int(filter_stats["kept_prompt_count"])
-
-                            if len(filtered_batch) > 0:
-                                accumulated_batch = (
-                                    filtered_batch
-                                    if accumulated_batch is None
-                                    else DataProto.concat([accumulated_batch, filtered_batch])
-                                )
-
-                            prompt_bsz = self.config.data.train_batch_size
-                            if num_prompt_in_batch < prompt_bsz:
-                                print(f"{num_prompt_in_batch=} < {prompt_bsz=}")
-                                max_num_gen_batches = filter_groups_cfg.get("max_num_gen_batches", 0)
-                                if max_num_gen_batches <= 0 or num_gen_batches < max_num_gen_batches:
-                                    print(f"{num_gen_batches=}. Keep generating...")
-                                    continue
-                                raise ValueError(
-                                    f"{num_gen_batches=} >= {max_num_gen_batches=}."
-                                    + " Generated too many. Please check if your data are too difficult."
-                                    + " You could also try set max_num_gen_batches=0 to enable endless trials."
-                                )
-
-                            if accumulated_batch is None:
-                                raise ValueError("No samples left after filtering; cannot build a training batch.")
-
-                            # Align to the expected trajectory batch size.
-                            traj_bsz = self.config.data.train_batch_size * self.config.actor_rollout_ref.rollout.n
-                            batch = accumulated_batch[:traj_bsz]
-                            if reward_extra_infos_dict:
-                                reward_extra_infos_dict = {
-                                    k: batch.non_tensor_batch[k].tolist()
-                                    for k in reward_extra_infos_dict
-                                    if k in batch.non_tensor_batch and len(batch.non_tensor_batch[k]) == len(batch)
-                                }
-
-                            metrics.update(
-                                {
-                                    "filter_groups/pre/num_prompts": float(pre_filter_prompt_count),
-                                    "filter_groups/pre/num_trajectories": float(pre_filter_traj_count),
-                                    "filter_groups/pre/prompt_reward_mean": pre_filter_prompt_reward_sum
-                                    / max(1, pre_filter_prompt_count),
-                                    "filter_groups/pre/sequence_reward_mean": pre_filter_traj_reward_sum
-                                    / max(1, pre_filter_traj_count),
-                                    "filter_groups/pre/zero_std_prompt_ratio": pre_filter_zero_std_prompt_count
-                                    / max(1, pre_filter_prompt_count),
-                                }
-                            )
-                            metrics.update(
-                                self._compute_filter_group_batch_metrics(
-                                    batch=batch, metric_name=filter_metric_name, prefix="filter_groups/post"
-                                )
-                            )
-                        else:
-                            accumulated_batch = batch
-
                         # Balance the number of valid tokens across DP ranks.
                         # NOTE: This usually changes the order of data in the `batch`,
                         # which won't affect the advantage calculation (since it's based on uid),
