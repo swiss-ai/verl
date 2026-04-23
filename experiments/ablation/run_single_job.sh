@@ -86,16 +86,14 @@ export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-/iopsstor/scratch/cscs/msantelmo/.cac
 export WANDB_NAME="${RUN_NAME}"
 export WANDB_RUN_GROUP
 
-# Apply local vLLM patch only for entropy-aware mixed-policy runs (EASD).
-if [ "${ALGO}" = "mixed_policy" ] && [ "${USE_ENTROPY_AWARE_MIXING}" = "true" ]; then
-  cp -f "${VLLM_PATCH_ROOT}/config/speculative.py" /usr/local/lib/python3.12/dist-packages/vllm/config/speculative.py
-  cp -f "${VLLM_PATCH_ROOT}/engine/arg_utils.py" /usr/local/lib/python3.12/dist-packages/vllm/engine/arg_utils.py
-  cp -f "${VLLM_PATCH_ROOT}/v1/sample/rejection_sampler.py" /usr/local/lib/python3.12/dist-packages/vllm/v1/sample/rejection_sampler.py
-  cp -f "${VLLM_PATCH_ROOT}/v1/spec_decode/eagle.py" /usr/local/lib/python3.12/dist-packages/vllm/v1/spec_decode/eagle.py
-  cp -f "${VLLM_PATCH_ROOT}/v1/spec_decode/draft_model.py" /usr/local/lib/python3.12/dist-packages/vllm/v1/spec_decode/draft_model.py
-  cp -f "${VLLM_PATCH_ROOT}/v1/worker/gpu_model_runner.py" /usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu_model_runner.py
-  cp -f "${VLLM_PATCH_ROOT}/compilation/decorators.py" /usr/local/lib/python3.12/dist-packages/vllm/compilation/decorators.py
-fi
+# Apply local vLLM patch
+cp -f "${VLLM_PATCH_ROOT}/config/speculative.py" /usr/local/lib/python3.12/dist-packages/vllm/config/speculative.py
+cp -f "${VLLM_PATCH_ROOT}/engine/arg_utils.py" /usr/local/lib/python3.12/dist-packages/vllm/engine/arg_utils.py
+cp -f "${VLLM_PATCH_ROOT}/v1/sample/rejection_sampler.py" /usr/local/lib/python3.12/dist-packages/vllm/v1/sample/rejection_sampler.py
+cp -f "${VLLM_PATCH_ROOT}/v1/spec_decode/eagle.py" /usr/local/lib/python3.12/dist-packages/vllm/v1/spec_decode/eagle.py
+cp -f "${VLLM_PATCH_ROOT}/v1/spec_decode/draft_model.py" /usr/local/lib/python3.12/dist-packages/vllm/v1/spec_decode/draft_model.py
+cp -f "${VLLM_PATCH_ROOT}/v1/worker/gpu_model_runner.py" /usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu_model_runner.py
+cp -f "${VLLM_PATCH_ROOT}/compilation/decorators.py" /usr/local/lib/python3.12/dist-packages/vllm/compilation/decorators.py
 
 python3 -m pip install --no-deps --no-cache-dir --force-reinstall -e .
 python3 -m pip install --ignore-installed --no-cache-dir "cupy-cuda13x==13.6.0"
@@ -127,9 +125,9 @@ overrides=(
   "trainer.max_critic_ckpt_to_keep=null"
   "trainer.val_before_train=true"
   "critic.checkpoint.save_contents=[]"
-  "algorithm.filter_groups.enable=${FILTER_GROUPS_ENABLE}"
-  "algorithm.filter_groups.metric=seq_reward"
-  "algorithm.filter_groups.max_num_gen_batches=0"
+  "++algorithm.filter_groups.enable=${FILTER_GROUPS_ENABLE}"
+  "++algorithm.filter_groups.metric=seq_reward"
+  "++algorithm.filter_groups.max_num_gen_batches=0"
   "hydra.run.dir=${RUN_DIR}"
   "hydra.output_subdir=.hydra"
 )
