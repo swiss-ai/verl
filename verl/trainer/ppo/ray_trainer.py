@@ -2237,3 +2237,23 @@ class RayPPOTrainer:
                 if hasattr(self.train_dataset, "on_batch_end"):
                     # The dataset may be changed after each training batch
                     self.train_dataset.on_batch_end(batch=batch)
+
+        completed_steps = max(0, self.global_steps - 1)
+        if completed_steps < self.total_training_steps:
+            reason = (
+                "Train dataloader exhausted before reaching configured total_training_steps. "
+                "Treating this as a normal training end."
+            )
+            if filter_groups_enabled:
+                reason += " filter_groups is enabled, so one optimization step may consume multiple data batches."
+            if num_gen_batches > 0:
+                reason += f" Incomplete-step stats: {num_gen_batches=}, {num_prompt_in_batch=}."
+            print(
+                f"{reason} {completed_steps=}, configured_total_steps={self.total_training_steps}."
+            )
+
+        if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
+            self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=True)
+        pprint(f"Final validation metrics: {last_val_metrics}")
+        progress_bar.close()
+        return
