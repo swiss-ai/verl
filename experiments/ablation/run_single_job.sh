@@ -171,31 +171,6 @@ case "${ALGO}" in
     ;;
 esac
 
-{
-  echo "RUN_NAME=${RUN_NAME}"
-  echo "ALGO=${ALGO}"
-  echo "PROJECT_NAME=${PROJECT_NAME}"
-  echo "TRAIN_FILE=${TRAIN_FILE}"
-  echo "VAL_FILE=${VAL_FILE}"
-  echo "STUDENT_MODEL_PATH=${STUDENT_MODEL_PATH}"
-  echo "TEACHER_MODEL_PATH=${TEACHER_MODEL_PATH}"
-  echo "SEED=${SEED}"
-  echo "REPEAT_IDX=${REPEAT_IDX}"
-  echo "K_ON=${K_ON}"
-  echo "K_OFF=${K_OFF}"
-  echo "ROLLOUT_N=${ROLLOUT_N}"
-  echo "ENTROPY_TOP_K=${ENTROPY_TOP_K}"
-  echo "ENTROPY_AWARE_MIXING=${ENTROPY_AWARE_MIXING}"
-  echo "ENTROPY_AWARE_ALPHA=${ENTROPY_AWARE_ALPHA}"
-  echo "USE_ENTROPY_AWARE_MIXING=${USE_ENTROPY_AWARE_MIXING}"
-  echo "USE_ROLLOUT_CORRECTION=${USE_ROLLOUT_CORRECTION}"
-  echo "FILTER_GROUPS_ENABLE=${FILTER_GROUPS_ENABLE}"
-  echo "FILTER_GROUPS_METRIC=seq_reward"
-  echo "FILTER_GROUPS_MAX_NUM_GEN_BATCHES=0"
-  echo "APPLY_VLLM_PATCH=$([ "${ALGO}" = "mixed_policy" ] && [ "${USE_ENTROPY_AWARE_MIXING}" = "true" ] && echo true || echo false)"
-  echo "DATE=$(date --iso-8601=seconds)"
-} > "${RUN_DIR}/run_meta.txt"
-
 HYDRA_FULL_ERROR=1 python3 -m verl.trainer.main_ppo \
   --config-name="${CONFIG_NAME}" \
   "${overrides[@]}" \

@@ -16,11 +16,13 @@ REPEATS=3
 START_SEED=85
 MAX_CONCURRENT_RUNS=4
 
-STUDENT_MODEL_PATH=meta-llama/Llama-3.2-1B-Instruct
-TEACHER_MODEL_PATH=nvidia/OpenMath2-Llama3.1-8B # meta-llama/Llama-3.1-8B-Instruct
+STUDENT_MODEL_PATH=Qwen/Qwen3-1.7B-Base # meta-llama/Llama-3.2-1B-Instruct
+TEACHER_MODEL_PATH=Qwen/Qwen3-8B-Base # nvidia/OpenMath2-Llama3.1-8B, meta-llama/Llama-3.1-8B-Instruct
 
+# Training parameters
 TRAIN_BATCH_SIZE=128
-TOTAL_EPOCHS=3
+TOTAL_EPOCHS=6  # Double the epochs as group filtering  
+
 # EASD parameters
 ENTROPY_TOP_K=32
 ENTROPY_AWARE_MIXING=geometric
@@ -31,23 +33,15 @@ USE_ENTROPY_AWARE_MIXING_OPTIONS=(
 	false
 )
 
-USE_ROLLOUT_CORRECTION_OPTIONS=(
-	true # false
-)
-
-FILTER_GROUPS_ENABLE_OPTIONS=(
-	false
-	# true
-)
+USE_ROLLOUT_CORRECTION_OPTIONS=(true)
+FILTER_GROUPS_ENABLE_OPTIONS=(true)
 
 MIXED_SPLIT_PAIRS=(
 	"7 1"
 	"6 2"
 )
 
-GRPO_ROLLOUT_NS=(
-	8
-)
+GRPO_ROLLOUT_NS=(8)
 
 #####################################################################
 
@@ -74,18 +68,21 @@ submit_job() {
   local use_rollout_correction="${8:-true}"
   local filter_groups_enable="${9:-false}"
 
-  local budget_tag
+  local filter_tag=""
+  if [ "${filter_groups_enable}" = "true" ]; then
+    filter_tag="__DAPO"
+  fi
   local run_name
   if [ "${algo}" = "mixed_policy" ]; then
     if [ "${use_entropy_aware_mixing}" = "true" ]; then
-      run_name="mixed__${STUDENT_MODEL_TAG}--${TEACHER_MODEL_TAG}__bs${TRAIN_BATCH_SIZE}__${k_on}on${k_off}off__rc-${use_rollout_correction}__fg-${filter_groups_enable}__EASD-topk${ENTROPY_TOP_K}_${ENTROPY_AWARE_MIXING}_${ENTROPY_AWARE_ALPHA}__rep${rep}"
+      run_name="mixed__${STUDENT_MODEL_TAG}--${TEACHER_MODEL_TAG}__bs${TRAIN_BATCH_SIZE}__${k_on}on${k_off}off__rc-${use_rollout_correction}${filter_tag}__EASD-topk${ENTROPY_TOP_K}_${ENTROPY_AWARE_MIXING}_${ENTROPY_AWARE_ALPHA}__seed${seed}"
     else
-      run_name="mixed__${STUDENT_MODEL_TAG}--${TEACHER_MODEL_TAG}__bs${TRAIN_BATCH_SIZE}__${k_on}on${k_off}off__rc-${use_rollout_correction}__fg-${filter_groups_enable}__SD__rep${rep}"
+      run_name="mixed__${STUDENT_MODEL_TAG}--${TEACHER_MODEL_TAG}__bs${TRAIN_BATCH_SIZE}__${k_on}on${k_off}off__rc-${use_rollout_correction}${filter_tag}__SD__seed${seed}"
     fi
   else
-    run_name="${algo}__${STUDENT_MODEL_TAG}__bs${TRAIN_BATCH_SIZE}__n${rollout_n}__fg-${filter_groups_enable}__rep${rep}"
+    run_name="${algo}__${STUDENT_MODEL_TAG}__bs${TRAIN_BATCH_SIZE}__n${rollout_n}${filter_tag}__seed${seed}"
   fi
-  local wandb_group="${run_name%__rep${rep}}"
+  local wandb_group="${run_name%__seed${seed}}"
   local run_dir="${OUTPUT_ROOT}/${run_name}"
   mkdir -p "${run_dir}"
 
