@@ -855,21 +855,31 @@ class RayPPOTrainer:
         unique_uids = np.unique(uids)
         recovered_groups = 0
         groups_with_on_policy = 0
+        zero_reward_on_policy_prompt_count = 0
+        zero_reward_off_policy_prompt_count = 0
         for uid in unique_uids:
             group_mask = uids == uid
             on_mask = group_mask & (src == self.mixed_source_on_value)
-            if not np.any(on_mask):
-                continue
-            groups_with_on_policy += 1
             off_mask = group_mask & (src == self.mixed_source_off_value)
-            on_max_reward = float(token_scores[on_mask].max())
-            off_max_reward = float(token_scores[off_mask].max()) if np.any(off_mask) else 0.0
-            if on_max_reward == 0.0 and off_max_reward > 0.0:
-                recovered_groups += 1
+            if np.any(on_mask):
+                on_prompt_reward = float(token_scores[on_mask].mean())
+                if np.isclose(on_prompt_reward, 0.0):
+                    zero_reward_on_policy_prompt_count += 1
+                groups_with_on_policy += 1
+                on_max_reward = float(token_scores[on_mask].max())
+                off_max_reward = float(token_scores[off_mask].max()) if np.any(off_mask) else 0.0
+                if on_max_reward == 0.0 and off_max_reward > 0.0:
+                    recovered_groups += 1
+            if np.any(off_mask):
+                off_prompt_reward = float(token_scores[off_mask].mean())
+                if np.isclose(off_prompt_reward, 0.0):
+                    zero_reward_off_policy_prompt_count += 1
 
         metrics["mixed_policy/recovered_groups/count"] = int(recovered_groups)
         if groups_with_on_policy > 0:
             metrics["mixed_policy/recovered_groups/rate"] = float(recovered_groups / groups_with_on_policy)
+        metrics["mixed_policy/on_policy/zero_reward_prompt_count"] = int(zero_reward_on_policy_prompt_count)
+        metrics["mixed_policy/off_policy/zero_reward_prompt_count"] = int(zero_reward_off_policy_prompt_count)
 
     def _get_filter_group_metric_values(self, batch: DataProto, metric_name: str) -> np.ndarray:
         if metric_name in batch.non_tensor_batch:
@@ -911,11 +921,15 @@ class RayPPOTrainer:
 
         kept_prompt_uids = []
         zero_std_prompt_count = 0
+        zero_reward_prompt_count = 0
         prompt_reward_sum = 0.0
         for uid, traj_idxs in uid2traj_idxs.items():
+            prompt_reward = float(np.mean(seq_rewards[traj_idxs]))
+            if np.isclose(prompt_reward, 0.0):
+                zero_reward_prompt_count += 1
             # Enforce prompt-level completeness so filtering never keeps partial rollout groups for a uid.
             if expected_group_size is not None and len(traj_idxs) != expected_group_size:
-                prompt_reward_sum += float(np.mean(seq_rewards[traj_idxs]))
+                prompt_reward_sum += prompt_reward
                 continue
             prompt_metric_std = float(np.std(uid2metric_vals[uid]))
             # Keep singleton prompts to avoid dead loops when rollout_n == 1.
@@ -923,7 +937,7 @@ class RayPPOTrainer:
                 kept_prompt_uids.append(uid)
             else:
                 zero_std_prompt_count += 1
-            prompt_reward_sum += float(np.mean(seq_rewards[traj_idxs]))
+            prompt_reward_sum += prompt_reward
 
         kept_prompt_uids = set(kept_prompt_uids)
         kept_traj_idxs = [idx for idx, uid in enumerate(uids) if uid in kept_prompt_uids]
@@ -932,6 +946,7 @@ class RayPPOTrainer:
             "total_prompt_count": len(uid2traj_idxs),
             "kept_prompt_count": len(kept_prompt_uids),
             "zero_std_prompt_count": zero_std_prompt_count,
+            "zero_reward_prompt_count": zero_reward_prompt_count,
             "total_traj_count": int(len(uids)),
             "kept_traj_count": int(len(kept_traj_idxs)),
             "total_prompt_reward_sum": float(prompt_reward_sum),
@@ -1690,6 +1705,7 @@ class RayPPOTrainer:
         pre_filter_prompt_count = 0
         pre_filter_traj_count = 0
         pre_filter_zero_std_prompt_count = 0
+        pre_filter_zero_reward_prompt_count = 0
         pre_filter_prompt_reward_sum = 0.0
         pre_filter_traj_reward_sum = 0.0
         timing_raw = defaultdict(float)
@@ -1881,6 +1897,7 @@ class RayPPOTrainer:
                         pre_filter_prompt_count += int(filter_stats["total_prompt_count"])
                         pre_filter_traj_count += int(filter_stats["total_traj_count"])
                         pre_filter_zero_std_prompt_count += int(filter_stats["zero_std_prompt_count"])
+                        pre_filter_zero_reward_prompt_count += int(filter_stats["zero_reward_prompt_count"])
                         pre_filter_prompt_reward_sum += float(filter_stats["total_prompt_reward_sum"])
                         pre_filter_traj_reward_sum += float(filter_stats["total_traj_reward_sum"])
                         num_prompt_in_batch += int(filter_stats["kept_prompt_count"])
@@ -1954,6 +1971,8 @@ class RayPPOTrainer:
                                 "filter_groups/pre/sequence_reward_mean": pre_filter_traj_reward_sum
                                 / max(1, pre_filter_traj_count),
                                 "filter_groups/pre/zero_std_prompt_ratio": pre_filter_zero_std_prompt_count
+                                / max(1, pre_filter_prompt_count),
+                                "filter_groups/pre/zero_reward_prompt_ratio": pre_filter_zero_reward_prompt_count
                                 / max(1, pre_filter_prompt_count),
                             }
                         )
@@ -2210,6 +2229,7 @@ class RayPPOTrainer:
                 pre_filter_prompt_count = 0
                 pre_filter_traj_count = 0
                 pre_filter_zero_std_prompt_count = 0
+                pre_filter_zero_reward_prompt_count = 0
                 pre_filter_prompt_reward_sum = 0.0
                 pre_filter_traj_reward_sum = 0.0
                 timing_raw = defaultdict(float)
