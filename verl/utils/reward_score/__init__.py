@@ -45,6 +45,12 @@ def default_compute_score(
         from . import gsm8k
 
         res = gsm8k.compute_score(solution_str, ground_truth)
+
+    elif data_source in ["code", "livecodebench", "humanevalplus", "livecodebench/code_generation_lite-v6"]:
+        from . import code
+
+        res = code.compute_score(solution_str, ground_truth, extra_info, sparse_rewards=True, max_test_cases=None)
+
     elif data_source in ["lighteval/MATH", "DigitalLearningGmbH/MATH-lighteval", "HuggingFaceH4/MATH-500", "math_500", "math500", "math-500", "hendrycks-math-12k", "gsm8k_boxed", "beyondaime", "aime2024", "aime2025", "aime2026", "amc23"]:
         from . import math_reward
 

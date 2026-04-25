@@ -7,8 +7,9 @@ set -euo pipefail
 WORKING_DIR="/iopsstor/scratch/cscs/msantelmo/inverse_batch/RL-policy-mix"
 cd "${WORKING_DIR}"
 
-PROJECT_NAME="RLVR-policy-mix"
-# PROJECT_NAME="entropy_DeepScaleR"
+PROJECT_NAME="policy-mix-math"
+MAX_CONCURRENT_RUNS=10
+
 OUTPUT_ROOT="${WORKING_DIR}/outputs/${PROJECT_NAME}"
 EVAL_DATA_DIR="${WORKING_DIR}/data/eval_benchmarks"
 EVAL_OUTPUT_SUBDIR="eval"
@@ -41,6 +42,11 @@ MAX_NUM_SEQS="${MAX_NUM_SEQS:-}"
 
 SLEEP_BETWEEN_SUBMITS="${SLEEP_BETWEEN_SUBMITS:-2}"
 
+if ! [[ "${MAX_CONCURRENT_RUNS}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "MAX_CONCURRENT_RUNS must be a positive integer, got: ${MAX_CONCURRENT_RUNS}"
+  exit 1
+fi
+
 if [[ ! -d "${OUTPUT_ROOT}" ]]; then
   echo "Output root does not exist: ${OUTPUT_ROOT}"
   exit 1
@@ -59,6 +65,15 @@ submit_eval_job() {
   local eval_dir="${run_dir}/${EVAL_OUTPUT_SUBDIR}"
   mkdir -p "${eval_dir}"
 
+  local dependency_arg=()
+  local current_idx="${#submitted_job_ids[@]}"
+  if (( current_idx >= MAX_CONCURRENT_RUNS )); then
+    local dep_idx=$((current_idx - MAX_CONCURRENT_RUNS))
+    dependency_arg=(--dependency="afterany:${submitted_job_ids[dep_idx]}")
+  fi
+
+  local sbatch_output
+  sbatch_output="$(
   WORKING_DIR="${WORKING_DIR}" \
   RUN_DIR="${run_dir}" \
   EVAL_DATA_DIR="${EVAL_DATA_DIR}" \
@@ -81,17 +96,24 @@ submit_eval_job() {
   MAX_MODEL_LEN="${MAX_MODEL_LEN}" \
   MAX_NUM_SEQS="${MAX_NUM_SEQS}" \
   sbatch \
+    --parsable \
+    "${dependency_arg[@]}" \
     --job-name="${job_name}" \
     --output="${eval_dir}/slurm_eval.out" \
     --error="${eval_dir}/slurm_eval.err" \
     --export=ALL \
     "${WORKING_DIR}/experiments/ablation/eval/run_hard_ablation_eval_job.sh"
+  )"
+
+  local job_id="${sbatch_output%%;*}"
+  submitted_job_ids+=("${job_id}")
 
   echo "[submitted] ${run_name}"
   sleep "${SLEEP_BETWEEN_SUBMITS}"
 }
 
 submitted=0
+submitted_job_ids=()
 while IFS= read -r run_dir; do
   run_name="$(basename "${run_dir}")"
 
@@ -112,3 +134,4 @@ while IFS= read -r run_dir; do
 done < <(find "${OUTPUT_ROOT}" -maxdepth 1 -mindepth 1 -type d | sort)
 
 echo "Submitted ${submitted} latest-checkpoint evaluation jobs."
+echo "Max concurrent runs: ${MAX_CONCURRENT_RUNS}"

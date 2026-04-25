@@ -16,14 +16,14 @@ WORKING_DIR="${WORKING_DIR:-${REPO_ROOT}}"
 cd "${WORKING_DIR}"
 
 ALGO="${ALGO:-mixed_policy}" # mixed_policy | grpo
-PROJECT_NAME="${PROJECT_NAME:-RLVR-policy-mix}"
+PROJECT_NAME="${PROJECT_NAME:-policy-mix-code}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${WORKING_DIR}/outputs/${PROJECT_NAME}}"
 
-TRAIN_FILE="${TRAIN_FILE:-./data/hendrycks_math/train.parquet}"
-VAL_FILE="${VAL_FILE:-./data/hendrycks_math/test.parquet}"
+TRAIN_FILE="${TRAIN_FILE:-./data/livecodebench_v6/train.parquet}"
+VAL_FILE="${VAL_FILE:-./data/livecodebench_v6/test.parquet}"
 
-STUDENT_MODEL_PATH="${STUDENT_MODEL_PATH:-meta-llama/Llama-3.2-1B-Instruct}"
-TEACHER_MODEL_PATH="${TEACHER_MODEL_PATH:-meta-llama/Llama-3.1-8B-Instruct}"
+STUDENT_MODEL_PATH="${STUDENT_MODEL_PATH:-Qwen/Qwen3-1.7B-Base}"
+TEACHER_MODEL_PATH="${TEACHER_MODEL_PATH:-Qwen/Qwen3-8B}"
 
 REPEAT_IDX="${REPEAT_IDX:-1}"
 SEED="${SEED:-42}"
@@ -34,30 +34,28 @@ K_ON="${K_ON:-7}"
 K_OFF="${K_OFF:-1}"
 ROLLOUT_N="${ROLLOUT_N:-$((K_ON + K_OFF))}"
 
-ENTROPY_TOP_K="${ENTROPY_TOP_K:-50}"
+ENTROPY_TOP_K="${ENTROPY_TOP_K:-32}"
 ENTROPY_AWARE_MIXING="${ENTROPY_AWARE_MIXING:-geometric}"
-ENTROPY_AWARE_ALPHA="${ENTROPY_AWARE_ALPHA:-linear}"
+ENTROPY_AWARE_ALPHA="${ENTROPY_AWARE_ALPHA:-sqrt2}"
 USE_ENTROPY_AWARE_MIXING="${USE_ENTROPY_AWARE_MIXING:-true}"
 USE_ROLLOUT_CORRECTION="${USE_ROLLOUT_CORRECTION:-true}"
 FILTER_GROUPS_ENABLE="${FILTER_GROUPS_ENABLE:-false}"
 
 LOG_TRAIN_ROLLOUTS="${LOG_TRAIN_ROLLOUTS:-false}"
-TRAIN_ROLLOUT_LOG_FREQ=5
-TRAIN_ROLLOUT_LOG_MAX_SAMPLES=32
+TRAIN_ROLLOUT_LOG_FREQ="${TRAIN_ROLLOUT_LOG_FREQ:-5}"
+TRAIN_ROLLOUT_LOG_MAX_SAMPLES="${TRAIN_ROLLOUT_LOG_MAX_SAMPLES:-32}"
 
-TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-512}"
-MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-1024}"
-MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-2048}"
-TOTAL_EPOCHS="${TOTAL_EPOCHS:-10}"
+TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-32}"
+MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-4096}"
+MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-4096}"
+TOTAL_EPOCHS="${TOTAL_EPOCHS:-6}"
 
-# Throughput-oriented rollout knobs (kept configurable via env/submit script)
 ROLLOUT_MAX_MODEL_LEN="${ROLLOUT_MAX_MODEL_LEN:-16384}"
 ROLLOUT_ENABLE_CHUNKED_PREFILL="${ROLLOUT_ENABLE_CHUNKED_PREFILL:-false}"
 ROLLOUT_MAX_NUM_BATCHED_TOKENS="${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-16384}"
 ROLLOUT_CUDAGRAPH_MODE="${ROLLOUT_CUDAGRAPH_MODE:-FULL_AND_PIECEWISE}"
 
 VLLM_PATCH_ROOT="${VLLM_PATCH_ROOT:-/users/msantelmo/scratch/vllm/vllm}"
-
 HF_HUB_CACHE_DIR="${HF_HUB_CACHE_DIR:-/capstor/scratch/cscs/msantelmo/huggingface/hub}"
 
 resolve_model_path() {
@@ -87,8 +85,8 @@ mkdir -p "${RUN_DIR}"
 
 export HF_HOME="${HF_HOME:-/iopsstor/scratch/cscs/msantelmo/huggingface}"
 export HF_HUB_CACHE="${HF_HUB_CACHE:-${HF_HUB_CACHE_DIR}}"
-export HF_HUB_OFFLINE="1"
-export TRANSFORMERS_OFFLINE="1"
+export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
+export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 export PYTHONNOUSERSITE=1
 export VLLM_USE_V2_MODEL_RUNNER=0
 export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-/iopsstor/scratch/cscs/msantelmo/.cache/vllm}"
@@ -96,7 +94,6 @@ export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-/iopsstor/scratch/cscs/msantelmo/.cac
 export WANDB_NAME="${RUN_NAME}"
 export WANDB_RUN_GROUP
 
-# Apply local vLLM patch
 cp -f "${VLLM_PATCH_ROOT}/config/speculative.py" /usr/local/lib/python3.12/dist-packages/vllm/config/speculative.py
 cp -f "${VLLM_PATCH_ROOT}/engine/arg_utils.py" /usr/local/lib/python3.12/dist-packages/vllm/engine/arg_utils.py
 cp -f "${VLLM_PATCH_ROOT}/v1/sample/rejection_sampler.py" /usr/local/lib/python3.12/dist-packages/vllm/v1/sample/rejection_sampler.py
@@ -113,15 +110,20 @@ STUDENT_RESOLVED="$(resolve_model_path "${STUDENT_MODEL_PATH}")"
 TEACHER_RESOLVED="$(resolve_model_path "${TEACHER_MODEL_PATH}")"
 
 overrides=(
+  "actor_rollout_ref.actor.ppo_mini_batch_size=32"
+  "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=8"
   "data.train_files=${TRAIN_FILE}"
   "data.val_files=${VAL_FILE}"
   "data.train_batch_size=${TRAIN_BATCH_SIZE}"
   "data.max_prompt_length=${MAX_PROMPT_LENGTH}"
   "data.max_response_length=${MAX_RESPONSE_LENGTH}"
+  "data.truncation=left"
+  "data.filter_overlong_prompts=true"
   "actor_rollout_ref.model.path=${STUDENT_RESOLVED}"
   "actor_rollout_ref.actor.data_loader_seed=${SEED}"
   "actor_rollout_ref.actor.checkpoint.save_contents=['hf_model']"
   "actor_rollout_ref.rollout.n=${ROLLOUT_N}"
+  "reward_model.reward_manager=naive"
   "trainer.project_name=${PROJECT_NAME}"
   "trainer.experiment_name=${RUN_NAME}"
   "trainer.default_local_dir=${RUN_DIR}"
@@ -142,15 +144,7 @@ overrides=(
   "hydra.output_subdir=.hydra"
 )
 
-# If the teacher is a non-Base Qwen3 model, disable thinking and add rollout optimizations.
 if [[ "${TEACHER_MODEL_PATH}" == *"Qwen3"* && "${TEACHER_MODEL_PATH}" != *"Base"* ]]; then
-  echo "Rollout speed knobs:"
-  echo "  ROLLOUT_MAX_MODEL_LEN=${ROLLOUT_MAX_MODEL_LEN}"
-  echo "  ROLLOUT_ENABLE_CHUNKED_PREFILL=${ROLLOUT_ENABLE_CHUNKED_PREFILL}"
-  echo "  ROLLOUT_MAX_NUM_BATCHED_TOKENS=${ROLLOUT_MAX_NUM_BATCHED_TOKENS}"
-  echo "  ROLLOUT_CUDAGRAPH_MODE=${ROLLOUT_CUDAGRAPH_MODE}"
-  echo "Disabled thinking in chat template"
-
   overrides+=(
     "actor_rollout_ref.rollout.max_model_len=${ROLLOUT_MAX_MODEL_LEN}"
     "++actor_rollout_ref.rollout.enable_chunked_prefill=${ROLLOUT_ENABLE_CHUNKED_PREFILL}"
@@ -161,10 +155,6 @@ if [[ "${TEACHER_MODEL_PATH}" == *"Qwen3"* && "${TEACHER_MODEL_PATH}" != *"Base"
 fi
 
 if [ "${LOG_TRAIN_ROLLOUTS}" = "true" ]; then
-  echo "Training rollout debug logging enabled:"
-  echo "  dir=${RUN_DIR}/train_rollouts"
-  echo "  freq=${TRAIN_ROLLOUT_LOG_FREQ}"
-  echo "  max_samples=${TRAIN_ROLLOUT_LOG_MAX_SAMPLES}"
   overrides+=(
     "trainer.rollout_data_dir=${RUN_DIR}/train_rollouts"
     "++trainer.rollout_data_freq=${TRAIN_ROLLOUT_LOG_FREQ}"

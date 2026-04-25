@@ -38,6 +38,11 @@ MAX_MODEL_LEN="${MAX_MODEL_LEN:-}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-}"
 
 SLEEP_BETWEEN_SUBMITS="${SLEEP_BETWEEN_SUBMITS:-2}"
+MAX_CONCURRENT_RUNS="${MAX_CONCURRENT_RUNS:-4}"
+if ! [[ "${MAX_CONCURRENT_RUNS}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "MAX_CONCURRENT_RUNS must be a positive integer, got: ${MAX_CONCURRENT_RUNS}"
+  exit 1
+fi
 
 if [[ ! -d "${EVAL_DATA_DIR}" ]]; then
   echo "Eval data directory does not exist: ${EVAL_DATA_DIR}"
@@ -81,6 +86,15 @@ submit_base_eval_job() {
   local out_dir="${OUTPUT_ROOT}/${model_tag}"
   mkdir -p "${out_dir}"
 
+  local dependency_arg=()
+  local current_idx="${#submitted_job_ids[@]}"
+  if (( current_idx >= MAX_CONCURRENT_RUNS )); then
+    local dep_idx=$((current_idx - MAX_CONCURRENT_RUNS))
+    dependency_arg=(--dependency="afterany:${submitted_job_ids[dep_idx]}")
+  fi
+
+  local sbatch_output
+  sbatch_output="$(
   WORKING_DIR="${WORKING_DIR}" \
   MODEL_PATH="${resolved_model}" \
   MODEL_NAME="${model_tag}" \
@@ -103,20 +117,28 @@ submit_base_eval_job() {
   MAX_MODEL_LEN="${MAX_MODEL_LEN}" \
   MAX_NUM_SEQS="${MAX_NUM_SEQS}" \
   sbatch \
+    --parsable \
+    "${dependency_arg[@]}" \
     --job-name="eval_base_${model_tag}" \
     --output="${out_dir}/slurm_eval.out" \
     --error="${out_dir}/slurm_eval.err" \
     --export=ALL \
     "${WORKING_DIR}/experiments/ablation/eval/run_hard_ablation_eval_job.sh"
+  )"
+
+  local job_id="${sbatch_output%%;*}"
+  submitted_job_ids+=("${job_id}")
 
   echo "[submitted] base model: ${model} -> ${model_tag}"
   sleep "${SLEEP_BETWEEN_SUBMITS}"
 }
 
 submitted=0
+submitted_job_ids=()
 for model in "${MODELS[@]}"; do
   submit_base_eval_job "${model}"
   submitted=$((submitted + 1))
 done
 
 echo "Submitted ${submitted} base-model evaluation jobs."
+echo "Max concurrent runs: ${MAX_CONCURRENT_RUNS}"
