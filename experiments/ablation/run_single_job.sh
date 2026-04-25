@@ -5,6 +5,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --time=08:00:00
+#SBATCH --reservation=SD-69241-apertus-1-5
 #SBATCH --environment=reasoning
 
 set -xeuo pipefail
@@ -41,10 +42,20 @@ USE_ENTROPY_AWARE_MIXING="${USE_ENTROPY_AWARE_MIXING:-true}"
 USE_ROLLOUT_CORRECTION="${USE_ROLLOUT_CORRECTION:-true}"
 FILTER_GROUPS_ENABLE="${FILTER_GROUPS_ENABLE:-false}"
 
+LOG_TRAIN_ROLLOUTS="${LOG_TRAIN_ROLLOUTS:-false}"
+TRAIN_ROLLOUT_LOG_FREQ=5
+TRAIN_ROLLOUT_LOG_MAX_SAMPLES=32
+
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-512}"
 MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-1024}"
 MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-2048}"
 TOTAL_EPOCHS="${TOTAL_EPOCHS:-10}"
+
+# Throughput-oriented rollout knobs (kept configurable via env/submit script)
+ROLLOUT_MAX_MODEL_LEN="${ROLLOUT_MAX_MODEL_LEN:-16384}"
+ROLLOUT_ENABLE_CHUNKED_PREFILL="${ROLLOUT_ENABLE_CHUNKED_PREFILL:-false}"
+ROLLOUT_MAX_NUM_BATCHED_TOKENS="${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-16384}"
+ROLLOUT_CUDAGRAPH_MODE="${ROLLOUT_CUDAGRAPH_MODE:-FULL_AND_PIECEWISE}"
 
 VLLM_PATCH_ROOT="${VLLM_PATCH_ROOT:-/users/msantelmo/scratch/vllm/vllm}"
 
@@ -131,6 +142,36 @@ overrides=(
   "hydra.run.dir=${RUN_DIR}"
   "hydra.output_subdir=.hydra"
 )
+
+# If the teacher is a non-Base Qwen3 model, disable thinking and add rollout optimizations.
+if [[ "${TEACHER_MODEL_PATH}" == *"Qwen3"* && "${TEACHER_MODEL_PATH}" != *"Base"* ]]; then
+  echo "Rollout speed knobs:"
+  echo "  ROLLOUT_MAX_MODEL_LEN=${ROLLOUT_MAX_MODEL_LEN}"
+  echo "  ROLLOUT_ENABLE_CHUNKED_PREFILL=${ROLLOUT_ENABLE_CHUNKED_PREFILL}"
+  echo "  ROLLOUT_MAX_NUM_BATCHED_TOKENS=${ROLLOUT_MAX_NUM_BATCHED_TOKENS}"
+  echo "  ROLLOUT_CUDAGRAPH_MODE=${ROLLOUT_CUDAGRAPH_MODE}"
+  echo "Disabled thinking in chat template"
+
+  overrides+=(
+    "actor_rollout_ref.rollout.max_model_len=${ROLLOUT_MAX_MODEL_LEN}"
+    "++actor_rollout_ref.rollout.enable_chunked_prefill=${ROLLOUT_ENABLE_CHUNKED_PREFILL}"
+    "++actor_rollout_ref.rollout.max_num_batched_tokens=${ROLLOUT_MAX_NUM_BATCHED_TOKENS}"
+    "++actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config.cudagraph_mode=${ROLLOUT_CUDAGRAPH_MODE}"
+    "++data.apply_chat_template_kwargs.enable_thinking=false"
+  )
+fi
+
+if [ "${LOG_TRAIN_ROLLOUTS}" = "true" ]; then
+  echo "Training rollout debug logging enabled:"
+  echo "  dir=${RUN_DIR}/train_rollouts"
+  echo "  freq=${TRAIN_ROLLOUT_LOG_FREQ}"
+  echo "  max_samples=${TRAIN_ROLLOUT_LOG_MAX_SAMPLES}"
+  overrides+=(
+    "trainer.rollout_data_dir=${RUN_DIR}/train_rollouts"
+    "++trainer.rollout_data_freq=${TRAIN_ROLLOUT_LOG_FREQ}"
+    "++trainer.rollout_data_max_samples=${TRAIN_ROLLOUT_LOG_MAX_SAMPLES}"
+  )
+fi
 
 case "${ALGO}" in
   mixed_policy)

@@ -222,6 +222,12 @@ trainer:
   # Directory for logging rollout data; no dump if null
   rollout_data_dir: null
 
+  # Dump rollout data every N training steps when rollout_data_dir is set.
+  rollout_data_freq: 5
+
+  # Maximum number of rollout samples to dump per step. null dumps the full batch.
+  rollout_data_max_samples: 32
+
   # Directory for logging validation data; no dump if null
   validation_data_dir: null
 

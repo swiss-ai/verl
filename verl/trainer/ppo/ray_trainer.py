@@ -450,6 +450,15 @@ class RayPPOTrainer:
 
         print(f"Dumped generations to {filename}")
 
+    def _select_rollout_dump_indices(self, batch_size: int) -> list[int] | None:
+        max_samples = self.config.trainer.get("rollout_data_max_samples", None)
+        if max_samples is None:
+            return None
+        max_samples = int(max_samples)
+        if max_samples <= 0 or batch_size <= max_samples:
+            return None
+        return np.linspace(0, batch_size - 1, num=max_samples, dtype=int).tolist()
+
     def _log_rollout_data(
         self, batch: DataProto, reward_extra_infos_dict: dict, timing_raw: dict, rollout_data_dir: str
     ):
@@ -461,16 +470,38 @@ class RayPPOTrainer:
             rollout_data_dir (str): Directory path to save the rollout data
         """
         with marked_timer("dump_rollout_generations", timing_raw, color="green"):
+            indices = self._select_rollout_dump_indices(len(batch))
+            if indices is not None:
+                batch = batch[indices]
+
+            response_mask = batch.batch.get("response_mask", None)
             inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
             outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
             scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
             sample_gts = [item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in batch]
 
             reward_extra_infos_to_dump = reward_extra_infos_dict.copy()
+            if indices is not None:
+                reward_extra_infos_to_dump = {
+                    key: [values[i] for i in indices] if len(values) > max(indices) else values
+                    for key, values in reward_extra_infos_to_dump.items()
+                }
             if "request_id" in batch.non_tensor_batch:
-                reward_extra_infos_dict.setdefault(
+                reward_extra_infos_to_dump.setdefault(
                     "request_id",
                     batch.non_tensor_batch["request_id"].tolist(),
+                )
+            if self.mixed_source_tag_key in batch.non_tensor_batch:
+                reward_extra_infos_to_dump.setdefault(
+                    self.mixed_source_tag_key,
+                    batch.non_tensor_batch[self.mixed_source_tag_key].tolist(),
+                )
+            if "uid" in batch.non_tensor_batch:
+                reward_extra_infos_to_dump.setdefault("uid", batch.non_tensor_batch["uid"].tolist())
+            if response_mask is not None:
+                reward_extra_infos_to_dump.setdefault(
+                    "response_length",
+                    response_mask.sum(dim=-1).detach().cpu().tolist(),
                 )
 
             self._dump_generations(
@@ -834,9 +865,21 @@ class RayPPOTrainer:
         # Keep deterministic concat order [on, mixed] to simplify source-wise inspection.
         return DataProto.concat([on_batch, off_batch])
 
-    def _compute_rollout_source_metrics(self, batch: DataProto, metrics: dict):
+    def _compute_rollout_source_stats(self, batch: DataProto) -> dict[str, float]:
+        stats = {
+            f"{self.mixed_source_on_value}_count": 0.0,
+            f"{self.mixed_source_off_value}_count": 0.0,
+            f"{self.mixed_source_on_value}_reward_sum": 0.0,
+            f"{self.mixed_source_off_value}_reward_sum": 0.0,
+            f"{self.mixed_source_on_value}_response_len_sum": 0.0,
+            f"{self.mixed_source_off_value}_response_len_sum": 0.0,
+            "recovered_groups_count": 0.0,
+            "groups_with_on_policy_count": 0.0,
+            "zero_reward_on_policy_prompt_count": 0.0,
+            "zero_reward_off_policy_prompt_count": 0.0,
+        }
         if self.mixed_source_tag_key not in batch.non_tensor_batch:
-            return
+            return stats
         src = np.asarray(batch.non_tensor_batch[self.mixed_source_tag_key], dtype=object)
         token_scores = batch.batch["token_level_scores"].sum(dim=-1).detach().cpu().numpy()
         response_mask = batch.batch["response_mask"].detach().cpu().numpy()
@@ -845,18 +888,15 @@ class RayPPOTrainer:
             mask = src == name
             if not np.any(mask):
                 continue
-            metrics[f"mixed_policy/{name}/count"] = int(mask.sum())
-            metrics[f"mixed_policy/{name}/reward_mean"] = float(token_scores[mask].mean())
-            metrics[f"mixed_policy/{name}/response_len_mean"] = float(response_lens[mask].mean())
+            count = int(mask.sum())
+            stats[f"{name}_count"] += float(count)
+            stats[f"{name}_reward_sum"] += float(token_scores[mask].sum())
+            stats[f"{name}_response_len_sum"] += float(response_lens[mask].sum())
 
         if "uid" not in batch.non_tensor_batch:
-            return
+            return stats
         uids = np.asarray(batch.non_tensor_batch["uid"], dtype=object)
         unique_uids = np.unique(uids)
-        recovered_groups = 0
-        groups_with_on_policy = 0
-        zero_reward_on_policy_prompt_count = 0
-        zero_reward_off_policy_prompt_count = 0
         for uid in unique_uids:
             group_mask = uids == uid
             on_mask = group_mask & (src == self.mixed_source_on_value)
@@ -864,22 +904,51 @@ class RayPPOTrainer:
             if np.any(on_mask):
                 on_prompt_reward = float(token_scores[on_mask].mean())
                 if np.isclose(on_prompt_reward, 0.0):
-                    zero_reward_on_policy_prompt_count += 1
-                groups_with_on_policy += 1
+                    stats["zero_reward_on_policy_prompt_count"] += 1.0
+                stats["groups_with_on_policy_count"] += 1.0
                 on_max_reward = float(token_scores[on_mask].max())
                 off_max_reward = float(token_scores[off_mask].max()) if np.any(off_mask) else 0.0
                 if on_max_reward == 0.0 and off_max_reward > 0.0:
-                    recovered_groups += 1
+                    stats["recovered_groups_count"] += 1.0
             if np.any(off_mask):
                 off_prompt_reward = float(token_scores[off_mask].mean())
                 if np.isclose(off_prompt_reward, 0.0):
-                    zero_reward_off_policy_prompt_count += 1
+                    stats["zero_reward_off_policy_prompt_count"] += 1.0
+        return stats
 
-        metrics["mixed_policy/recovered_groups/count"] = int(recovered_groups)
+    def _aggregate_rollout_source_stats(
+        self, accum_stats: dict[str, float], batch_stats: dict[str, float]
+    ) -> dict[str, float]:
+        if not accum_stats:
+            return dict(batch_stats)
+        for key, value in batch_stats.items():
+            accum_stats[key] = accum_stats.get(key, 0.0) + float(value)
+        return accum_stats
+
+    def _format_rollout_source_metrics(self, stats: dict[str, float]) -> dict[str, float]:
+        metrics: dict[str, float] = {}
+        for name in [self.mixed_source_on_value, self.mixed_source_off_value]:
+            count = int(stats.get(f"{name}_count", 0.0))
+            if count <= 0:
+                continue
+            reward_sum = float(stats.get(f"{name}_reward_sum", 0.0))
+            response_len_sum = float(stats.get(f"{name}_response_len_sum", 0.0))
+            metrics[f"mixed_policy/{name}/count"] = count
+            metrics[f"mixed_policy/{name}/reward_mean"] = reward_sum / count
+            metrics[f"mixed_policy/{name}/response_len_mean"] = response_len_sum / count
+
+        recovered_groups = int(stats.get("recovered_groups_count", 0.0))
+        groups_with_on_policy = int(stats.get("groups_with_on_policy_count", 0.0))
+        metrics["mixed_policy/recovered_groups/count"] = recovered_groups
         if groups_with_on_policy > 0:
-            metrics["mixed_policy/recovered_groups/rate"] = float(recovered_groups / groups_with_on_policy)
-        metrics["mixed_policy/on_policy/zero_reward_prompt_count"] = int(zero_reward_on_policy_prompt_count)
-        metrics["mixed_policy/off_policy/zero_reward_prompt_count"] = int(zero_reward_off_policy_prompt_count)
+            metrics["mixed_policy/recovered_groups/rate"] = recovered_groups / groups_with_on_policy
+        metrics["mixed_policy/on_policy/zero_reward_prompt_count"] = int(
+            stats.get("zero_reward_on_policy_prompt_count", 0.0)
+        )
+        metrics["mixed_policy/off_policy/zero_reward_prompt_count"] = int(
+            stats.get("zero_reward_off_policy_prompt_count", 0.0)
+        )
+        return metrics
 
     def _get_filter_group_metric_values(self, batch: DataProto, metric_name: str) -> np.ndarray:
         if metric_name in batch.non_tensor_batch:
@@ -1708,6 +1777,7 @@ class RayPPOTrainer:
         pre_filter_zero_reward_prompt_count = 0
         pre_filter_prompt_reward_sum = 0.0
         pre_filter_traj_reward_sum = 0.0
+        rollout_source_stats_accum: dict[str, float] = {}
         timing_raw = defaultdict(float)
 
         for epoch in range(current_epoch, self.config.trainer.total_epochs):
@@ -1887,6 +1957,12 @@ class RayPPOTrainer:
                     else:
                         batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
 
+                    if self.use_mixed_policy:
+                        batch_rollout_source_stats = self._compute_rollout_source_stats(batch)
+                        rollout_source_stats_accum = self._aggregate_rollout_source_stats(
+                            rollout_source_stats_accum, batch_rollout_source_stats
+                        )
+
                     if filter_groups_enabled:
                         filtered_batch, filter_stats = self._filter_groups_by_std(
                             batch=batch,
@@ -1991,6 +2067,9 @@ class RayPPOTrainer:
                     if self.async_rollout_mode and ((not self.use_mixed_policy) or self.mixed_k_on > 0):
                         self.checkpoint_manager.sleep_replicas()
 
+                    if self.use_mixed_policy:
+                        metrics.update(self._format_rollout_source_metrics(rollout_source_stats_accum))
+
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
                     # - Decoupled mode: Recomputes old_log_probs as proximal anchor (3 policies: π_rollout, π_old, π_θ)
@@ -2070,10 +2149,6 @@ class RayPPOTrainer:
                             images_seqlens_all.extend(multi_modal_input["images_seqlens"].tolist())
                         batch.meta_info["images_seqlens"] = images_seqlens_all
 
-                        # Compute metrics to compare on.policy vs. mixed/off-policy samples
-                        if self.use_mixed_policy:
-                            self._compute_rollout_source_metrics(batch, metrics)
-
                         # Compute rollout correction: IS weights, rejection sampling, and metrics.
                         # Why it matters for mixed-policy:
                         # - batch now contains samples from at least two behavior policies
@@ -2136,7 +2211,8 @@ class RayPPOTrainer:
 
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
-                    if rollout_data_dir:
+                    rollout_data_freq = int(self.config.trainer.get("rollout_data_freq", 1) or 1)
+                    if rollout_data_dir and self.global_steps % rollout_data_freq == 0:
                         self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
 
                 # validate
@@ -2232,6 +2308,7 @@ class RayPPOTrainer:
                 pre_filter_zero_reward_prompt_count = 0
                 pre_filter_prompt_reward_sum = 0.0
                 pre_filter_traj_reward_sum = 0.0
+                rollout_source_stats_accum = {}
                 timing_raw = defaultdict(float)
 
                 progress_bar.update(1)

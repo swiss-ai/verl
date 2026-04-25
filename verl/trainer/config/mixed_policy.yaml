@@ -76,7 +76,7 @@ actor_rollout_ref:
     temperature: 1
     dtype: bfloat16
     tensor_model_parallel_size: 1
-    gpu_memory_utilization: 0.6
+    gpu_memory_utilization: 0.7
     calculate_log_probs: true
     log_prob_micro_batch_size_per_gpu: 32
     val_kwargs:

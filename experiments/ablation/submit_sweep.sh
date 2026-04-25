@@ -6,7 +6,7 @@ cd "${WORKING_DIR}"
 
 #####################################################################
 
-PROJECT_NAME=policy-mix
+PROJECT_NAME=policy-mix-math
 OUTPUT_ROOT=${WORKING_DIR}/outputs/${PROJECT_NAME}
 
 TRAIN_FILE=./data/hendrycks_math/train.parquet
@@ -17,11 +17,12 @@ START_SEED=85
 MAX_CONCURRENT_RUNS=4
 
 STUDENT_MODEL_PATH=Qwen/Qwen3-1.7B-Base # meta-llama/Llama-3.2-1B-Instruct
-TEACHER_MODEL_PATH=Qwen/Qwen3-8B-Base # nvidia/OpenMath2-Llama3.1-8B, meta-llama/Llama-3.1-8B-Instruct
+TEACHER_MODEL_PATH=Qwen/Qwen3-8B # nvidia/OpenMath2-Llama3.1-8B, meta-llama/Llama-3.1-8B-Instruct
 
 # Training parameters
 TRAIN_BATCH_SIZE=128
-TOTAL_EPOCHS=6  # Double the epochs as group filtering  
+TOTAL_EPOCHS=6  # Double the epochs as group filtering
+LOG_TRAIN_ROLLOUTS=true
 
 # EASD parameters
 ENTROPY_TOP_K=32
@@ -101,7 +102,7 @@ submit_job() {
     --job-name="${run_name}" \
     --output="${run_dir}/slurm.out" \
     --error="${run_dir}/slurm.err" \
-    --export=ALL,WORKING_DIR="${WORKING_DIR}",PROJECT_NAME="${PROJECT_NAME}",OUTPUT_ROOT="${OUTPUT_ROOT}",RUN_NAME="${run_name}",WANDB_RUN_GROUP="${wandb_group}",ALGO="${algo}",REPEAT_IDX="${rep}",SEED="${seed}",TRAIN_FILE="${TRAIN_FILE}",VAL_FILE="${VAL_FILE}",STUDENT_MODEL_PATH="${STUDENT_MODEL_PATH}",TEACHER_MODEL_PATH="${TEACHER_MODEL_PATH}",TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE}",TOTAL_EPOCHS="${TOTAL_EPOCHS}",K_ON="${k_on}",K_OFF="${k_off}",ROLLOUT_N="${rollout_n}",ENTROPY_TOP_K="${ENTROPY_TOP_K}",ENTROPY_AWARE_MIXING="${ENTROPY_AWARE_MIXING}",ENTROPY_AWARE_ALPHA="${ENTROPY_AWARE_ALPHA}",USE_ENTROPY_AWARE_MIXING="${use_entropy_aware_mixing}",USE_ROLLOUT_CORRECTION="${use_rollout_correction}",FILTER_GROUPS_ENABLE="${filter_groups_enable}" \
+    --export=ALL,WORKING_DIR="${WORKING_DIR}",PROJECT_NAME="${PROJECT_NAME}",OUTPUT_ROOT="${OUTPUT_ROOT}",RUN_NAME="${run_name}",WANDB_RUN_GROUP="${wandb_group}",ALGO="${algo}",REPEAT_IDX="${rep}",SEED="${seed}",TRAIN_FILE="${TRAIN_FILE}",VAL_FILE="${VAL_FILE}",STUDENT_MODEL_PATH="${STUDENT_MODEL_PATH}",TEACHER_MODEL_PATH="${TEACHER_MODEL_PATH}",TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE}",TOTAL_EPOCHS="${TOTAL_EPOCHS}",K_ON="${k_on}",K_OFF="${k_off}",ROLLOUT_N="${rollout_n}",ENTROPY_TOP_K="${ENTROPY_TOP_K}",ENTROPY_AWARE_MIXING="${ENTROPY_AWARE_MIXING}",ENTROPY_AWARE_ALPHA="${ENTROPY_AWARE_ALPHA}",USE_ENTROPY_AWARE_MIXING="${use_entropy_aware_mixing}",USE_ROLLOUT_CORRECTION="${use_rollout_correction}",FILTER_GROUPS_ENABLE="${filter_groups_enable}",LOG_TRAIN_ROLLOUTS="${LOG_TRAIN_ROLLOUTS}" \
     "${WORKING_DIR}/experiments/ablation/run_single_job.sh"
   )"
 
