@@ -57,7 +57,9 @@ class SGLangHttpServerForPartial(SGLangHttpServer):
 
         # for cancel LLMServer
         self.paused = False
+        self.sglang_generation_paused = False
         self.lock = asyncio.Lock()
+        self.sglang_pause_lock = asyncio.Lock()
         self.cancel_event: dict[str, asyncio.Event] = {}
         self.req_output: dict[str, Optional[dict[str, Any]]] = {}
 
@@ -118,11 +120,22 @@ class SGLangHttpServerForPartial(SGLangHttpServer):
             [generation_handle, cancel_handle],
             return_when=asyncio.FIRST_COMPLETED,
         )
+        is_cancel = generation_handle not in done
+        if is_cancel:
+            # Cancelling the local asyncio task is not enough for SGLang: the scheduler
+            # may still own the request/KV blocks. Send an explicit abort before we
+            # report the partial result so later cache release sees a drained engine.
+            self.tokenizer_manager.abort_request(request_id)
+
         for task in done:
             await task
 
         for task in pending:
             task.cancel()
+        if pending:
+            # Await cancellation so the generate_request async generator unwinds and
+            # releases SGLang's model_update_lock reader before parameter sync begins.
+            await asyncio.gather(*pending, return_exceptions=True)
         async with self.lock:
             output = self.req_output.get(request_id)
             if output is None:
@@ -130,6 +143,11 @@ class SGLangHttpServerForPartial(SGLangHttpServer):
                 self.req_output.pop(request_id, None)
                 return [], [], True
             meta_info = output.get("meta_info", {})
+            finish_reason = meta_info.get("finish_reason") or {}
+            # A backend abort can race ahead of the local cancel event and make the
+            # generation task look complete. Preserve the partial-rollout contract
+            # by surfacing that scheduler-side abort as a cancellation.
+            is_cancel = is_cancel or finish_reason.get("type") == "abort"
             output_token_logprobs = meta_info.get("output_token_logprobs")
 
             token_ids: list[int] = []
@@ -142,19 +160,44 @@ class SGLangHttpServerForPartial(SGLangHttpServer):
             else:
                 token_ids = list(output["output_ids"])
                 log_probs = []
-            is_cancel = generation_handle not in done
             self.cancel_event.pop(request_id, None)
             self.req_output.pop(request_id, None)
 
         return token_ids, log_probs, is_cancel
 
+    async def _pause_sglang_generation(self):
+        async with self.sglang_pause_lock:
+            if self.sglang_generation_paused:
+                return
+            from sglang.srt.managers.io_struct import PauseGenerationReqInput
+
+            # SGLang release_memory_occupation asserts if any request is still active.
+            # Its pause_generation(mode="abort") path is the engine-supported drain:
+            # it blocks new generate_request calls, aborts outstanding scheduler work,
+            # and waits until the model-update/read lock is no longer held.
+            await self.tokenizer_manager.pause_generation(PauseGenerationReqInput(mode="abort"))
+            self.sglang_generation_paused = True
+
+    async def _resume_sglang_generation(self):
+        async with self.sglang_pause_lock:
+            if not self.sglang_generation_paused:
+                return
+            from sglang.srt.managers.io_struct import ContinueGenerationReqInput
+
+            # clear_kv_cache pauses SGLang's tokenizer gate during weight sync.
+            # Re-open that gate before accepting rollout work again.
+            await self.tokenizer_manager.continue_generation(ContinueGenerationReqInput())
+            self.sglang_generation_paused = False
+
     async def cancel(self):
         async with self.lock:
             self.paused = True
-            for request_id in self.cancel_event:
+            for request_id in list(self.cancel_event):
                 self.cancel_event[request_id].set()
+        await self._pause_sglang_generation()
 
     async def resume(self):
+        await self._resume_sglang_generation()
         async with self.lock:
             self.paused = False
 
@@ -162,6 +205,15 @@ class SGLangHttpServerForPartial(SGLangHttpServer):
         async with self.lock:
             print("Reset prefix cache ...")
             await self.tokenizer_manager.flush_cache()
+
+    async def clear_kv_cache(self):
+        async with self.lock:
+            self.paused = True
+            for request_id in list(self.cancel_event):
+                self.cancel_event[request_id].set()
+        # Idempotent guard: cancel() usually paused SGLang already, but cache release must be safe on its own.
+        await self._pause_sglang_generation()
+        await super().clear_kv_cache()
 
 
 class FullyAsyncSGLangReplica(SGLangReplica):

@@ -1,0 +1,123 @@
+hydra:
+  searchpath:
+    - file:///iopsstor/scratch/cscs/msantelmo/inverse_batch/async-ada/verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+algorithm:
+  adv_estimator: grpo
+  norm_adv_by_std_in_grpo: false
+
+data:
+  train_files: ./data/math/train.parquet
+  val_files: ./data/math/test.parquet
+  train_batch_size: 0
+  gen_batch_size: 1
+  max_prompt_length: 1024
+  max_response_length: 2048
+  truncation: left
+
+async_training:
+  staleness_threshold: 0.2
+  trigger_parameter_sync_step: 4
+  require_batches: 1
+  partial_rollout: true
+  use_rollout_log_probs: true
+  compute_prox_log_prob: false
+  use_trainer_do_validate: false
+  checkpoint_engine:
+    enable: false
+    device_buffer_size_M: 4096
+    overlap_broadcast_and_consume: false
+
+rollout:
+  nnodes: 1
+  n_gpus_per_node: 2
+  total_rollout_steps: 128000
+  total_epochs: ${trainer.total_epochs}
+
+actor_rollout_ref:
+  hybrid_engine: false
+  nccl_timeout: 1800
+  checkpoint_engine: ${oc.select:async_training.checkpoint_engine,null}
+
+  model:
+    path: Qwen/Qwen2.5-3B-Instruct
+    use_remove_padding: true
+    enable_gradient_checkpointing: true
+    use_shm: false
+    override_config:
+      attn_implementation: flash_attention_3
+
+  actor:
+    use_rollout_log_probs: ${oc.select:async_training.use_rollout_log_probs,true}
+    ppo_mini_batch_size: 64
+    ppo_micro_batch_size_per_gpu: 16
+    optim:
+      optimizer: _AdamW
+      lr: 1e-6
+      weight_decay: 0.01
+      clip_grad: 1.0
+      optimizer_impl: torchao.optim
+      override_optimizer_config:
+        bf16_stochastic_round: true
+    strategy: fsdp2
+    fsdp_config:
+      strategy: fsdp2
+      param_offload: false
+      optimizer_offload: false
+      entropy_from_logits_with_chunking: ${oc.select:actor_rollout_ref.actor.entropy_from_logits_with_chunking,false}
+      entropy_checkpointing: ${oc.select:actor_rollout_ref.actor.entropy_checkpointing,false}
+      model_dtype: bf16
+      mixed_precision:
+        param_dtype: bf16
+        reduce_dtype: bf16
+        buffer_dtype: bf16
+    clip_ratio_high: 0.28
+    clip_ratio_low: 0.2
+    use_kl_loss: false
+    loss_agg_mode: token-mean
+    shuffle: true
+
+  rollout:
+    gpu_memory_utilization: 0.4
+    log_prob_micro_batch_size_per_gpu: 16
+    tensor_model_parallel_size: 1
+    n: 4
+    max_num_batched_tokens: 8192
+    max_num_seqs: 256
+    name: sglang
+    mode: async
+    calculate_log_probs: true
+    dtype: bfloat16
+    multi_stage_wake_up: true
+    free_cache_engine: true
+    enforce_eager: false
+    load_format: safetensors
+    val_kwargs:
+      do_sample: True
+      n: 4
+      top_p: 0.95
+      temperature: 0.6
+
+trainer:
+  total_epochs: 1000
+  total_training_steps: 500
+  save_freq: -1
+  max_actor_ckpt_to_keep: null
+  project_name: Reinforce-Ada
+  experiment_name: GRPO
+  logger: ["console", "wandb"]
+  nnodes: 1
+  n_gpus_per_node: 2
+  log_val_generations: 5
+  val_before_train: true
+  default_local_dir: ./outputs/${trainer.project_name}/${trainer.experiment_name}
+  validation_data_dir: ${trainer.default_local_dir}/validation/
+
+ray_kwargs:
+  ray_init:
+    num_cpus: ${oc.decode:${oc.env:SLURM_CPUS_PER_TASK,null}}
+  timeline_json_file: null

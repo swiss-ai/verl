@@ -34,7 +34,7 @@ from verl.experimental.fully_async_policy.message_queue import MessageQueueClien
 from verl.experimental.fully_async_policy.ray_trainer import FullyAsyncRayPPOTrainer
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
 from verl.trainer.ppo.ray_trainer import ResourcePoolManager
-from verl.trainer.ppo.reward import load_reward_manager
+from verl.trainer.ppo.reward import compute_reward, load_reward_manager
 from verl.trainer.ppo.utils import Role, WorkerType
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 from verl.utils.profiler import marked_timer
@@ -151,6 +151,9 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         self.total_generated_samples = 0
         self.staleness_samples = 0
         self.dropped_stale_samples = 0
+        self.filter_groups_total_prompts = 0
+        self.filter_groups_kept_prompts = 0
+        self.filter_groups_dropped_prompts = 0
         self.processed_sample_count = 0
         # we start from step 1
         self.global_steps = 1
@@ -579,6 +582,14 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             rollout_sample.full_batch.non_tensor_batch["uid"] = np.array(
                 [f"uid_{rollout_sample.sample_id}"] * len(rollout_sample.full_batch), dtype=object
             )
+            
+            # DAPO-style filtering: if the sample has no reward variance, it
+            # will not be put into the message queue
+            if not self._should_enqueue_rollout_sample(rollout_sample):
+                self.staleness_samples = max(self.staleness_samples - 1, 0)
+                self.processed_sample_count += 1
+                return
+
             rollout_sample.param_version = self.current_param_version
             rollout_sample.rollout_status = await self.get_statistics()
             rollout_sample.agent_loop_output_list = []
@@ -596,6 +607,44 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             await self.cancel_queue.put(rollout_sample)
 
         self.processed_sample_count += 1
+
+    def _should_enqueue_rollout_sample(self, rollout_sample: RolloutSample) -> bool:
+        filter_cfg = self.config.algorithm.get("filter_groups", None) or {}
+        if not bool(filter_cfg.get("enable", False)):
+            return True
+
+        metric_name = filter_cfg.get("metric", None)
+        if not metric_name:
+            raise ValueError("algorithm.filter_groups.metric must be set when algorithm.filter_groups.enable=True.")
+
+        batch = rollout_sample.full_batch
+        reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
+        batch.batch["token_level_scores"] = reward_tensor
+        if reward_extra_infos_dict:
+            batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
+
+        if metric_name == "seq_final_reward":
+            batch.non_tensor_batch["seq_final_reward"] = reward_tensor.sum(dim=-1).detach().cpu().numpy()
+        elif metric_name == "seq_reward":
+            batch.non_tensor_batch["seq_reward"] = reward_tensor.sum(dim=-1).detach().cpu().numpy()
+        elif metric_name not in batch.non_tensor_batch:
+            raise KeyError(
+                f"Filter metric '{metric_name}' not found in batch.non_tensor_batch. "
+                "Expected one of reward extra-info keys or seq_reward/seq_final_reward."
+            )
+
+        metric_vals = batch.non_tensor_batch[metric_name]
+        keep = bool(np.std(metric_vals) > 0 or len(metric_vals) == 1)
+        self.filter_groups_total_prompts += 1
+        if keep:
+            self.filter_groups_kept_prompts += 1
+        else:
+            self.filter_groups_dropped_prompts += 1
+            print(
+                "[FullyAsyncRollouter][filter_groups] dropped zero-variance sample: "
+                f"sample_id={rollout_sample.sample_id}, metric={metric_name}, n={len(metric_vals)}"
+            )
+        return keep
 
     async def _streaming_generation_main(self):
         """The main entry method for stream processing"""
@@ -782,6 +831,11 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             "count/total_generated_samples": self.total_generated_samples,
             "count/staleness_samples": self.staleness_samples,
             "count/dropped_stale_samples": self.dropped_stale_samples,
+            "filter_groups/total_prompts": self.filter_groups_total_prompts,
+            "filter_groups/kept_prompts": self.filter_groups_kept_prompts,
+            "filter_groups/dropped_prompts": self.filter_groups_dropped_prompts,
+            "filter_groups/kept_prompt_ratio": self.filter_groups_kept_prompts
+            / max(self.filter_groups_total_prompts, 1),
             # static stats
             "static/max_required_samples": self.max_required_samples,
             "static/required_samples": self.required_samples,
