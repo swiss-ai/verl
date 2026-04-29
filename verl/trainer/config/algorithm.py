@@ -55,11 +55,14 @@ class FilterGroupsConfig(BaseConfig):
         enable (bool): Whether to enable filter groups.
         metric (Optional[str]): Metric to use for filtering: "acc", "score", "seq_reward", "seq_final_reward", etc.
         max_num_gen_batches (int): Non-positive values mean no upper limit.
+        filter_negative_off_policy_advantage (bool): Whether to drop mixed-policy prompt groups that contain any
+            off-policy trajectory with negative GRPO/RLOO advantage.
     """
 
     enable: bool = False
     metric: Optional[str] = None
     max_num_gen_batches: int = 0
+    filter_negative_off_policy_advantage: bool = False
 
 
 @dataclass

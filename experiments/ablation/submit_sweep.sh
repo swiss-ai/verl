@@ -36,6 +36,7 @@ USE_ENTROPY_AWARE_MIXING_OPTIONS=(
 
 USE_ROLLOUT_CORRECTION_OPTIONS=(true)
 FILTER_GROUPS_ENABLE_OPTIONS=(true)
+FILTER_NEGATIVE_OFF_POLICY_ADVANTAGE=true
 
 MIXED_SPLIT_PAIRS=(
 	"7 1"
@@ -73,6 +74,9 @@ submit_job() {
   if [ "${filter_groups_enable}" = "true" ]; then
     filter_tag="__DAPO"
   fi
+  if [ "${algo}" = "mixed_policy" ] && [ "${filter_groups_enable}" = "true" ] && [ "${FILTER_NEGATIVE_OFF_POLICY_ADVANTAGE}" = "true" ]; then
+    filter_tag="${filter_tag}-noNegOff"
+  fi
   local run_name
   if [ "${algo}" = "mixed_policy" ]; then
     if [ "${use_entropy_aware_mixing}" = "true" ]; then
@@ -102,7 +106,7 @@ submit_job() {
     --job-name="${run_name}" \
     --output="${run_dir}/slurm.out" \
     --error="${run_dir}/slurm.err" \
-    --export=ALL,WORKING_DIR="${WORKING_DIR}",PROJECT_NAME="${PROJECT_NAME}",OUTPUT_ROOT="${OUTPUT_ROOT}",RUN_NAME="${run_name}",WANDB_RUN_GROUP="${wandb_group}",ALGO="${algo}",REPEAT_IDX="${rep}",SEED="${seed}",TRAIN_FILE="${TRAIN_FILE}",VAL_FILE="${VAL_FILE}",STUDENT_MODEL_PATH="${STUDENT_MODEL_PATH}",TEACHER_MODEL_PATH="${TEACHER_MODEL_PATH}",TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE}",TOTAL_EPOCHS="${TOTAL_EPOCHS}",K_ON="${k_on}",K_OFF="${k_off}",ROLLOUT_N="${rollout_n}",ENTROPY_TOP_K="${ENTROPY_TOP_K}",ENTROPY_AWARE_MIXING="${ENTROPY_AWARE_MIXING}",ENTROPY_AWARE_ALPHA="${ENTROPY_AWARE_ALPHA}",USE_ENTROPY_AWARE_MIXING="${use_entropy_aware_mixing}",USE_ROLLOUT_CORRECTION="${use_rollout_correction}",FILTER_GROUPS_ENABLE="${filter_groups_enable}",LOG_TRAIN_ROLLOUTS="${LOG_TRAIN_ROLLOUTS}" \
+    --export=ALL,WORKING_DIR="${WORKING_DIR}",PROJECT_NAME="${PROJECT_NAME}",OUTPUT_ROOT="${OUTPUT_ROOT}",RUN_NAME="${run_name}",WANDB_RUN_GROUP="${wandb_group}",ALGO="${algo}",REPEAT_IDX="${rep}",SEED="${seed}",TRAIN_FILE="${TRAIN_FILE}",VAL_FILE="${VAL_FILE}",STUDENT_MODEL_PATH="${STUDENT_MODEL_PATH}",TEACHER_MODEL_PATH="${TEACHER_MODEL_PATH}",TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE}",TOTAL_EPOCHS="${TOTAL_EPOCHS}",K_ON="${k_on}",K_OFF="${k_off}",ROLLOUT_N="${rollout_n}",ENTROPY_TOP_K="${ENTROPY_TOP_K}",ENTROPY_AWARE_MIXING="${ENTROPY_AWARE_MIXING}",ENTROPY_AWARE_ALPHA="${ENTROPY_AWARE_ALPHA}",USE_ENTROPY_AWARE_MIXING="${use_entropy_aware_mixing}",USE_ROLLOUT_CORRECTION="${use_rollout_correction}",FILTER_GROUPS_ENABLE="${filter_groups_enable}",FILTER_NEGATIVE_OFF_POLICY_ADVANTAGE="${FILTER_NEGATIVE_OFF_POLICY_ADVANTAGE}",LOG_TRAIN_ROLLOUTS="${LOG_TRAIN_ROLLOUTS}" \
     "${WORKING_DIR}/experiments/ablation/run_single_job.sh"
   )"
 
@@ -146,4 +150,4 @@ done
 echo "Submitted ${submitted} jobs."
 echo "Max concurrent runs: ${MAX_CONCURRENT_RUNS}"
 echo "Methods: mixed_policy + grpo"
-echo "Repeats: ${REPEATS}, start seed: ${START_SEED}, split pairs: ${MIXED_SPLIT_PAIRS[*]}, mixing options: ${USE_ENTROPY_AWARE_MIXING_OPTIONS[*]}, rollout correction options: ${USE_ROLLOUT_CORRECTION_OPTIONS[*]}, filter groups options: ${FILTER_GROUPS_ENABLE_OPTIONS[*]}, filter metric: seq_reward, max gen batches: 0, grpo n list: ${GRPO_ROLLOUT_NS[*]}"
+echo "Repeats: ${REPEATS}, start seed: ${START_SEED}, split pairs: ${MIXED_SPLIT_PAIRS[*]}, mixing options: ${USE_ENTROPY_AWARE_MIXING_OPTIONS[*]}, rollout correction options: ${USE_ROLLOUT_CORRECTION_OPTIONS[*]}, filter groups options: ${FILTER_GROUPS_ENABLE_OPTIONS[*]}, filter negative off-policy advantage: ${FILTER_NEGATIVE_OFF_POLICY_ADVANTAGE}, filter metric: seq_reward, max gen batches: 0, grpo n list: ${GRPO_ROLLOUT_NS[*]}"

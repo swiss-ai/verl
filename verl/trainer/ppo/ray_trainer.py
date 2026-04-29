@@ -972,15 +972,73 @@ class RayPPOTrainer:
             "Expected a non-tensor key, a batch key, 'seq_reward', or 'seq_final_reward'."
         )
 
+    @staticmethod
+    def _adv_estimator_name(adv_estimator) -> str:
+        return getattr(adv_estimator, "value", str(adv_estimator))
+
+    def _compute_group_outcome_advantage_values(
+        self, batch: DataProto, adv_estimator
+    ) -> np.ndarray:
+        adv_estimator_name = self._adv_estimator_name(adv_estimator)
+        supported_grpo = {AdvantageEstimator.GRPO.value, AdvantageEstimator.GRPO_VECTORIZED.value}
+        supported_rloo = {AdvantageEstimator.RLOO.value, AdvantageEstimator.RLOO_VECTORIZED.value}
+        if adv_estimator_name not in supported_grpo | supported_rloo:
+            raise ValueError(
+                "filter_groups.filter_negative_off_policy_advantage currently supports only "
+                f"GRPO/RLOO advantage estimators, got {adv_estimator_name!r}."
+            )
+
+        if "uid" not in batch.non_tensor_batch:
+            raise ValueError("filter_groups requires `uid` in batch.non_tensor_batch.")
+
+        seq_rewards = batch.batch["token_level_rewards"].sum(dim=-1).detach().cpu().numpy().astype(np.float64)
+        uids = np.asarray(batch.non_tensor_batch["uid"], dtype=object)
+        uid2traj_idxs = defaultdict(list)
+        for traj_idx, uid in enumerate(uids):
+            uid2traj_idxs[uid].append(traj_idx)
+
+        seq_advantages = np.zeros_like(seq_rewards, dtype=np.float64)
+        for traj_idxs in uid2traj_idxs.values():
+            group_rewards = seq_rewards[traj_idxs]
+            if len(traj_idxs) <= 1:
+                continue
+            if adv_estimator_name in supported_grpo:
+                seq_advantages[traj_idxs] = group_rewards - float(np.mean(group_rewards))
+            else:
+                group_size = float(len(traj_idxs))
+                group_sum = float(np.sum(group_rewards))
+                seq_advantages[traj_idxs] = (group_size * group_rewards - group_sum) / (group_size - 1.0)
+        return seq_advantages
+
     def _filter_groups_by_std(
-        self, batch: DataProto, metric_name: str, expected_group_size: int | None = None
+        self,
+        batch: DataProto,
+        metric_name: str,
+        expected_group_size: int | None = None,
+        filter_by_std: bool = True,
+        filter_negative_off_policy_advantage: bool = False,
+        adv_estimator=None,
     ) -> tuple[DataProto, dict[str, float | int]]:
         if "uid" not in batch.non_tensor_batch:
             raise ValueError("filter_groups requires `uid` in batch.non_tensor_batch.")
+        if filter_negative_off_policy_advantage and self.mixed_source_tag_key not in batch.non_tensor_batch:
+            raise ValueError(
+                "filter_groups.filter_negative_off_policy_advantage requires mixed-policy rollout source tags."
+            )
 
         metric_vals = self._get_filter_group_metric_values(batch, metric_name)
         seq_rewards = batch.batch["token_level_rewards"].sum(dim=-1).detach().cpu().numpy().astype(np.float64)
         uids = np.asarray(batch.non_tensor_batch["uid"], dtype=object)
+        rollout_sources = (
+            np.asarray(batch.non_tensor_batch[self.mixed_source_tag_key], dtype=object)
+            if filter_negative_off_policy_advantage
+            else None
+        )
+        seq_advantages = (
+            self._compute_group_outcome_advantage_values(batch, adv_estimator)
+            if filter_negative_off_policy_advantage
+            else None
+        )
 
         uid2metric_vals = defaultdict(list)
         uid2traj_idxs = defaultdict(list)
@@ -991,6 +1049,7 @@ class RayPPOTrainer:
         kept_prompt_uids = []
         zero_std_prompt_count = 0
         zero_reward_prompt_count = 0
+        negative_off_policy_advantage_prompt_count = 0
         prompt_reward_sum = 0.0
         for uid, traj_idxs in uid2traj_idxs.items():
             prompt_reward = float(np.mean(seq_rewards[traj_idxs]))
@@ -1001,11 +1060,26 @@ class RayPPOTrainer:
                 prompt_reward_sum += prompt_reward
                 continue
             prompt_metric_std = float(np.std(uid2metric_vals[uid]))
+            keep_group = True
             # Keep singleton prompts to avoid dead loops when rollout_n == 1.
-            if (not np.isclose(prompt_metric_std, 0.0)) or len(traj_idxs) == 1:
-                kept_prompt_uids.append(uid)
-            else:
+            if filter_by_std and np.isclose(prompt_metric_std, 0.0) and len(traj_idxs) > 1:
+                keep_group = False
                 zero_std_prompt_count += 1
+
+            if filter_negative_off_policy_advantage:
+                assert rollout_sources is not None and seq_advantages is not None
+                off_policy_idxs = [
+                    idx for idx in traj_idxs if rollout_sources[idx] == self.mixed_source_off_value
+                ]
+                negative_off_policy_idxs = [
+                    idx for idx in off_policy_idxs if seq_advantages[idx] < 0.0
+                ]
+                if negative_off_policy_idxs:
+                    keep_group = False
+                    negative_off_policy_advantage_prompt_count += 1
+
+            if keep_group:
+                kept_prompt_uids.append(uid)
             prompt_reward_sum += prompt_reward
 
         kept_prompt_uids = set(kept_prompt_uids)
@@ -1016,6 +1090,7 @@ class RayPPOTrainer:
             "kept_prompt_count": len(kept_prompt_uids),
             "zero_std_prompt_count": zero_std_prompt_count,
             "zero_reward_prompt_count": zero_reward_prompt_count,
+            "negative_off_policy_advantage_prompt_count": negative_off_policy_advantage_prompt_count,
             "total_traj_count": int(len(uids)),
             "kept_traj_count": int(len(kept_traj_idxs)),
             "total_prompt_reward_sum": float(prompt_reward_sum),
@@ -1761,6 +1836,12 @@ class RayPPOTrainer:
 
         filter_groups_cfg = self.config.algorithm.get("filter_groups", None)
         filter_groups_enabled = bool(filter_groups_cfg and filter_groups_cfg.get("enable", False))
+        filter_negative_off_policy_advantage_enabled = bool(
+            self.use_mixed_policy
+            and filter_groups_enabled
+            and filter_groups_cfg
+            and filter_groups_cfg.get("filter_negative_off_policy_advantage", False)
+        )
         filter_metric_name = filter_groups_cfg.get("metric", None) if filter_groups_enabled else None
         if filter_groups_enabled and not filter_metric_name:
             filter_metric_name = "seq_reward"
@@ -1775,6 +1856,7 @@ class RayPPOTrainer:
         pre_filter_traj_count = 0
         pre_filter_zero_std_prompt_count = 0
         pre_filter_zero_reward_prompt_count = 0
+        pre_filter_negative_off_policy_advantage_prompt_count = 0
         pre_filter_prompt_reward_sum = 0.0
         pre_filter_traj_reward_sum = 0.0
         rollout_source_stats_accum: dict[str, float] = {}
@@ -1968,12 +2050,18 @@ class RayPPOTrainer:
                             batch=batch,
                             metric_name=filter_metric_name,
                             expected_group_size=expected_prompt_group_size,
+                            filter_by_std=filter_groups_enabled,
+                            filter_negative_off_policy_advantage=filter_negative_off_policy_advantage_enabled,
+                            adv_estimator=self.config.algorithm.adv_estimator,
                         )
 
                         pre_filter_prompt_count += int(filter_stats["total_prompt_count"])
                         pre_filter_traj_count += int(filter_stats["total_traj_count"])
                         pre_filter_zero_std_prompt_count += int(filter_stats["zero_std_prompt_count"])
                         pre_filter_zero_reward_prompt_count += int(filter_stats["zero_reward_prompt_count"])
+                        pre_filter_negative_off_policy_advantage_prompt_count += int(
+                            filter_stats["negative_off_policy_advantage_prompt_count"]
+                        )
                         pre_filter_prompt_reward_sum += float(filter_stats["total_prompt_reward_sum"])
                         pre_filter_traj_reward_sum += float(filter_stats["total_traj_reward_sum"])
                         num_prompt_in_batch += int(filter_stats["kept_prompt_count"])
@@ -2050,6 +2138,10 @@ class RayPPOTrainer:
                                 / max(1, pre_filter_prompt_count),
                                 "filter_groups/pre/zero_reward_prompt_ratio": pre_filter_zero_reward_prompt_count
                                 / max(1, pre_filter_prompt_count),
+                                "filter_groups/pre/negative_off_policy_advantage_prompt_ratio": (
+                                    pre_filter_negative_off_policy_advantage_prompt_count
+                                    / max(1, pre_filter_prompt_count)
+                                ),
                             }
                         )
                         metrics.update(
@@ -2306,6 +2398,7 @@ class RayPPOTrainer:
                 pre_filter_traj_count = 0
                 pre_filter_zero_std_prompt_count = 0
                 pre_filter_zero_reward_prompt_count = 0
+                pre_filter_negative_off_policy_advantage_prompt_count = 0
                 pre_filter_prompt_reward_sum = 0.0
                 pre_filter_traj_reward_sum = 0.0
                 rollout_source_stats_accum = {}

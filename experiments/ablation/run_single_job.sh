@@ -40,6 +40,11 @@ ENTROPY_AWARE_ALPHA="${ENTROPY_AWARE_ALPHA:-linear}"
 USE_ENTROPY_AWARE_MIXING="${USE_ENTROPY_AWARE_MIXING:-true}"
 USE_ROLLOUT_CORRECTION="${USE_ROLLOUT_CORRECTION:-true}"
 FILTER_GROUPS_ENABLE="${FILTER_GROUPS_ENABLE:-false}"
+FILTER_NEGATIVE_OFF_POLICY_ADVANTAGE="${FILTER_NEGATIVE_OFF_POLICY_ADVANTAGE:-false}"
+EFFECTIVE_FILTER_NEGATIVE_OFF_POLICY_ADVANTAGE=false
+if [ "${ALGO}" = "mixed_policy" ] && [ "${FILTER_GROUPS_ENABLE}" = "true" ]; then
+  EFFECTIVE_FILTER_NEGATIVE_OFF_POLICY_ADVANTAGE="${FILTER_NEGATIVE_OFF_POLICY_ADVANTAGE}"
+fi
 
 LOG_TRAIN_ROLLOUTS="${LOG_TRAIN_ROLLOUTS:-false}"
 TRAIN_ROLLOUT_LOG_FREQ=5
@@ -138,6 +143,7 @@ overrides=(
   "++algorithm.filter_groups.enable=${FILTER_GROUPS_ENABLE}"
   "++algorithm.filter_groups.metric=seq_reward"
   "++algorithm.filter_groups.max_num_gen_batches=0"
+  "++algorithm.filter_groups.filter_negative_off_policy_advantage=${EFFECTIVE_FILTER_NEGATIVE_OFF_POLICY_ADVANTAGE}"
   "hydra.run.dir=${RUN_DIR}"
   "hydra.output_subdir=.hydra"
 )
