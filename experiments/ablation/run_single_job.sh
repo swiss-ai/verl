@@ -47,10 +47,12 @@ if [ "${ALGO}" = "mixed_policy" ] && [ "${FILTER_GROUPS_ENABLE}" = "true" ]; the
 fi
 
 LOG_TRAIN_ROLLOUTS="${LOG_TRAIN_ROLLOUTS:-false}"
-TRAIN_ROLLOUT_LOG_FREQ=5
+TRAIN_ROLLOUT_LOG_FREQ=10
 TRAIN_ROLLOUT_LOG_MAX_SAMPLES=32
 
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-512}"
+PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-128}"
+PPO_MICRO_BATCH_SIZE_PER_GPU="${PPO_MICRO_BATCH_SIZE_PER_GPU:-16}"
 MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-1024}"
 MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-2048}"
 TOTAL_EPOCHS="${TOTAL_EPOCHS:-10}"
@@ -113,6 +115,7 @@ cp -f "${VLLM_PATCH_ROOT}/compilation/decorators.py" /usr/local/lib/python3.12/d
 python3 -m pip install --no-deps --no-cache-dir --force-reinstall -e .
 python3 -m pip install --ignore-installed --no-cache-dir "cupy-cuda13x==13.6.0"
 python3 -m pip install --no-deps --no-cache-dir "numpy<=2.2.0"
+python3 -m pip install math-verify
 
 STUDENT_RESOLVED="$(resolve_model_path "${STUDENT_MODEL_PATH}")"
 TEACHER_RESOLVED="$(resolve_model_path "${TEACHER_MODEL_PATH}")"
@@ -126,6 +129,8 @@ overrides=(
   "actor_rollout_ref.model.path=${STUDENT_RESOLVED}"
   "actor_rollout_ref.actor.data_loader_seed=${SEED}"
   "actor_rollout_ref.actor.checkpoint.save_contents=['hf_model']"
+  "actor_rollout_ref.actor.ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE}"
+  "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=${PPO_MICRO_BATCH_SIZE_PER_GPU}"
   "actor_rollout_ref.rollout.n=${ROLLOUT_N}"
   "trainer.project_name=${PROJECT_NAME}"
   "trainer.experiment_name=${RUN_NAME}"
@@ -134,7 +139,7 @@ overrides=(
   "trainer.total_epochs=${TOTAL_EPOCHS}"
   "trainer.use_legacy_worker_impl=enable"
   "trainer.critic_warmup=0"
-  "trainer.save_freq=20"
+  "trainer.save_freq=10"
   "trainer.test_freq=5"
   "trainer.max_actor_ckpt_to_keep=null"
   "trainer.max_critic_ckpt_to_keep=null"

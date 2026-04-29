@@ -51,17 +51,17 @@ def default_compute_score(
 
         res = code.compute_score(solution_str, ground_truth, extra_info, sparse_rewards=True, max_test_cases=None)
 
-    elif data_source in ["lighteval/MATH", "DigitalLearningGmbH/MATH-lighteval", "HuggingFaceH4/MATH-500", "math_500", "math500", "math-500", "hendrycks-math-12k", "gsm8k_boxed", "beyondaime", "aime2024", "aime2025", "aime2026", "amc23"]:
-        from . import math_reward
+    elif data_source in ["lighteval/MATH", "DigitalLearningGmbH/MATH-lighteval", "HuggingFaceH4/MATH-500", "math_500", "math500", "math-500", "hendrycks-math-12k", "gsm8k_boxed", "beyondaime", "aime2024", "aime2025", "aime2026", "amc23", "gneubig/aime-1983-2024"]:
+        # from . import math_reward
 
-        res = math_reward.compute_score(solution_str, ground_truth)
+        # res = math_reward.compute_score(solution_str, ground_truth)
         # [Optional] Math-Verify Integration
         # For enhanced accuracy, consider utilizing Math-Verify (https://github.com/huggingface/Math-Verify).
         # Note: Math-Verify needs to be manually installed via pip: `pip install math-verify`.
         # To use it, override the `compute_score` function with the following implementation:
 
-        # from . import math_verify
-        # res = math_verify.compute_score(solution_str, ground_truth)
+        from . import math_verify
+        res = math_verify.compute_score(solution_str, ground_truth)
     elif data_source in ["math_dapo", "math", "math_dapo_reasoning"] or data_source.startswith("aime"):
         from . import math_dapo
 
