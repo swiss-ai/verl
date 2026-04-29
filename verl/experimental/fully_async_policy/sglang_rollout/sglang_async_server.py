@@ -184,8 +184,8 @@ class SGLangHttpServerForPartial(SGLangHttpServer):
                 return
             from sglang.srt.managers.io_struct import ContinueGenerationReqInput
 
-            # clear_kv_cache pauses SGLang's tokenizer gate during weight sync.
-            # Re-open that gate before accepting rollout work again.
+            # cancel() pauses SGLang's tokenizer gate during parameter sync with
+            # partial-rollout. Re-open that gate before accepting rollout work again.
             await self.tokenizer_manager.continue_generation(ContinueGenerationReqInput())
             self.sglang_generation_paused = False
 
@@ -205,15 +205,6 @@ class SGLangHttpServerForPartial(SGLangHttpServer):
         async with self.lock:
             print("Reset prefix cache ...")
             await self.tokenizer_manager.flush_cache()
-
-    async def clear_kv_cache(self):
-        async with self.lock:
-            self.paused = True
-            for request_id in list(self.cancel_event):
-                self.cancel_event[request_id].set()
-        # Idempotent guard: cancel() usually paused SGLang already, but cache release must be safe on its own.
-        await self._pause_sglang_generation()
-        await super().clear_kv_cache()
 
 
 class FullyAsyncSGLangReplica(SGLangReplica):

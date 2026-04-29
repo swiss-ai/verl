@@ -268,8 +268,16 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             )
             print(
                 f"[FullyAsyncRollouter] need_validate: {need_validate},"
-                f"parallel_validate_and_rollout: {self.parallel_validate_and_rollout}"
+                f"parallel_validate_and_rollout: {self.parallel_validate_and_rollout}",
             )
+            if need_validate and self.config.async_training.partial_rollout:
+                # Need to resume the rollout backend before validation,
+                # otherwise validation will hang
+                print(
+                    "[FullyAsyncRollouter][ValidateDebug] resume_generation_backend_before_validation "
+                    f"version={version}",
+                )
+                await self.async_rollout_manager.resume()
             if not need_validate:
                 data = ValidateMetrics(
                     timing_raw=timing_raw, metrics=None, global_steps=global_steps, param_version=version
