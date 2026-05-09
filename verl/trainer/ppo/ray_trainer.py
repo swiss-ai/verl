@@ -24,6 +24,7 @@ import os
 import time
 import uuid
 from collections import defaultdict
+from collections.abc import Mapping
 from copy import deepcopy
 from pprint import pprint
 from typing import Any, Optional
@@ -582,6 +583,12 @@ class RayPPOTrainer:
     def _get_filter_groups_config(self) -> dict[str, Any]:
         """Resolve filter-groups config from algorithm.filter_groups."""
         filter_cfg = self.config.algorithm.get("filter_groups", None) or {}
+        if not isinstance(filter_cfg, Mapping):
+            raise TypeError(
+                "algorithm.filter_groups must be a mapping with keys "
+                "{enable, metric, max_num_gen_batches}. "
+                "Use algorithm.filter_groups.enable=true instead of algorithm.filter_groups=true."
+            )
         max_num_gen_batches = filter_cfg.get("max_num_gen_batches", 0)
         if max_num_gen_batches is None:
             max_num_gen_batches = 0

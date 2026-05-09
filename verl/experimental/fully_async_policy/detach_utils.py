@@ -45,6 +45,7 @@ class RolloutSample:
     param_version_start: list[int]
     param_version_end: list[int]
     rollout_status: dict[str, Any]
+    reward_extra_info: Optional[dict[str, Any]] = None
 
 
 @dataclass
@@ -128,9 +129,33 @@ def assemble_batch_from_rollout_samples(
     # Add a prefix to all rollout_status keys
     rollout_status = {f"fully_async/{key}": value for key, value in rollout_status.items()}
 
+    reward_extra_infos_dict = defaultdict(list)
+
     for rs in rollout_samples:
         rollout_samples_batch.append(rs.full_batch)
+        if rs.reward_extra_info:
+            for key, values in rs.reward_extra_info.items():
+                values = np.asarray(values, dtype=object)
+                if values.ndim == 0:
+                    values = values.reshape(1)
+                if values.shape[0] != len(rs.full_batch):
+                    raise ValueError(
+                        "Reward extra info length mismatch during fully async batch assembly: "
+                        f"key={key}, value_len={values.shape[0]}, sample_len={len(rs.full_batch)}"
+                    )
+                reward_extra_infos_dict[key].extend(values.tolist())
+
     final_batch = DataProto.concat(rollout_samples_batch)
+
+    if reward_extra_infos_dict:
+        for key, values in reward_extra_infos_dict.items():
+            if len(values) != len(final_batch):
+                raise ValueError(
+                    "Aggregated reward extra info length mismatch during fully async batch assembly: "
+                    f"key={key}, value_len={len(values)}, batch_len={len(final_batch)}"
+                )
+            final_batch.non_tensor_batch[key] = np.array(values, dtype=object)
+        final_batch.meta_info["reward_extra_keys"] = sorted(reward_extra_infos_dict.keys())
 
     # Calculate response_mask (if not present)
     if "response_mask" not in final_batch.batch.keys():
@@ -253,6 +278,8 @@ class MetricsAggregator:
                 "fully_async/count/stale_trajectory_processed",
                 "fully_async/count/current_param_version",
                 "fully_async/count/dropped_stale_samples",
+                "fully_async/count/filter_group_evaluated_samples",
+                "fully_async/count/dropped_filter_group_samples",
                 "training/global_step",  # TODO change name to: total_step
             ],
         }

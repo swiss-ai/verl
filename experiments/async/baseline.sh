@@ -4,9 +4,8 @@
 #SBATCH --container-writable
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --environment=async
+#SBATCH --environment=reasoning
 #SBATCH --time=08:00:00
-#SBATCH --time=04:00:00
 #SBATCH --output=slurm_logs/%x_%j.out
 #SBATCH --error=slurm_logs/%x_%j.err
 
@@ -22,7 +21,7 @@ cd "${WORKING_DIR}"
 DATA_DIR=${WORKING_DIR}/data/math-12k
 MODEL_NAME_OR_PATH=meta-llama/Llama-3.2-3B-Instruct
 PROJECT_NAME=async-rl
-CONFIG_NAME=async
+CONFIG_NAME=grpo_math_base
 
 ROLLOUT_N=8
 SEED=42
@@ -38,7 +37,7 @@ resolve_run_name() {
   local date_time
   date_time="$(date +'%Y%m%dT%H%M%S')"
   if [ -z "${RUN_NAME}" ]; then
-    RUN_NAME="${PROJECT_NAME}__${model_tag}__DAPO__seed${SEED}__${date_time}"
+    RUN_NAME="${PROJECT_NAME}__grpo__${model_tag}__DAPO__seed${SEED}__${date_time}"
   fi
   RUN_DIR="${OUTPUT_ROOT}/${RUN_NAME}"
   mkdir -p "${RUN_DIR}"
@@ -66,19 +65,14 @@ build_overrides() {
     "trainer.validation_data_dir=${RUN_DIR}/validation"
     "trainer.val_before_train=false"
     "actor_rollout_ref.rollout.n=${ROLLOUT_N}"
-    "rollout.total_rollout_steps=128000"
-    "async_training.trigger_parameter_sync_step=1"
     "hydra.run.dir=${RUN_DIR}"
     "algorithm.filter_groups.enable=true"
     "hydra.output_subdir=.hydra"
     "actor_rollout_ref.actor.data_loader_seed=${SEED}"
-    "async_training.partial_rollout=true"
-    "async_training.retain_stale_kv_cache=true" # TODO: test with both true and false
     "actor_rollout_ref.actor.checkpoint.save_contents=['hf_model']"
     "critic.checkpoint.save_contents=[]"
     "trainer.save_freq=10"
-    "+rollout.test_freq=10"
-    "async_training.use_trainer_do_validate=false"
+    "trainer.test_freq=10"
     "trainer.max_actor_ckpt_to_keep=null"
     "trainer.max_critic_ckpt_to_keep=null"
     "actor_rollout_ref.actor.strategy=fsdp2"
@@ -108,6 +102,6 @@ pip install --no-deps --no-cache-dir --force-reinstall -e .
 
 build_overrides
 
-HYDRA_FULL_ERROR=1 python3 -m verl.experimental.fully_async_policy.fully_async_main \
+HYDRA_FULL_ERROR=1 python3 -m verl.trainer.main_ppo \
   "${overrides[@]}" \
   "$@"

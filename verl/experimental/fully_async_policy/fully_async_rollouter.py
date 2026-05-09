@@ -34,7 +34,7 @@ from verl.experimental.fully_async_policy.message_queue import MessageQueueClien
 from verl.experimental.fully_async_policy.ray_trainer import FullyAsyncRayPPOTrainer
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
 from verl.trainer.ppo.ray_trainer import ResourcePoolManager
-from verl.trainer.ppo.reward import load_reward_manager
+from verl.trainer.ppo.reward import compute_reward, load_reward_manager
 from verl.trainer.ppo.utils import Role, WorkerType
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 from verl.utils.profiler import marked_timer
@@ -151,6 +151,8 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         self.total_generated_samples = 0
         self.staleness_samples = 0
         self.dropped_stale_samples = 0
+        self.filter_group_evaluated_samples = 0
+        self.dropped_filter_group_samples = 0
         self.processed_sample_count = 0
         # we start from step 1
         self.global_steps = 1
@@ -174,9 +176,14 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         cpu_cores = multiprocessing.cpu_count()
         # cpu case use cpu_cores; io case use cpu_cores*2
         self.validate_executor = ThreadPoolExecutor(max_workers=cpu_cores)
+        self.reward_executor = ThreadPoolExecutor(max_workers=cpu_cores)
         self.parallel_validate_and_rollout = config.async_training.get("parallel_validate_and_rollout", False)
         self.validate_task = None
         self.retain_stale_kv_cache = config.async_training.get("retain_stale_kv_cache", False)
+        self.filter_groups_cfg = self._get_filter_groups_config()
+        self._validate_filter_groups_config(self.filter_groups_cfg)
+        self.filter_groups_enabled = bool(self.filter_groups_cfg["enable"])
+        self.filter_groups_metric = self.filter_groups_cfg["metric"]
 
     def _init_async_objects(self):
         # Initialize asyncio synchronization primitives.
@@ -570,6 +577,71 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             else:
                 self.pending_queue.task_done()
 
+    async def _compute_reward_for_rollout_sample(self, rollout_sample: RolloutSample) -> tuple[torch.Tensor, dict]:
+        loop = asyncio.get_running_loop()
+        reward_tensor, reward_extra_infos_dict = await loop.run_in_executor(
+            self.reward_executor,
+            functools.partial(compute_reward, rollout_sample.full_batch, self.reward_fn),
+        )
+        rollout_sample.full_batch.batch["token_level_scores"] = reward_tensor
+        rollout_sample.reward_extra_info = reward_extra_infos_dict
+        return reward_tensor, reward_extra_infos_dict
+
+    def _get_filter_group_metric_values(
+        self, rollout_sample: RolloutSample, reward_tensor: torch.Tensor, reward_extra_infos_dict: dict
+    ) -> np.ndarray:
+        metric_name = self.filter_groups_metric
+        if metric_name in ("seq_reward", "seq_final_reward"):
+            metric_values = reward_tensor.sum(dim=-1).detach().cpu().numpy()
+        elif metric_name in reward_extra_infos_dict:
+            metric_values = np.asarray(reward_extra_infos_dict[metric_name], dtype=object)
+        elif metric_name in rollout_sample.full_batch.non_tensor_batch:
+            metric_values = np.asarray(rollout_sample.full_batch.non_tensor_batch[metric_name], dtype=object)
+        else:
+            raise KeyError(
+                f"Filter metric '{metric_name}' not found in reward extra info or rollout sample. "
+                "Expected one of reward extra-info keys or seq_reward/seq_final_reward."
+            )
+
+        if metric_values.ndim == 0:
+            metric_values = metric_values.reshape(1)
+        if metric_values.shape[0] != len(rollout_sample.full_batch):
+            raise ValueError(
+                "Filter metric length mismatch during fully async filter-groups sampling: "
+                f"metric={metric_name}, value_len={metric_values.shape[0]}, sample_len={len(rollout_sample.full_batch)}"
+            )
+
+        try:
+            return metric_values.astype(np.float64)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Filter metric '{metric_name}' must contain numeric values.") from exc
+
+    async def _should_enqueue_rollout_sample(self, rollout_sample: RolloutSample) -> bool:
+        if not self.filter_groups_enabled:
+            return True
+
+        reward_tensor, reward_extra_infos_dict = await self._compute_reward_for_rollout_sample(rollout_sample)
+        metric_values = self._get_filter_group_metric_values(
+            rollout_sample=rollout_sample,
+            reward_tensor=reward_tensor,
+            reward_extra_infos_dict=reward_extra_infos_dict,
+        )
+        metric_variance = float(np.var(metric_values))
+        self.filter_group_evaluated_samples += 1
+
+        should_enqueue = metric_variance > 0.0
+        if not should_enqueue:
+            self.dropped_filter_group_samples += 1
+            self.staleness_samples = max(self.staleness_samples - 1, 0)
+            if self.dropped_filter_group_samples % 100 == 0:
+                print(
+                    "[FullyAsyncRollouter][FilterGroups] "
+                    f"dropped_filter_group_samples={self.dropped_filter_group_samples}, "
+                    f"metric={self.filter_groups_metric}, "
+                    f"metric_variance={metric_variance:.6g}"
+                )
+        return should_enqueue
+
     async def _process_single_sample_streaming(self, rollout_sample: RolloutSample):
         """Process a single sample streamingly"""
         # Calling asynchronous generation methods
@@ -584,6 +656,11 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             rollout_sample.full_batch.non_tensor_batch["uid"] = np.array(
                 [f"uid_{rollout_sample.sample_id}"] * len(rollout_sample.full_batch), dtype=object
             )
+
+            if not await self._should_enqueue_rollout_sample(rollout_sample):
+                self.processed_sample_count += 1
+                return
+
             rollout_sample.param_version = self.current_param_version
             rollout_sample.rollout_status = await self.get_statistics()
             rollout_sample.agent_loop_output_list = []
@@ -793,6 +870,11 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             "count/total_generated_samples": self.total_generated_samples,
             "count/staleness_samples": self.staleness_samples,
             "count/dropped_stale_samples": self.dropped_stale_samples,
+            "count/filter_group_evaluated_samples": self.filter_group_evaluated_samples,
+            "count/dropped_filter_group_samples": self.dropped_filter_group_samples,
+            "count/filter_group_drop_ratio": self.dropped_filter_group_samples
+            / max(self.filter_group_evaluated_samples, 1),
+            "filter_groups/enabled": int(self.filter_groups_enabled),
             # static stats
             "static/max_required_samples": self.max_required_samples,
             "static/required_samples": self.required_samples,

@@ -336,16 +336,30 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         return batch
 
     def _process_batch_common(self, batch, metrics, timing_raw, local_trigger_step=None):
+        reward_precomputed = "token_level_scores" in batch.batch.keys()
+        reward_extra_infos_dict: dict[str, list] = {}
+
         with marked_timer("reward", timing_raw, color="yellow"):
+            if reward_precomputed:
+                reward_tensor = batch.batch["token_level_scores"]
+                reward_extra_keys = batch.meta_info.get("reward_extra_keys", [])
+                reward_extra_infos_dict = {
+                    key: batch.non_tensor_batch[key].tolist()
+                    if hasattr(batch.non_tensor_batch[key], "tolist")
+                    else batch.non_tensor_batch[key]
+                    for key in reward_extra_keys
+                    if key in batch.non_tensor_batch
+                }
             # compute reward model score
-            if self.use_rm:
+            elif self.use_rm:
                 reward_tensor = self.rm_wg.compute_rm_score(batch)
                 batch = batch.union(reward_tensor)
 
-            if self.config.reward_model.launch_reward_fn_async:
-                future_reward = compute_reward_async.remote(data=batch, reward_fn=self.reward_fn)
-            else:
-                reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
+            if not reward_precomputed:
+                if self.config.reward_model.launch_reward_fn_async:
+                    future_reward = compute_reward_async.remote(data=batch, reward_fn=self.reward_fn)
+                else:
+                    reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
 
         with marked_timer("old_log_prob", timing_raw, color="blue"):
 
@@ -410,12 +424,12 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
 
         with marked_timer("adv", timing_raw, color="brown"):
             # we combine with rule-based rm
-            reward_extra_infos_dict: dict[str, list]
-            if self.config.reward_model.launch_reward_fn_async:
+            if not reward_precomputed and self.config.reward_model.launch_reward_fn_async:
                 reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
-            batch.batch["token_level_scores"] = reward_tensor
+            if not reward_precomputed:
+                batch.batch["token_level_scores"] = reward_tensor
 
-            if reward_extra_infos_dict:
+            if not reward_precomputed and reward_extra_infos_dict:
                 batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
 
             # compute rewards. apply_kl_penalty if available

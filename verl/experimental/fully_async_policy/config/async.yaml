@@ -9,6 +9,11 @@ defaults:
 algorithm:
   adv_estimator: grpo
   norm_adv_by_std_in_grpo: false
+  filter_groups:
+    _target_: verl.trainer.config.FilterGroupsConfig
+    enable: false
+    metric: acc
+    max_num_gen_batches: null
 
 data:
   train_files: ./data/math/train.parquet
@@ -21,8 +26,8 @@ data:
 
 async_training:
   staleness_threshold: 0.2
-  trigger_parameter_sync_step: 4
-  require_batches: 1
+  trigger_parameter_sync_step: 1
+  require_batches: 4
   partial_rollout: true
   retain_stale_kv_cache: false
   use_rollout_log_probs: true
@@ -87,7 +92,7 @@ actor_rollout_ref:
     gpu_memory_utilization: 0.4
     log_prob_micro_batch_size_per_gpu: 16
     tensor_model_parallel_size: 1
-    n: 4
+    n: 8
     max_num_batched_tokens: 8192
     max_num_seqs: 256
     name: sglang
