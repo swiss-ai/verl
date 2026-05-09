@@ -176,6 +176,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         self.validate_executor = ThreadPoolExecutor(max_workers=cpu_cores)
         self.parallel_validate_and_rollout = config.async_training.get("parallel_validate_and_rollout", False)
         self.validate_task = None
+        self.retain_stale_kv_cache = config.async_training.get("retain_stale_kv_cache", False)
 
     def _init_async_objects(self):
         # Initialize asyncio synchronization primitives.
@@ -398,6 +399,10 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         if not hasattr(self.config, "async_training"):
             raise ValueError("[FullyAsyncRollouter] Missing async_training configuration")
         assert self.config.actor_rollout_ref.rollout.calculate_log_probs, "must rollout calculate log_probs"
+        if self.config.async_training.get("retain_stale_kv_cache", False):
+            assert self.config.actor_rollout_ref.rollout.name == "sglang", "retain_stale_kv_cache only supports sglang"
+            assert self.config.actor_rollout_ref.rollout.mode == "async", "retain_stale_kv_cache requires async rollout"
+            assert self.config.async_training.partial_rollout, "retain_stale_kv_cache requires partial_rollout"
 
     async def init_workers(self):
         """Initialize distributed training workers using Ray backend.
@@ -751,10 +756,16 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 await asyncio.gather(*self.active_tasks, return_exceptions=True)
                 self.active_tasks.clear()
                 print("[FullyAsyncRollouter][Public][Pause] All active tasks completed")
-            print("[FullyAsyncRollouter][Public][Pause] Prefix cache reset")
-            # Always clear KV cache to release GPU memory during weight synchronization,
-            # regardless of partial_rollout setting.
-            await self.async_rollout_manager.clear_kv_cache()
+            if self.retain_stale_kv_cache:
+                print(
+                    "[FullyAsyncRollouter][Public][Pause] "
+                    "Retaining stale SGLang KV cache across parameter sync",
+                    flush=True,
+                )
+            else:
+                print("[FullyAsyncRollouter][Public][Pause] Prefix cache reset")
+                # Clear KV cache to release GPU memory during weight synchronization.
+                await self.async_rollout_manager.clear_kv_cache()
             self.monitor_loop_trigger = False
 
     async def resume(self, dependency_ref: ObjectRef = None):

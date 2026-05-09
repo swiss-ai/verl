@@ -119,6 +119,8 @@ class AsyncPartialToolAgentLoop(ToolAgentLoop):
         # additional param version record
         agent_data.extra_fields["param_version_start"] = param_version
         agent_data.extra_fields["param_version_end"] = param_version
+        agent_data.extra_fields["kv_cache_metrics"] = []
+        agent_data.extra_fields["next_generation_is_resumed"] = False
 
         return agent_data
 
@@ -128,6 +130,7 @@ class AsyncPartialToolAgentLoop(ToolAgentLoop):
         agent_state = output.extra_fields.get("agent_state", None)
         if agent_data is None or agent_state is None:
             raise ValueError(f"Unexpected situation: agent_data is {agent_data}, agent_state is {agent_state}")
+        agent_data.extra_fields["next_generation_is_resumed"] = True
         return agent_data, agent_state
 
     async def _run_state_machine(
@@ -171,12 +174,21 @@ class AsyncPartialToolAgentLoop(ToolAgentLoop):
         with simple_timer("generate_sequences", agent_data.metrics):
             # partial interface
             if self.enable_partial_rollout:
-                response_ids, log_probs, is_cancel = await self.server_manager.generate_for_partial(
+                partial_result = await self.server_manager.generate_for_partial(
                     request_id=agent_data.request_id,
                     prompt_ids=agent_data.prompt_ids,
                     sampling_params=sampling_params,
                     image_data=agent_data.image_data,
                 )
+                if len(partial_result) == 4:
+                    response_ids, log_probs, is_cancel, kv_metrics = partial_result
+                else:
+                    response_ids, log_probs, is_cancel = partial_result
+                    kv_metrics = {}
+                if kv_metrics:
+                    kv_metrics = dict(kv_metrics)
+                    kv_metrics["is_resumed"] = bool(agent_data.extra_fields.pop("next_generation_is_resumed", False))
+                    agent_data.extra_fields.setdefault("kv_cache_metrics", []).append(kv_metrics)
 
                 if is_cancel:
                     # Save the generated parts
@@ -259,6 +271,7 @@ class AsyncPartialToolAgentLoop(ToolAgentLoop):
                 "is_cancel": False,
                 "param_version_start": agent_data.extra_fields["param_version_start"],
                 "param_version_end": param_version,
+                "kv_cache_metrics": agent_data.extra_fields.get("kv_cache_metrics", []),
             }
         )
         return output

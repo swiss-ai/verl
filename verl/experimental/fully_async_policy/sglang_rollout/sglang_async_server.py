@@ -104,10 +104,10 @@ class SGLangHttpServerForPartial(SGLangHttpServer):
         sampling_params: dict[str, Any],
         request_id: str,
         image_data: Optional[list[Any]] = None,
-    ) -> tuple[list[int], list[float], bool]:
+    ) -> tuple[list[int], list[float], bool, dict[str, Any]]:
         async with self.lock:
             if self.paused:
-                return [], [], True
+                return [], [], True, {}
             self.req_output[request_id] = None
             self.cancel_event[request_id] = asyncio.Event()
             cancel_handle = asyncio.create_task(self.cancel_event[request_id].wait())
@@ -121,6 +121,13 @@ class SGLangHttpServerForPartial(SGLangHttpServer):
         for task in done:
             await task
 
+        is_cancel = generation_handle not in done
+        if is_cancel:
+            try:
+                self.tokenizer_manager.abort_request(request_id)
+            except Exception as exc:
+                logger.warning("Failed to abort SGLang request %s: %r", request_id, exc)
+
         for task in pending:
             task.cancel()
         async with self.lock:
@@ -128,7 +135,7 @@ class SGLangHttpServerForPartial(SGLangHttpServer):
             if output is None:
                 self.cancel_event.pop(request_id, None)
                 self.req_output.pop(request_id, None)
-                return [], [], True
+                return [], [], True, {}
             meta_info = output.get("meta_info", {})
             output_token_logprobs = meta_info.get("output_token_logprobs")
 
@@ -142,11 +149,17 @@ class SGLangHttpServerForPartial(SGLangHttpServer):
             else:
                 token_ids = list(output["output_ids"])
                 log_probs = []
-            is_cancel = generation_handle not in done
+            prompt_tokens = int(meta_info.get("prompt_tokens") or len(prompt_ids) or 0)
+            cached_tokens = int(meta_info.get("cached_tokens") or 0)
+            kv_metrics = {
+                "prompt_tokens": prompt_tokens,
+                "cached_tokens": cached_tokens,
+                "cache_hit_rate": cached_tokens / prompt_tokens if prompt_tokens > 0 else 0.0,
+            }
             self.cancel_event.pop(request_id, None)
             self.req_output.pop(request_id, None)
 
-        return token_ids, log_probs, is_cancel
+        return token_ids, log_probs, is_cancel, kv_metrics
 
     async def cancel(self):
         async with self.lock:

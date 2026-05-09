@@ -173,6 +173,32 @@ def assemble_batch_from_rollout_samples(
         "fully_async/partial/partial_ratio": (len(param_version_diff) - num_diff0) / len(param_version_diff),
         "fully_async/partial/max_partial_span": max(param_version_diff),
     }
+    kv_metric_records = []
+    if "kv_cache_metrics" in final_batch.non_tensor_batch:
+        for item in final_batch.non_tensor_batch["kv_cache_metrics"]:
+            if item is None:
+                continue
+            if isinstance(item, dict):
+                kv_metric_records.append(item)
+            else:
+                kv_metric_records.extend(record for record in item if record is not None)
+
+    kv_prompt_tokens = [float(record.get("prompt_tokens", 0) or 0) for record in kv_metric_records]
+    kv_cached_tokens = [float(record.get("cached_tokens", 0) or 0) for record in kv_metric_records]
+    kv_hit_rates = [float(record.get("cache_hit_rate", 0.0) or 0.0) for record in kv_metric_records]
+    kv_resumed_hit_rates = [
+        float(record.get("cache_hit_rate", 0.0) or 0.0)
+        for record in kv_metric_records
+        if record.get("is_resumed", False)
+    ]
+    kv_stats = {
+        "fully_async/kv_cache/hit_rate_mean": np.mean(kv_hit_rates) if kv_hit_rates else 0.0,
+        "fully_async/kv_cache/resumed_hit_rate_mean": np.mean(kv_resumed_hit_rates)
+        if kv_resumed_hit_rates
+        else 0.0,
+        "fully_async/kv_cache/cached_tokens_total": sum(kv_cached_tokens),
+        "fully_async/kv_cache/prompt_tokens_total": sum(kv_prompt_tokens),
+    }
     # add meta_info
     param_versions = [rs.param_version for rs in rollout_samples]
     trajectorys_param_versions = final_batch.non_tensor_batch["param_version_end"]
@@ -185,6 +211,7 @@ def assemble_batch_from_rollout_samples(
             **processing_time_stats,
             **rollout_status,
             **partial_stats,
+            **kv_stats,
             **tool_calls_stats,
         }
     )

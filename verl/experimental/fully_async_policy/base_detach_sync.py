@@ -21,6 +21,7 @@ import threading
 import torch
 from omegaconf import DictConfig
 from ray.util.collective import collective
+from torch.distributed.tensor import DTensor
 
 from verl.single_controller.base.decorator import Dispatch, register
 from verl.utils.device import get_torch_device, is_npu_available
@@ -37,6 +38,7 @@ class BaseDetachNcclSync:
     _last_avg_bucket_size = 1024.0
 
     def __init__(self, config: DictConfig, role: str):
+        self.config = config
         self._bg_loop = asyncio.new_event_loop()
         self._bg_thread = threading.Thread(
             target=self._start_background_loop, args=(self._bg_loop,), name="rollout_actor_async_worker", daemon=True
@@ -170,11 +172,18 @@ class BaseDetachNcclSync:
         actual_bucket_sizes = []
         current_batch = []
         current_batch_size = 0
+        retain_stale_kv_cache = self.config.get("retain_stale_kv_cache", False)
 
         def flush_batch():
             if current_batch:
                 actual_bucket_sizes.append(current_batch_size / (1024 * 1024))
-                self._run_async_safely(self.update_weights(inference_model, iter(current_batch)))
+                self._run_async_safely(
+                    self.update_weights(
+                        inference_model,
+                        iter(current_batch),
+                        flush_cache=not retain_stale_kv_cache,
+                    )
+                )
                 get_torch_device().synchronize()
                 current_batch.clear()
 
@@ -203,8 +212,12 @@ class BaseDetachNcclSync:
             sum(actual_bucket_sizes) / len(actual_bucket_sizes) if actual_bucket_sizes else self.get_bucket_size_mb()
         )
 
-        # Resume kv_cache after weights sync to restore GPU memory released during pause
-        if self._is_rollout and self.rollout_device_mesh["infer_tp"].get_local_rank() == 0:
+        # Resume kv_cache after weights sync only when pause released it.
+        if (
+            not retain_stale_kv_cache
+            and self._is_rollout
+            and self.rollout_device_mesh["infer_tp"].get_local_rank() == 0
+        ):
             self._run_async_safely(inference_model.resume_memory_occupation(tags=["kv_cache"]))
 
     def _sync_vllm_weights(self, inference_model, params, sync_group_name):
@@ -224,15 +237,64 @@ class BaseDetachNcclSync:
             if self._is_rollout:
                 inference_model.load_weights([(key, tensor)])
 
-    async def update_weights(self, inference_engine, params):
-        from sglang.srt.weight_sync.utils import update_weights as sgl_update_weights
+    @staticmethod
+    def _preprocess_tensor_for_update_weights(tensor: torch.Tensor):
+        if isinstance(tensor, DTensor):
+            return tensor.full_tensor()
+        return tensor
 
-        await sgl_update_weights(
-            engine=inference_engine,
-            params_batch=params,
-            device_mesh_key="infer_tp",
-            device_mesh=self.rollout_device_mesh,
+    async def update_weights(self, inference_engine, params, flush_cache: bool = True):
+        """Mirror ``sglang.srt.weight_sync.utils.update_weights`` with explicit cache-flush control."""
+        from sglang.srt.managers.io_struct import UpdateWeightsFromTensorReqInput
+        from sglang.srt.model_executor.model_runner import LocalSerializedTensor
+        from sglang.srt.utils import MultiprocessingSerializer
+
+        params_batch = list(params)
+        infer_tp_mesh = self.rollout_device_mesh["infer_tp"]
+        infer_tp_size = infer_tp_mesh.mesh.size()[0]
+        infer_tp_rank = infer_tp_mesh.get_local_rank()
+
+        from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
+
+        monkey_patch_torch_reductions()
+        named_tensors_batch = [
+            (
+                name,
+                MultiprocessingSerializer.serialize(
+                    self._preprocess_tensor_for_update_weights(tensor.detach())
+                ),
+            )
+            for name, tensor in params_batch
+        ]
+
+        if infer_tp_rank == 0:
+            gathered_serialized_batches = [None for _ in range(infer_tp_size)]
+        else:
+            gathered_serialized_batches = None
+
+        torch.distributed.gather_object(
+            obj=named_tensors_batch,
+            object_gather_list=gathered_serialized_batches,
+            dst=infer_tp_mesh.mesh.tolist()[0],
+            group=infer_tp_mesh.get_group(),
         )
 
-        if self.rollout_device_mesh["infer_tp"].get_local_rank() == 0:
+        if infer_tp_rank == 0:
+            logical_tensors = zip(*gathered_serialized_batches, strict=True)
+            named_tensors = [
+                (
+                    tensor_group[0][0],
+                    LocalSerializedTensor(values=[rank_part[1] for rank_part in tensor_group]),
+                )
+                for tensor_group in logical_tensors
+            ]
+            update_weights_request = UpdateWeightsFromTensorReqInput(
+                serialized_named_tensors=[
+                    MultiprocessingSerializer.serialize(named_tensors) for _ in range(infer_tp_size)
+                ],
+                flush_cache=flush_cache,
+            )
+            await inference_engine.update_weights_from_tensor(update_weights_request)
+
+        if flush_cache and infer_tp_rank == 0:
             await inference_engine.flush_cache()

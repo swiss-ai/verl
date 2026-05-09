@@ -40,11 +40,13 @@ class PartialSingleTurnAgentLoop(AgentLoopBase):
         param_version = kwargs.get("param_version", 0)
 
         metrics = {}
-        request_id = uuid4().hex
+        request_id = output.extra_fields.get("request_id", uuid4().hex) if output else uuid4().hex
         image_data = (kwargs.get("multi_modal_data") or {}).get("image", None)
 
         param_version_start = param_version
         param_version_end = param_version
+        is_resumed_generation = output is not None and output.extra_fields.get("is_cancel", False)
+        kv_cache_metrics = list(output.extra_fields.get("kv_cache_metrics", [])) if output else []
 
         if not output:
             # TODO(baiyan): it is supposed to use the correct processor,
@@ -85,9 +87,18 @@ class PartialSingleTurnAgentLoop(AgentLoopBase):
                 # The samples without partial rollout are returned directly.
                 return output
         with simple_timer("generate_sequences", metrics):
-            response_ids, response_logprobs, is_cancel = await self.server_manager.generate_for_partial(
+            partial_result = await self.server_manager.generate_for_partial(
                 request_id=request_id, prompt_ids=prompt_ids, sampling_params=sampling_params, image_data=image_data
             )
+            if len(partial_result) == 4:
+                response_ids, response_logprobs, is_cancel, kv_metrics = partial_result
+            else:
+                response_ids, response_logprobs, is_cancel = partial_result
+                kv_metrics = {}
+        if kv_metrics:
+            kv_metrics = dict(kv_metrics)
+            kv_metrics["is_resumed"] = is_resumed_generation
+            kv_cache_metrics.append(kv_metrics)
         if not output:
             response_mask = [1] * len(response_ids)
         else:
@@ -110,6 +121,8 @@ class PartialSingleTurnAgentLoop(AgentLoopBase):
                 "is_cancel": is_cancel,
                 "param_version_start": param_version_start,
                 "param_version_end": param_version_end,
+                "kv_cache_metrics": kv_cache_metrics,
+                "request_id": request_id,
             },
             # multi_modal_data={"image": image_data} if image_data is not None else {},
         )
