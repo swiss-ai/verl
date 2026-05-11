@@ -71,7 +71,7 @@ build_overrides() {
     "actor_rollout_ref.actor.data_loader_seed=${SEED}"
     "actor_rollout_ref.actor.checkpoint.save_contents=['hf_model']"
     "critic.checkpoint.save_contents=[]"
-    "trainer.save_freq=10"
+    "trainer.save_freq=-1"
     "trainer.test_freq=10"
     "trainer.max_actor_ckpt_to_keep=null"
     "trainer.max_critic_ckpt_to_keep=null"

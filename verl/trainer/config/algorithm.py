@@ -74,6 +74,7 @@ class AdaptiveGroupSamplingConfig(BaseConfig):
         rollouts_per_round (int): Number of rollouts sampled per active prompt each round.
         prompt_oversampling_factor (float): Oversampling factor for prompt candidates passed into adaptive
             sampling. The adaptive loop keeps a fixed active set size and backfills from this candidate pool.
+        metric (str): Metric used to classify positive/negative rollouts.
         positive_threshold (float): A rollout is positive when sequence reward > positive_threshold.
         apply_downsampling (bool): Whether to downsample each prompt to rollout.n samples after adaptive sampling.
         apply_inverse_pass_rate_weight (bool): Whether to scale adaptive GRPO advantages by 1 / pass_rate.
@@ -89,7 +90,8 @@ class AdaptiveGroupSamplingConfig(BaseConfig):
     max_rounds: int = 1
     rollouts_per_round: int = 1
     prompt_oversampling_factor: float = 1.0
-    positive_threshold: float = 0.0
+    metric: str = "acc"
+    positive_threshold: float = 0.5
     apply_downsampling: bool = True
     apply_inverse_pass_rate_weight: bool = True
     apply_prompt_inverse_group_weight: bool = False

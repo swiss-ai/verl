@@ -11,7 +11,7 @@ data:
   val_files: ./data/math/test.parquet
   train_batch_size: 256
   max_prompt_length: 1024
-  max_response_length: 2048
+  max_response_length: 4096
   truncation: left
 
 actor_rollout_ref:
@@ -58,7 +58,7 @@ actor_rollout_ref:
     gpu_memory_utilization: 0.4
     log_prob_micro_batch_size_per_gpu: 16
     tensor_model_parallel_size: 1
-    n: 4
+    n: 8
     max_num_batched_tokens: 8192
     max_num_seqs: 256
     name: sglang
@@ -74,8 +74,8 @@ actor_rollout_ref:
       temperature: 0.6
 
 trainer:
-  total_epochs: 1000
-  total_training_steps: 500
+  total_epochs: 100
+  total_training_steps: 250
   save_freq: -1
   test_freq: 20
   max_actor_ckpt_to_keep: null

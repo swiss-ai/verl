@@ -21,6 +21,7 @@ This trainer supports model-agonistic model initialization with huggingface
 import uuid
 from copy import deepcopy
 from pprint import pprint
+from typing import Any
 
 import numpy as np
 import ray
@@ -32,6 +33,7 @@ from verl import DataProto
 from verl.experimental.dataset.sampler import AbstractCurriculumSampler
 from verl.single_controller.ray import RayClassWithInitArgs
 from verl.single_controller.ray.base import create_colocated_worker_cls
+from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
 from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
@@ -104,6 +106,79 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.RewardModel)
             rm_cls = RayClassWithInitArgs(self.role_worker_mapping[Role.RewardModel], config=self.config.reward_model)
             self.resource_pool_to_cls[resource_pool][str(Role.RewardModel)] = rm_cls
+
+    def _get_async_adaptive_group_sampling_config(self) -> dict[str, Any]:
+        """Resolve async adaptive group sampling config."""
+        adaptive_cfg = self.config.algorithm.get("adaptive_group_sampling", None) or {}
+        required_fields = (
+            "enable",
+            "min_positive_samples",
+            "min_negative_samples",
+            "max_rounds",
+            "positive_threshold",
+        )
+        missing_fields = [field for field in required_fields if adaptive_cfg.get(field, None) is None]
+        if missing_fields:
+            raise KeyError(
+                f"Missing required adaptive_group_sampling config field(s): {', '.join(missing_fields)}."
+            )
+
+        return {
+            "enable": bool(adaptive_cfg["enable"]),
+            "min_positive_samples": int(adaptive_cfg["min_positive_samples"]),
+            "min_negative_samples": int(adaptive_cfg["min_negative_samples"]),
+            "max_rounds": int(adaptive_cfg["max_rounds"]),
+            "metric": adaptive_cfg.get("metric", "acc") or "acc",
+            "positive_threshold": float(adaptive_cfg["positive_threshold"]),
+            "apply_downsampling": bool(adaptive_cfg.get("apply_downsampling", False)),
+            "apply_inverse_pass_rate_weight": bool(adaptive_cfg.get("apply_inverse_pass_rate_weight", False)),
+            "apply_prompt_inverse_group_weight": bool(adaptive_cfg.get("apply_prompt_inverse_group_weight", False)),
+            "apply_within_prompt_mass_balance": bool(adaptive_cfg.get("apply_within_prompt_mass_balance", False)),
+        }
+
+    def _validate_async_adaptive_group_sampling_config(self, adaptive_cfg: dict[str, Any]) -> None:
+        if not adaptive_cfg["enable"]:
+            return
+
+        if self.config.algorithm.adv_estimator != AdvantageEstimator.GRPO:
+            raise ValueError(
+                "Fully async adaptive group sampling requires algorithm.adv_estimator=grpo."
+            )
+        if self.config.algorithm.use_kl_in_reward:
+            raise ValueError(
+                "Fully async adaptive group sampling currently does not support algorithm.use_kl_in_reward=True."
+            )
+        if adaptive_cfg["min_positive_samples"] < 0 or adaptive_cfg["min_negative_samples"] < 0:
+            raise ValueError("Adaptive group sampling requires non-negative min_positive_samples/min_negative_samples.")
+        if adaptive_cfg["max_rounds"] <= 0:
+            raise ValueError("Adaptive group sampling requires max_rounds > 0.")
+        if int(self.config.actor_rollout_ref.rollout.n) <= 0:
+            raise ValueError("Adaptive group sampling requires actor_rollout_ref.rollout.n > 0.")
+        if not np.isfinite(float(adaptive_cfg["positive_threshold"])):
+            raise ValueError("Adaptive group sampling requires positive_threshold to be finite.")
+        if not adaptive_cfg["metric"]:
+            raise ValueError("Adaptive group sampling requires a non-empty metric.")
+        if adaptive_cfg["apply_downsampling"]:
+            raise ValueError(
+                "Fully async adaptive group sampling keeps all accepted trajectories; set apply_downsampling=False."
+            )
+        if adaptive_cfg["apply_inverse_pass_rate_weight"]:
+            raise ValueError(
+                "Fully async adaptive group sampling uses equal trajectory weighting; set "
+                "apply_inverse_pass_rate_weight=False."
+            )
+        if adaptive_cfg["apply_prompt_inverse_group_weight"] or adaptive_cfg["apply_within_prompt_mass_balance"]:
+            raise ValueError(
+                "Fully async adaptive group sampling uses equal trajectory weighting; disable adaptive prompt "
+                "inverse-group weighting and within-prompt mass balancing."
+            )
+        if self.config.trainer.balance_batch and bool(
+            self.config.actor_rollout_ref.actor.get("use_prefix_grouper", False)
+        ):
+            raise ValueError(
+                "Adaptive keep-all mode is currently incompatible with balance_batch=True when "
+                "use_prefix_grouper=True."
+            )
 
     def _init_worker_groups(self):
         # initialize WorkerGroup
@@ -338,6 +413,8 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
     def _process_batch_common(self, batch, metrics, timing_raw, local_trigger_step=None):
         reward_precomputed = "token_level_scores" in batch.batch.keys()
         reward_extra_infos_dict: dict[str, list] = {}
+        adaptive_group_sampling_cfg = self._get_async_adaptive_group_sampling_config()
+        adaptive_group_sampling_enabled = bool(adaptive_group_sampling_cfg["enable"])
 
         with marked_timer("reward", timing_raw, color="yellow"):
             if reward_precomputed:
@@ -360,6 +437,28 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                     future_reward = compute_reward_async.remote(data=batch, reward_fn=self.reward_fn)
                 else:
                     reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
+
+        if adaptive_group_sampling_enabled:
+            required_adaptive_keys = (
+                "adaptive_group_mean",
+                "adaptive_group_std",
+                "adaptive_group_pass_rate",
+            )
+            missing_adaptive_keys = [key for key in required_adaptive_keys if key not in batch.batch.keys()]
+            if missing_adaptive_keys:
+                raise KeyError(
+                    "Fully async adaptive group sampling requires rollouter-precomputed adaptive stats, "
+                    f"missing: {', '.join(missing_adaptive_keys)}."
+                )
+            if not reward_precomputed:
+                raise ValueError("Fully async adaptive group sampling requires precomputed token_level_scores.")
+            if "response_mask" not in batch.batch.keys():
+                batch.batch["response_mask"] = compute_response_mask(batch)
+            batch = self.pad_adaptive_batch_to_divisor(batch=batch, metrics=metrics)
+            if self.config.trainer.balance_batch:
+                self._balance_batch(batch, metrics=metrics)
+            if "attention_mask" in batch.batch.keys():
+                batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
 
         with marked_timer("old_log_prob", timing_raw, color="blue"):
 
@@ -457,15 +556,28 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                 "norm_adv_by_std_in_grpo", True
             )  # GRPO adv normalization factor
 
-            batch = compute_advantage(
-                batch,
-                adv_estimator=self.config.algorithm.adv_estimator,
-                gamma=self.config.algorithm.gamma,
-                lam=self.config.algorithm.lam,
-                num_repeat=self.config.actor_rollout_ref.rollout.n,
-                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-                config=self.config.algorithm,
-            )
+            if adaptive_group_sampling_enabled:
+                advantages, returns, _ = core_algos.compute_adaptive_grpo_outcome_advantage(
+                    token_level_rewards=batch.batch["token_level_rewards"],
+                    response_mask=batch.batch["response_mask"],
+                    group_mean=batch.batch["adaptive_group_mean"],
+                    group_std=batch.batch["adaptive_group_std"],
+                    group_pass_rate=batch.batch["adaptive_group_pass_rate"],
+                    norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                    apply_inverse_pass_rate_weight=False,
+                )
+                batch.batch["advantages"] = advantages
+                batch.batch["returns"] = returns
+            else:
+                batch = compute_advantage(
+                    batch,
+                    adv_estimator=self.config.algorithm.adv_estimator,
+                    gamma=self.config.algorithm.gamma,
+                    lam=self.config.algorithm.lam,
+                    num_repeat=self.config.actor_rollout_ref.rollout.n,
+                    norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                    config=self.config.algorithm,
+                )
 
         # update critic
         if self.use_critic:
@@ -482,6 +594,8 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                 actor_output = self.actor_rollout_wg.update_actor(batch)
             actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
             metrics.update(actor_output_metrics)
+        if adaptive_group_sampling_enabled:
+            batch = self.unpad_adaptive_batch(batch=batch, metrics=metrics)
         return batch, reward_extra_infos_dict
 
     def _log_rollout(self, batch, reward_extra_infos_dict, timing_raw):

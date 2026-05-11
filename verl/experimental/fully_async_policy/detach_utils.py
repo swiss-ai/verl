@@ -46,6 +46,7 @@ class RolloutSample:
     param_version_end: list[int]
     rollout_status: dict[str, Any]
     reward_extra_info: Optional[dict[str, Any]] = None
+    adaptive_state: Optional[dict[str, Any]] = None
 
 
 @dataclass
@@ -96,6 +97,40 @@ def prepare_single_generation_data(batch_dict, config) -> DataProto:
     return full_batch
 
 
+def attach_adaptive_group_stats(
+    batch: DataProto,
+    sequence_scores: list[float],
+    positive_count: int,
+    negative_count: int,
+) -> tuple[float, float, float]:
+    """Attach per-row adaptive group statistics computed from all cached trajectories."""
+    sequence_scores_arr = np.asarray(sequence_scores, dtype=np.float64)
+    if sequence_scores_arr.shape[0] != len(batch):
+        raise ValueError(
+            "Adaptive group sampling score/cache length mismatch: "
+            f"scores={sequence_scores_arr.shape[0]}, batch={len(batch)}."
+        )
+    if "token_level_scores" not in batch.batch.keys():
+        raise KeyError("Adaptive group statistics require token_level_scores in the batch.")
+
+    mean = float(np.mean(sequence_scores_arr))
+    std = float(np.std(sequence_scores_arr))
+    pass_rate = float(positive_count / max(positive_count + negative_count, 1))
+
+    score_tensor = batch.batch["token_level_scores"]
+    stats_shape = (len(batch),)
+    batch.batch["adaptive_group_mean"] = torch.full(
+        stats_shape, mean, dtype=score_tensor.dtype, device=score_tensor.device
+    )
+    batch.batch["adaptive_group_std"] = torch.full(
+        stats_shape, std, dtype=score_tensor.dtype, device=score_tensor.device
+    )
+    batch.batch["adaptive_group_pass_rate"] = torch.full(
+        stats_shape, pass_rate, dtype=score_tensor.dtype, device=score_tensor.device
+    )
+    return mean, std, pass_rate
+
+
 def assemble_batch_from_rollout_samples(
     rollout_samples: list[RolloutSample], tokenizer, config, balance_batch=None
 ) -> DataProto:
@@ -125,8 +160,8 @@ def assemble_batch_from_rollout_samples(
     rollout_samples_batch = []
     processing_times = []
     tool_calls = []
-    rollout_status = rollout_samples[0].rollout_status
-    # Add a prefix to all rollout_status keys
+    # Use the newest enqueued sample's status snapshot for cumulative rollouter counters.
+    rollout_status = rollout_samples[-1].rollout_status
     rollout_status = {f"fully_async/{key}": value for key, value in rollout_status.items()}
 
     reward_extra_infos_dict = defaultdict(list)
@@ -211,6 +246,8 @@ def assemble_batch_from_rollout_samples(
     kv_prompt_tokens = [float(record.get("prompt_tokens", 0) or 0) for record in kv_metric_records]
     kv_cached_tokens = [float(record.get("cached_tokens", 0) or 0) for record in kv_metric_records]
     kv_hit_rates = [float(record.get("cache_hit_rate", 0.0) or 0.0) for record in kv_metric_records]
+    kv_prompt_tokens_total = sum(kv_prompt_tokens)
+    kv_cached_tokens_total = sum(kv_cached_tokens)
     kv_resumed_hit_rates = [
         float(record.get("cache_hit_rate", 0.0) or 0.0)
         for record in kv_metric_records
@@ -218,15 +255,33 @@ def assemble_batch_from_rollout_samples(
     ]
     kv_stats = {
         "fully_async/kv_cache/hit_rate_mean": np.mean(kv_hit_rates) if kv_hit_rates else 0.0,
+        "fully_async/kv_cache/global_hit_rate": (
+            kv_cached_tokens_total / kv_prompt_tokens_total if kv_prompt_tokens_total > 0 else 0.0
+        ),
         "fully_async/kv_cache/resumed_hit_rate_mean": np.mean(kv_resumed_hit_rates)
         if kv_resumed_hit_rates
         else 0.0,
-        "fully_async/kv_cache/cached_tokens_total": sum(kv_cached_tokens),
-        "fully_async/kv_cache/prompt_tokens_total": sum(kv_prompt_tokens),
+        "fully_async/kv_cache/cached_tokens_total": kv_cached_tokens_total,
+        "fully_async/kv_cache/prompt_tokens_total": kv_prompt_tokens_total,
     }
     # add meta_info
     param_versions = [rs.param_version for rs in rollout_samples]
     trajectorys_param_versions = final_batch.non_tensor_batch["param_version_end"]
+    adaptive_group_summaries = [
+        rs.adaptive_state
+        for rs in rollout_samples
+        if isinstance(rs.adaptive_state, dict)
+        and "rounds" in rs.adaptive_state
+        and "trajectories" in rs.adaptive_state
+    ]
+    adaptive_stats = {}
+    if adaptive_group_summaries:
+        batch_rounds = [int(summary["rounds"]) for summary in adaptive_group_summaries]
+        batch_trajectories = [int(summary["trajectories"]) for summary in adaptive_group_summaries]
+        adaptive_stats = {
+            "fully_async/adaptive_group_sampling/batch_mean_rounds": float(np.mean(batch_rounds)),
+            "fully_async/adaptive_group_sampling/batch_mean_trajectories": float(np.mean(batch_trajectories)),
+        }
 
     final_batch.meta_info.update(
         {
@@ -238,6 +293,7 @@ def assemble_batch_from_rollout_samples(
             **partial_stats,
             **kv_stats,
             **tool_calls_stats,
+            **adaptive_stats,
         }
     )
 
@@ -277,9 +333,13 @@ class MetricsAggregator:
                 "fully_async/count/stale_samples_processed",
                 "fully_async/count/stale_trajectory_processed",
                 "fully_async/count/current_param_version",
+                "fully_async/count/staleness_samples",
                 "fully_async/count/dropped_stale_samples",
                 "fully_async/count/filter_group_evaluated_samples",
                 "fully_async/count/dropped_filter_group_samples",
+                "fully_async/adaptive_group_sampling/started_prompts_total",
+                "fully_async/adaptive_group_sampling/dropped_prompts_total",
+                "fully_async/adaptive_group_sampling/sampled_rollouts_total",
                 "training/global_step",  # TODO change name to: total_step
             ],
         }
@@ -397,6 +457,16 @@ class MetricsAggregator:
         # trainer/idle_ratio
         if "timing_s/gen" in aggregated.keys() and "timing_s/step" in aggregated.keys():
             aggregated["trainer/idle_ratio"] = aggregated["timing_s/gen"] / aggregated["timing_s/step"]
+
+        # Token-weighted KV cache hit rate across all aggregated trainer steps.
+        if (
+            "fully_async/kv_cache/cached_tokens_total" in aggregated
+            and "fully_async/kv_cache/prompt_tokens_total" in aggregated
+        ):
+            prompt_tokens = aggregated["fully_async/kv_cache/prompt_tokens_total"]
+            aggregated["fully_async/kv_cache/global_hit_rate"] = (
+                aggregated["fully_async/kv_cache/cached_tokens_total"] / prompt_tokens if prompt_tokens > 0 else 0.0
+            )
 
         return aggregated
 

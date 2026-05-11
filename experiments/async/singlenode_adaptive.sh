@@ -5,7 +5,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --environment=async
-#SBATCH --time=04:00:00
+#SBATCH --time=01:00:00
 #SBATCH --output=slurm_logs/%x_%j.out
 #SBATCH --error=slurm_logs/%x_%j.err
 
@@ -26,6 +26,12 @@ CONFIG_NAME=async
 ROLLOUT_N=8
 SEED=42
 
+ADAPTIVE_MIN_POSITIVE_SAMPLES=1
+ADAPTIVE_MIN_NEGATIVE_SAMPLES=1
+ADAPTIVE_MAX_ROUNDS=8
+ADAPTIVE_METRIC=acc
+ADAPTIVE_POSITIVE_THRESHOLD=0.5
+
 TRAIN_FILE=${DATA_DIR}/train.parquet
 TEST_FILE=${DATA_DIR}/test.parquet
 OUTPUT_ROOT=${WORKING_DIR}/outputs/${PROJECT_NAME}
@@ -37,7 +43,7 @@ resolve_run_name() {
   local date_time
   date_time="$(date +'%Y%m%dT%H%M%S')"
   if [ -z "${RUN_NAME}" ]; then
-    RUN_NAME="${PROJECT_NAME}__${model_tag}__DAPO__seed${SEED}__${date_time}"
+    RUN_NAME="${PROJECT_NAME}__${model_tag}__AdaGS__seed${SEED}__${date_time}"
   fi
   RUN_DIR="${OUTPUT_ROOT}/${RUN_NAME}"
   mkdir -p "${RUN_DIR}"
@@ -68,7 +74,17 @@ build_overrides() {
     "rollout.total_rollout_steps=128000"
     "async_training.trigger_parameter_sync_step=1"
     "hydra.run.dir=${RUN_DIR}"
-    "algorithm.filter_groups.enable=true"
+    "algorithm.filter_groups.enable=false"
+    "algorithm.adaptive_group_sampling.enable=true"
+    "algorithm.adaptive_group_sampling.min_positive_samples=${ADAPTIVE_MIN_POSITIVE_SAMPLES}"
+    "algorithm.adaptive_group_sampling.min_negative_samples=${ADAPTIVE_MIN_NEGATIVE_SAMPLES}"
+    "algorithm.adaptive_group_sampling.max_rounds=${ADAPTIVE_MAX_ROUNDS}"
+    "algorithm.adaptive_group_sampling.metric=${ADAPTIVE_METRIC}"
+    "algorithm.adaptive_group_sampling.positive_threshold=${ADAPTIVE_POSITIVE_THRESHOLD}"
+    "algorithm.adaptive_group_sampling.apply_downsampling=false"
+    "algorithm.adaptive_group_sampling.apply_inverse_pass_rate_weight=false"
+    "algorithm.adaptive_group_sampling.apply_prompt_inverse_group_weight=false"
+    "algorithm.adaptive_group_sampling.apply_within_prompt_mass_balance=false"
     "hydra.output_subdir=.hydra"
     "actor_rollout_ref.actor.data_loader_seed=${SEED}"
     "async_training.partial_rollout=true"

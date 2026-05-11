@@ -114,6 +114,9 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         self.require_batches = config.async_training.require_batches
         self.required_samples = config.actor_rollout_ref.actor.ppo_mini_batch_size * self.require_batches
         self.compute_prox_log_prob = self.config.async_training.compute_prox_log_prob
+        self.adaptive_group_sampling_cfg = self._get_async_adaptive_group_sampling_config()
+        self._validate_async_adaptive_group_sampling_config(self.adaptive_group_sampling_cfg)
+        self.adaptive_group_sampling_enabled = bool(self.adaptive_group_sampling_cfg["enable"])
         total_gpus = (
             config.trainer.nnodes * config.trainer.n_gpus_per_node
             + config.rollout.nnodes * config.rollout.n_gpus_per_node
@@ -218,7 +221,7 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
 
         queue_samples = [ray.cloudpickle.loads(x) for x in queue_samples]
         # Assemble batch - now working directly with RolloutSample objects
-        if self.config.trainer.balance_batch:
+        if self.config.trainer.balance_batch and not self.adaptive_group_sampling_enabled:
             batch = assemble_batch_from_rollout_samples(queue_samples, self.tokenizer, self.config, self._balance_batch)
         else:
             batch = assemble_batch_from_rollout_samples(queue_samples, self.tokenizer, self.config, None)

@@ -21,7 +21,7 @@ data:
   train_batch_size: 0
   gen_batch_size: 1
   max_prompt_length: 1024
-  max_response_length: 2048
+  max_response_length: 4096
   truncation: left
 
 async_training:

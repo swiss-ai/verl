@@ -17,6 +17,7 @@ import functools
 import multiprocessing
 import os
 import time
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from pprint import pformat
 
@@ -28,11 +29,13 @@ from ray import ObjectRef
 from verl.experimental.fully_async_policy.detach_utils import (
     RolloutSample,
     ValidateMetrics,
+    attach_adaptive_group_stats,
     prepare_single_generation_data,
 )
 from verl.experimental.fully_async_policy.message_queue import MessageQueueClient
 from verl.experimental.fully_async_policy.ray_trainer import FullyAsyncRayPPOTrainer
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
+from verl.trainer.ppo.adaptive_rl_utils import extract_reward_extra_info_row
 from verl.trainer.ppo.ray_trainer import ResourcePoolManager
 from verl.trainer.ppo.reward import compute_reward, load_reward_manager
 from verl.trainer.ppo.utils import Role, WorkerType
@@ -153,6 +156,9 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         self.dropped_stale_samples = 0
         self.filter_group_evaluated_samples = 0
         self.dropped_filter_group_samples = 0
+        self.adaptive_group_started_prompts = 0
+        self.adaptive_group_dropped_prompts = 0
+        self.adaptive_group_total_rollouts = 0
         self.processed_sample_count = 0
         # we start from step 1
         self.global_steps = 1
@@ -184,6 +190,10 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         self._validate_filter_groups_config(self.filter_groups_cfg)
         self.filter_groups_enabled = bool(self.filter_groups_cfg["enable"])
         self.filter_groups_metric = self.filter_groups_cfg["metric"]
+        self.adaptive_group_sampling_cfg = self._get_async_adaptive_group_sampling_config()
+        self._validate_async_adaptive_group_sampling_config(self.adaptive_group_sampling_cfg)
+        self.adaptive_group_sampling_enabled = bool(self.adaptive_group_sampling_cfg["enable"])
+        self.adaptive_group_sampling_metric = self.adaptive_group_sampling_cfg["metric"]
 
     def _init_async_objects(self):
         # Initialize asyncio synchronization primitives.
@@ -557,8 +567,11 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                         done_tasks, self.active_tasks = await asyncio.wait(
                             self.active_tasks, return_when=asyncio.FIRST_COMPLETED
                         )
-                    for task in done_tasks:
-                        await task
+                        for task in done_tasks:
+                            await task
+
+            if self.adaptive_group_sampling_enabled and not simple_from_cancel_queue:
+                self.adaptive_group_started_prompts += 1
 
             # Submit single sample processing
             async with self.lock:
@@ -577,38 +590,49 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             else:
                 self.pending_queue.task_done()
 
-    async def _compute_reward_for_rollout_sample(self, rollout_sample: RolloutSample) -> tuple[torch.Tensor, dict]:
+    async def _compute_reward_for_batch(self, batch) -> tuple[torch.Tensor, dict]:
         loop = asyncio.get_running_loop()
         reward_tensor, reward_extra_infos_dict = await loop.run_in_executor(
             self.reward_executor,
-            functools.partial(compute_reward, rollout_sample.full_batch, self.reward_fn),
+            functools.partial(compute_reward, batch, self.reward_fn),
         )
+        batch.batch["token_level_scores"] = reward_tensor
+        return reward_tensor, reward_extra_infos_dict
+
+    async def _compute_reward_for_rollout_sample(self, rollout_sample: RolloutSample) -> tuple[torch.Tensor, dict]:
+        reward_tensor, reward_extra_infos_dict = await self._compute_reward_for_batch(rollout_sample.full_batch)
         rollout_sample.full_batch.batch["token_level_scores"] = reward_tensor
         rollout_sample.reward_extra_info = reward_extra_infos_dict
         return reward_tensor, reward_extra_infos_dict
 
-    def _get_filter_group_metric_values(
-        self, rollout_sample: RolloutSample, reward_tensor: torch.Tensor, reward_extra_infos_dict: dict
+    def _get_metric_values(
+        self,
+        batch,
+        reward_tensor: torch.Tensor,
+        reward_extra_infos_dict: dict,
+        metric_name: str,
     ) -> np.ndarray:
-        metric_name = self.filter_groups_metric
         if metric_name in ("seq_reward", "seq_final_reward"):
             metric_values = reward_tensor.sum(dim=-1).detach().cpu().numpy()
         elif metric_name in reward_extra_infos_dict:
             metric_values = np.asarray(reward_extra_infos_dict[metric_name], dtype=object)
-        elif metric_name in rollout_sample.full_batch.non_tensor_batch:
-            metric_values = np.asarray(rollout_sample.full_batch.non_tensor_batch[metric_name], dtype=object)
+        elif metric_name in batch.batch.keys():
+            metric_values = batch.batch[metric_name].detach().cpu().numpy()
+        elif metric_name in batch.non_tensor_batch:
+            metric_values = np.asarray(batch.non_tensor_batch[metric_name], dtype=object)
         else:
             raise KeyError(
-                f"Filter metric '{metric_name}' not found in reward extra info or rollout sample. "
-                "Expected one of reward extra-info keys or seq_reward/seq_final_reward."
+                f"Metric '{metric_name}' not found. "
+                "Expected one of reward extra-info keys, batch keys, non-tensor batch keys, "
+                "or seq_reward/seq_final_reward."
             )
 
         if metric_values.ndim == 0:
             metric_values = metric_values.reshape(1)
-        if metric_values.shape[0] != len(rollout_sample.full_batch):
+        if metric_values.shape[0] != len(batch):
             raise ValueError(
-                "Filter metric length mismatch during fully async filter-groups sampling: "
-                f"metric={metric_name}, value_len={metric_values.shape[0]}, sample_len={len(rollout_sample.full_batch)}"
+                f"Metric length mismatch: metric={metric_name}, value_len={metric_values.shape[0]}, "
+                f"sample_len={len(batch)}"
             )
 
         try:
@@ -621,10 +645,11 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             return True
 
         reward_tensor, reward_extra_infos_dict = await self._compute_reward_for_rollout_sample(rollout_sample)
-        metric_values = self._get_filter_group_metric_values(
-            rollout_sample=rollout_sample,
+        metric_values = self._get_metric_values(
+            batch=rollout_sample.full_batch,
             reward_tensor=reward_tensor,
             reward_extra_infos_dict=reward_extra_infos_dict,
+            metric_name=self.filter_groups_metric,
         )
         metric_variance = float(np.var(metric_values))
         self.filter_group_evaluated_samples += 1
@@ -642,8 +667,142 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 )
         return should_enqueue
 
+    def _init_adaptive_state(self, rollout_sample: RolloutSample) -> dict:
+        """Create or reuse cached per-prompt adaptive sampling state."""
+        if rollout_sample.adaptive_state is None:
+            rollout_sample.adaptive_state = {
+                "rounds": 0,
+                "pos": 0,
+                "neg": 0,
+                "cached_batches": [],
+                "reward_extra_info": defaultdict(list),
+                "sequence_scores": [],
+            }
+        return rollout_sample.adaptive_state
+
+    async def _record_adaptive_round(self, rollout_sample: RolloutSample, round_batch) -> dict:
+        """Score one adaptive round and append it to the prompt cache."""
+        state = self._init_adaptive_state(rollout_sample)
+        prompt_uid = f"uid_{rollout_sample.sample_id}"
+        round_batch.non_tensor_batch["uid"] = np.array([prompt_uid] * len(round_batch), dtype=object)
+
+        reward_tensor, reward_extra_infos_dict = await self._compute_reward_for_batch(round_batch)
+        metric_values = self._get_metric_values(
+            batch=round_batch,
+            reward_tensor=reward_tensor,
+            reward_extra_infos_dict=reward_extra_infos_dict,
+            metric_name=self.adaptive_group_sampling_metric,
+        )
+        positive_mask = metric_values > float(self.adaptive_group_sampling_cfg["positive_threshold"])
+        pos_count = int(np.sum(positive_mask))
+        neg_count = int(len(metric_values) - pos_count)
+
+        state["rounds"] += 1
+        state["pos"] += pos_count
+        state["neg"] += neg_count
+        state["cached_batches"].append(round_batch)
+        state["sequence_scores"].extend(reward_tensor.sum(dim=-1).detach().cpu().tolist())
+
+        reward_extra_info = state["reward_extra_info"]
+        round_batch_size = len(round_batch)
+        for sample_idx in range(round_batch_size):
+            sample_extra = extract_reward_extra_info_row(reward_extra_infos_dict, sample_idx, round_batch_size)
+            for key, value in sample_extra.items():
+                reward_extra_info[key].append(value)
+
+        return state
+
+    def _finalize_adaptive_rollout_sample(self, rollout_sample: RolloutSample, state: dict) -> RolloutSample:
+        """Materialize cached rounds into one variable-size prompt group."""
+        if not state["cached_batches"]:
+            raise ValueError("Adaptive group sampling cannot finalize an empty rollout cache.")
+
+        full_batch = state["cached_batches"][0]
+        if len(state["cached_batches"]) > 1:
+            full_batch = type(full_batch).concat(state["cached_batches"])
+
+        attach_adaptive_group_stats(
+            batch=full_batch,
+            sequence_scores=state["sequence_scores"],
+            positive_count=int(state["pos"]),
+            negative_count=int(state["neg"]),
+        )
+
+        rollout_sample.full_batch = full_batch
+        rollout_sample.reward_extra_info = dict(state["reward_extra_info"])
+        rollout_sample.agent_loop_output_list = []
+        rollout_sample.adaptive_state = {
+            "rounds": int(state["rounds"]),
+            "trajectories": len(full_batch),
+        }
+        return rollout_sample
+
+    async def _enqueue_rollout_sample(self, rollout_sample: RolloutSample) -> bool:
+        rollout_sample.param_version = self.current_param_version
+        rollout_sample.rollout_status = await self.get_statistics()
+        success = await self.message_queue_client.put_sample(
+            sample=ray.cloudpickle.dumps(rollout_sample),
+            param_version=rollout_sample.param_version,
+        )
+        if success:
+            self.total_generated_samples += 1
+        else:
+            self.dropped_stale_samples += 1
+        return success
+
+    async def _process_adaptive_single_sample_streaming(self, rollout_sample: RolloutSample):
+        """Process one prompt with adaptive multi-round grouped sampling."""
+        state = self._init_adaptive_state(rollout_sample)
+        max_rounds = int(self.adaptive_group_sampling_cfg["max_rounds"])
+        min_positive_samples = int(self.adaptive_group_sampling_cfg["min_positive_samples"])
+        min_negative_samples = int(self.adaptive_group_sampling_cfg["min_negative_samples"])
+        round_rollouts = int(self.config.actor_rollout_ref.rollout.n)
+
+        while True:
+            rollout_sample.full_batch.non_tensor_batch["param_version"] = [self.current_param_version] * len(
+                rollout_sample.full_batch
+            )
+            ret, is_cancel = await self.async_rollout_manager.generate_single_sample_async(
+                rollout_sample.full_batch, rollout_sample.agent_loop_output_list
+            )
+            if is_cancel:
+                rollout_sample.agent_loop_output_list = ret
+                await self.cancel_queue.put(rollout_sample)
+                self.processed_sample_count += 1
+                return
+
+            rollout_sample.agent_loop_output_list = [None] * round_rollouts
+            state = await self._record_adaptive_round(rollout_sample, ret)
+            self.adaptive_group_total_rollouts += len(ret)
+
+            meets_criteria = state["pos"] >= min_positive_samples and state["neg"] >= min_negative_samples
+            reached_budget = state["rounds"] >= max_rounds
+
+            if meets_criteria:
+                rollout_sample = self._finalize_adaptive_rollout_sample(rollout_sample, state)
+                await self._enqueue_rollout_sample(rollout_sample)
+                self.processed_sample_count += 1
+                return
+
+            if reached_budget:
+                self.adaptive_group_dropped_prompts += 1
+                self.staleness_samples = max(self.staleness_samples - 1, 0)
+                if self.adaptive_group_dropped_prompts % 100 == 0:
+                    print(
+                        "[FullyAsyncRollouter][AdaptiveGroupSampling] "
+                        f"dropped_prompts={self.adaptive_group_dropped_prompts}, "
+                        f"rounds={state['rounds']}, pos={state['pos']}, neg={state['neg']}, "
+                        f"metric={self.adaptive_group_sampling_metric}"
+                    )
+                self.processed_sample_count += 1
+                return
+
     async def _process_single_sample_streaming(self, rollout_sample: RolloutSample):
         """Process a single sample streamingly"""
+        if self.adaptive_group_sampling_enabled:
+            await self._process_adaptive_single_sample_streaming(rollout_sample)
+            return
+
         # Calling asynchronous generation methods
         rollout_sample.full_batch.non_tensor_batch["param_version"] = [self.current_param_version] * len(
             rollout_sample.full_batch
@@ -661,18 +820,8 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 self.processed_sample_count += 1
                 return
 
-            rollout_sample.param_version = self.current_param_version
-            rollout_sample.rollout_status = await self.get_statistics()
             rollout_sample.agent_loop_output_list = []
-
-            success = await self.message_queue_client.put_sample(
-                sample=ray.cloudpickle.dumps(rollout_sample),
-                param_version=rollout_sample.param_version,
-            )
-            if success:
-                self.total_generated_samples += 1
-            else:
-                self.dropped_stale_samples += 1
+            await self._enqueue_rollout_sample(rollout_sample)
         else:
             rollout_sample.agent_loop_output_list = ret
             await self.cancel_queue.put(rollout_sample)
@@ -872,9 +1021,9 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             "count/dropped_stale_samples": self.dropped_stale_samples,
             "count/filter_group_evaluated_samples": self.filter_group_evaluated_samples,
             "count/dropped_filter_group_samples": self.dropped_filter_group_samples,
-            "count/filter_group_drop_ratio": self.dropped_filter_group_samples
-            / max(self.filter_group_evaluated_samples, 1),
-            "filter_groups/enabled": int(self.filter_groups_enabled),
+            "adaptive_group_sampling/started_prompts_total": self.adaptive_group_started_prompts,
+            "adaptive_group_sampling/dropped_prompts_total": self.adaptive_group_dropped_prompts,
+            "adaptive_group_sampling/sampled_rollouts_total": self.adaptive_group_total_rollouts,
             # static stats
             "static/max_required_samples": self.max_required_samples,
             "static/required_samples": self.required_samples,

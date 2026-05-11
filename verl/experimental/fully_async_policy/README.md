@@ -260,17 +260,34 @@ https://github.com/ArronHZG/verl-community/blob/main/docs/fully_async_policy_mod
 
 ### Key Metrics
 
-| metrics                                        | implication                                                                                            |
-|------------------------------------------------|--------------------------------------------------------------------------------------------------------|
-| `trainer/idle_ratio`                           | Trainer idle rate                                                                                      |
-| `rollouter/idle_ratio`                         | Rollouter idle rate                                                                                    |
-| `fully_async/count/stale_samples_processed`    | Total number of old samples used in training                                                           |
-| `fully_async/count/stale_trajectory_processed` | Total number of old trajectories used in training (one sample produces rollout.n trajectories)         |
-| `fully_async/partial/total_partial_num`        | Number of partial samples processed by Trainer between two trigger_parameter_sync_step                 |
-| `fully_async/partial/partial_ratio`            | Ratio of partial samples processed by Trainer between two trigger_parameter_sync_step                  |
-| `fully_async/partial/max_partial_span`         | Maximum parameter span of partial samples processed by Trainer between two trigger_parameter_sync_step |
-| `fully_async/kv_cache/hit_rate_mean`           | Mean SGLang prefix/KV cache hit rate reported by partial rollout requests                             |
-| `fully_async/kv_cache/resumed_hit_rate_mean`   | Mean SGLang prefix/KV cache hit rate for resumed partial rollout requests                             |
+| metrics                                                              | implication                                                                                                                                             |
+|----------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `trainer/idle_ratio`                                                 | Trainer idle rate                                                                                                                                       |
+| `rollouter/idle_ratio`                                               | Rollouter idle rate                                                                                                                                     |
+| `fully_async/count/total_generated_samples`                          | Latest cumulative number of prompt groups successfully enqueued by the Rollouter for training                                                           |
+| `fully_async/count/staleness_samples`                                | Latest Rollouter-side staleness/in-flight sample gauge used by freshness control                                                                        |
+| `fully_async/count/stale_samples_processed`                          | Cumulative number of stale prompt groups consumed by Trainer training batches                                                                           |
+| `fully_async/count/stale_trajectory_processed`                       | Cumulative number of stale trajectories consumed by Trainer training batches                                                                            |
+| `fully_async/count/filter_group_evaluated_samples`                   | Latest cumulative number of prompt groups whose completed rollouts had reward/filter metric variance computed by async filter-groups sampling           |
+| `fully_async/count/dropped_filter_group_samples`                     | Latest cumulative number of prompt groups dropped by async filter-groups sampling because the configured reward/filter metric had zero variance         |
+| `fully_async/partial/total_partial_num`                              | Number of partial training samples in the logged Trainer interval; dropped adaptive prompt groups are not included                                      |
+| `fully_async/partial/partial_ratio`                                  | Ratio of partial training samples in the logged Trainer interval; dropped adaptive prompt groups are not included                                       |
+| `fully_async/partial/max_partial_span`                               | Maximum parameter span of partial training samples in the logged Trainer interval; dropped adaptive prompt groups are not included                      |
+| `fully_async/kv_cache/hit_rate_mean`                                 | Mean per-request SGLang prefix/KV cache hit rate reported by partial rollout requests                                                                   |
+| `fully_async/kv_cache/resumed_hit_rate_mean`                         | Mean per-request SGLang prefix/KV cache hit rate for resumed partial rollout requests                                                                   |
+| `fully_async/kv_cache/cached_tokens_total`                           | Total number of prompt tokens reported by SGLang as already present in prefix/KV cache for the logged trainer interval                                  |
+| `fully_async/kv_cache/prompt_tokens_total`                           | Total number of prompt tokens sent to SGLang requests for the logged trainer interval                                                                   |
+| `fully_async/kv_cache/global_hit_rate`                               | Token-weighted cache hit rate, recomputed as `cached_tokens_total / prompt_tokens_total` after metric aggregation                                       |
+| `fully_async/adaptive_group_sampling/batch_mean_rounds`              | Mean number of adaptive sampling rounds for adaptive prompt groups included in Trainer training batches; dropped prompt groups are not included         |
+| `fully_async/adaptive_group_sampling/batch_mean_trajectories`        | Mean number of trajectories for adaptive prompt groups included in Trainer training batches; dropped prompt groups are not included                     |
+| `fully_async/adaptive_group_sampling/started_prompts_total`          | Latest cumulative number of prompt groups for which adaptive generation was started, including prompt groups that were later dropped                     |
+| `fully_async/adaptive_group_sampling/dropped_prompts_total`          | Latest cumulative number of adaptive prompt groups stopped without enqueueing after reaching the maximum generation budget                              |
+| `fully_async/adaptive_group_sampling/sampled_rollouts_total`         | Latest cumulative number of individual trajectories sampled by adaptive group sampling, including trajectories from prompt groups later dropped          |
+
+Counters marked as "latest cumulative" are Rollouter-side snapshots attached to `RolloutSample`s. When a Trainer batch
+contains multiple samples, the newest snapshot in that batch is logged. Metrics described as training-sample or
+training-batch metrics are computed only from `RolloutSample`s that are actually included in the Trainer batch; adaptive
+prompt groups dropped before enqueueing do not contribute to those metrics.
 
 ### Parameter Tuning Recommendations
 
