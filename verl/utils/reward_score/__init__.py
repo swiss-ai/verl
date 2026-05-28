@@ -49,6 +49,7 @@ def default_compute_score(
         "lighteval/MATH",
         "DigitalLearningGmbH/MATH-lighteval",
         "HuggingFaceH4/MATH-500",
+        "SynthLabsAI/Big-Math-RL-Verified",
         "deepscaler",
         "math500",
         "amc23",
@@ -68,6 +69,14 @@ def default_compute_score(
 
         from . import math_verify
         res = math_verify.compute_score(solution_str, ground_truth)
+    elif data_source in ["mmlu", "gpqa_diamond", "gpqa", "Idavidrein/gpqa"]:
+        from . import multiple_choice
+
+        res = multiple_choice.compute_score(solution_str, ground_truth)
+    elif data_source in ["allenai/IF_multi_constraints_upto5"]:
+        from . import instruction_following
+
+        res = instruction_following.compute_score(solution_str, ground_truth, extra_info=extra_info)
     elif data_source in ["math_dapo", "math", "math_dapo_reasoning"] or data_source.startswith("aime"):
         from . import math_dapo
 

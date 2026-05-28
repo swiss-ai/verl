@@ -46,7 +46,9 @@ from verl.trainer.config import AlgoConfig
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
 from verl.trainer.ppo.metric_utils import (
+    aggregate_generation_sample_metrics,
     compute_data_metrics,
+    compute_generation_sample_metrics,
     compute_throughout_metrics,
     compute_timing_metrics,
     compute_variance_proxy_metrics,
@@ -430,7 +432,7 @@ class RayPPOTrainer:
         except Exception as e:
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
 
-    def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
+    def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path, extra_fields=None):
         """Dump rollout/validation samples as JSONL."""
         os.makedirs(dump_path, exist_ok=True)
         filename = os.path.join(dump_path, f"{self.global_steps}.jsonl")
@@ -447,10 +449,21 @@ class RayPPOTrainer:
         for k, v in reward_extra_infos_dict.items():
             if len(v) == n:
                 base_data[k] = v
+        if extra_fields is not None:
+            for k, v in extra_fields.items():
+                if len(v) == n:
+                    base_data[k] = v
+
+        def json_ready(value):
+            if isinstance(value, np.generic):
+                return value.item()
+            if isinstance(value, torch.Tensor) and value.numel() == 1:
+                return value.item()
+            return value
 
         lines = []
         for i in range(n):
-            entry = {k: v[i] for k, v in base_data.items()}
+            entry = {k: json_ready(v[i]) for k, v in base_data.items()}
             lines.append(json.dumps(entry, ensure_ascii=False))
 
         with open(filename, "w") as f:
@@ -587,6 +600,11 @@ class RayPPOTrainer:
 
         return gen_batch
 
+    def _prompt_thinking_start_tokens(self) -> set[str] | None:
+        if self.config.data.get("force_thinking_prefix", False):
+            return {self.config.data.get("thinking_prefix_token", "<|inner_prefix|>")}
+        return None
+
     def _get_filter_groups_config(self) -> dict[str, Any]:
         """Resolve filter-groups config from algorithm.filter_groups."""
         filter_cfg = self.config.algorithm.get("filter_groups", None) or {}
@@ -634,6 +652,9 @@ class RayPPOTrainer:
         sample_scores = []
         sample_turns = []
         sample_uids = []
+        sample_data_sources = []
+        sample_indices = []
+        generation_sample_metrics: dict[str, list[float]] = defaultdict(list)
 
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
@@ -692,12 +713,30 @@ class RayPPOTrainer:
 
             test_batch = test_batch.union(test_output_gen_batch)
             test_batch.meta_info["validate"] = True
+            if "response_mask" not in test_batch.batch.keys():
+                test_batch.batch["response_mask"] = compute_response_mask(test_batch)
+
+            batch_generation_sample_metrics = compute_generation_sample_metrics(
+                test_batch,
+                tokenizer=self.tokenizer,
+                prompt_thinking_start_tokens=self._prompt_thinking_start_tokens(),
+            )
+            for key, values in batch_generation_sample_metrics.items():
+                generation_sample_metrics[key].extend(values)
 
             # Store original inputs
             input_ids = test_batch.batch["prompts"]
             input_texts = [self.tokenizer.decode(ids, skip_special_tokens=False) for ids in input_ids]
             sample_inputs.extend(input_texts)
             sample_uids.extend(test_batch.non_tensor_batch["uid"])
+            batch_data_sources = np.asarray(
+                test_batch.non_tensor_batch.get("data_source", ["unknown"] * len(test_batch)), dtype=object
+            )
+            batch_indices = np.asarray(
+                test_batch.non_tensor_batch.get("index", [None] * len(test_batch)), dtype=object
+            )
+            sample_data_sources.extend(batch_data_sources.tolist())
+            sample_indices.extend(batch_indices.tolist())
 
             # evaluate using reward_function
             reward_tensor, reward_extra_info = self._compute_or_extract_reward(
@@ -719,13 +758,18 @@ class RayPPOTrainer:
             if "__num_turns__" in test_batch.non_tensor_batch:
                 sample_turns.append(test_batch.non_tensor_batch["__num_turns__"])
 
-            data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
+            data_source_lst.append(batch_data_sources)
 
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
 
         # dump generations
         val_data_dir = self.config.trainer.get("validation_data_dir", None)
         if val_data_dir:
+            generation_dump_fields = {
+                "data_source": sample_data_sources,
+                "index": sample_indices,
+                **generation_sample_metrics,
+            }
             self._dump_generations(
                 inputs=sample_inputs,
                 outputs=sample_outputs,
@@ -733,10 +777,13 @@ class RayPPOTrainer:
                 scores=sample_scores,
                 reward_extra_infos_dict=reward_extra_infos_dict,
                 dump_path=val_data_dir,
+                extra_fields=generation_dump_fields,
             )
 
         for key_info, lst in reward_extra_infos_dict.items():
             assert len(lst) == 0 or len(lst) == len(sample_scores), f"{key_info}: {len(lst)=}, {len(sample_scores)=}"
+        for key_info, lst in generation_sample_metrics.items():
+            assert len(lst) == len(sample_scores), f"{key_info}: {len(lst)=}, {len(sample_scores)=}"
 
         if merged:
             print("_merge_validation_results validate result will be merged")
@@ -745,11 +792,21 @@ class RayPPOTrainer:
                 "sample_uids": sample_uids,
                 "sample_turns": sample_turns,
                 "reward_extra_infos_dict": reward_extra_infos_dict,
+                "generation_sample_metrics": generation_sample_metrics,
             }
         data_sources = np.concatenate(data_source_lst, axis=0)
-        return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
+        return self._val_metrics_update(
+            data_sources, sample_uids, reward_extra_infos_dict, sample_turns, generation_sample_metrics
+        )
 
-    def _val_metrics_update(self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns):
+    def _val_metrics_update(
+        self,
+        data_sources,
+        sample_uids,
+        reward_extra_infos_dict,
+        sample_turns,
+        generation_sample_metrics=None,
+    ):
         data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
         metric_dict = {}
         for data_source, var2metric2val in data_src2var2metric2val.items():
@@ -774,15 +831,44 @@ class RayPPOTrainer:
             metric_dict["val-aux/num_turns/max"] = sample_turns.max()
             metric_dict["val-aux/num_turns/mean"] = sample_turns.mean()
 
+        if generation_sample_metrics:
+            data_sources = np.asarray(data_sources)
+            for data_source in np.unique(data_sources):
+                source_indices = np.where(data_sources == data_source)[0]
+                source_sample_metrics = {
+                    key: [values[idx] for idx in source_indices]
+                    for key, values in generation_sample_metrics.items()
+                    if len(values) == len(data_sources)
+                }
+                metric_dict.update(
+                    aggregate_generation_sample_metrics(
+                        source_sample_metrics,
+                        prefix=f"val-aux/{data_source}/generation/",
+                        include_response_length=True,
+                    )
+                )
+
         return metric_dict
 
     def _merge_validation_results(self, result_a, result_b):
         if result_a is None and result_b is None:
             return {}
         if result_a is None:
-            result_a = {"data_sources": [], "sample_uids": [], "sample_turns": [], "reward_extra_infos_dict": {}}
+            result_a = {
+                "data_sources": [],
+                "sample_uids": [],
+                "sample_turns": [],
+                "reward_extra_infos_dict": {},
+                "generation_sample_metrics": {},
+            }
         if result_b is None:
-            result_b = {"data_sources": [], "sample_uids": [], "sample_turns": [], "reward_extra_infos_dict": {}}
+            result_b = {
+                "data_sources": [],
+                "sample_uids": [],
+                "sample_turns": [],
+                "reward_extra_infos_dict": {},
+                "generation_sample_metrics": {},
+            }
 
         if not result_a.get("data_sources") and not result_b.get("data_sources"):
             return {}
@@ -798,7 +884,18 @@ class RayPPOTrainer:
             list_b = result_b["reward_extra_infos_dict"].get(key, [])
             reward_extra_infos_dict[key] = list_a + list_b
 
-        return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
+        generation_sample_metrics = {}
+        all_generation_keys = set(result_a.get("generation_sample_metrics", {}).keys()) | set(
+            result_b.get("generation_sample_metrics", {}).keys()
+        )
+        for key in all_generation_keys:
+            list_a = result_a.get("generation_sample_metrics", {}).get(key, [])
+            list_b = result_b.get("generation_sample_metrics", {}).get(key, [])
+            generation_sample_metrics[key] = list_a + list_b
+
+        return self._val_metrics_update(
+            data_sources, sample_uids, reward_extra_infos_dict, sample_turns, generation_sample_metrics
+        )
 
     def init_workers(self):
         """Initialize distributed training workers using Ray backend.
@@ -1697,6 +1794,19 @@ class RayPPOTrainer:
                     # but might affect the loss calculation (due to the change of mini-batching).
                     if self.config.trainer.balance_batch:
                         self._balance_batch(batch, metrics=metrics)
+
+                    generation_sample_metrics = compute_generation_sample_metrics(
+                        batch,
+                        tokenizer=self.tokenizer,
+                        prompt_thinking_start_tokens=self._prompt_thinking_start_tokens(),
+                    )
+                    metrics.update(
+                        aggregate_generation_sample_metrics(
+                            generation_sample_metrics,
+                            prefix="generation/",
+                            include_response_length=False,
+                        )
+                    )
 
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
