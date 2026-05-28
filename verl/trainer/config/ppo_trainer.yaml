@@ -119,6 +119,19 @@ algorithm:
     # Power used for weight scaling in "pow" method
     weight_pow: 2.0
 
+  # Dynamic sampling via prompt-group filtering (DAPO-style)
+  filter_groups:
+    _target_: verl.trainer.config.FilterGroupsConfig
+
+    # Whether to enable prompt-group filtering
+    enable: False
+
+    # Metric to filter on: "acc", "score", "seq_reward", "seq_final_reward", etc.
+    metric: acc
+
+    # Maximum generation batches to try per update. Non-positive means no upper limit
+    max_num_gen_batches: 0
+
 # config for the trainer
 trainer:
 

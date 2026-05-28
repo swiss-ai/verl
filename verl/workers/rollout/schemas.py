@@ -231,6 +231,10 @@ class AsyncRolloutRequest(BaseModel):
         tokenize: bool = False,
         return_dict: bool = False,
     ):
+        # Keep empty tool list from activating tool-call templates.
+        if not tools:
+            tools = None
+
         raw_prompt = processing_class.apply_chat_template(
             messages, tools=tools, add_generation_prompt=add_generation_prompt, tokenize=False
         )

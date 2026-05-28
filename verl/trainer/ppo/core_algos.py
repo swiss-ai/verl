@@ -18,7 +18,13 @@ The function implemented in this file should be used by trainer with different d
 implement PPO-like algorithms.
 """
 
-__all__ = ["register_adv_est", "get_adv_estimator_fn", "AdvantageEstimator"]
+__all__ = [
+    "register_adv_est",
+    "get_adv_estimator_fn",
+    "AdvantageEstimator",
+    "compute_maxrl_outcome_advantage",
+    "compute_f_grpo_outcome_advantage",
+]
 
 from collections import defaultdict
 from enum import Enum
@@ -101,6 +107,8 @@ class AdvantageEstimator(str, Enum):
     REMAX = "remax"
     RLOO = "rloo"
     OPO = "opo"
+    MAXRL = "maxrl"
+    F_GRPO = "f_grpo"
     GRPO_PASSK = "grpo_passk"
     GPG = "gpg"
     RLOO_VECTORIZED = "rloo_vectorized"
@@ -329,6 +337,66 @@ def compute_grpo_outcome_advantage(
 
     return scores, scores
 
+
+@register_adv_est(AdvantageEstimator.MAXRL)
+def compute_maxrl_outcome_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    epsilon: float = 1e-6,
+    norm_adv_by_std_in_grpo: bool = True,
+    config: Optional[AlgoConfig] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute MaxRL-style outcome advantages.
+
+    Match the reference MaxRL implementation:
+        A_i = (r_i - p_hat_g) / (p_hat_g + epsilon),
+    where p_hat_g is the empirical group mean reward.
+    """
+    del norm_adv_by_std_in_grpo, config
+
+    with torch.no_grad():
+        scores = token_level_rewards.sum(dim=-1)
+        g = as_torch_index(index, device=scores.device)
+        mean_g, _, _ = group_mean_std(scores, g, eps=epsilon, device=scores.device)
+        group_mean = mean_g[g]
+        scalar_advantages = (scores - group_mean) / (group_mean + epsilon)
+        advantages = scalar_advantages.unsqueeze(-1) * response_mask
+        return advantages, advantages
+
+
+@register_adv_est(AdvantageEstimator.F_GRPO)
+def compute_f_grpo_outcome_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    epsilon: float = 1e-6,
+    norm_adv_by_std_in_grpo: bool = True,
+    config: Optional[AlgoConfig] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute F-GRPO advantages by focal-scaling GRPO advantages.
+
+    Group focal weight:
+        w_g = (1 - p_hat_g)^gamma, where p_hat_g is the empirical group pass-rate.
+    """
+    gamma = 1.0 if config is None else float(config.get("fgrpo_gamma", config.get("f_grpo_gamma", 1.0)))
+    if gamma < 0:
+        raise ValueError(f"fgrpo_gamma must be non-negative, got {gamma}")
+
+    with torch.no_grad():
+        scores = token_level_rewards.sum(dim=-1)
+        g = as_torch_index(index, device=scores.device)
+        mean_g, std_g, _ = group_mean_std(scores, g, eps=epsilon, device=scores.device)
+
+        if norm_adv_by_std_in_grpo:
+            scalar_advantages = (scores - mean_g[g]) / (std_g[g] + epsilon)
+        else:
+            scalar_advantages = scores - mean_g[g]
+
+        focal_weight = torch.clamp(1.0 - mean_g[g], min=0.0) ** gamma
+        scalar_advantages = scalar_advantages * focal_weight
+        advantages = scalar_advantages.unsqueeze(-1) * response_mask
+        return advantages, advantages
 
 @register_adv_est(AdvantageEstimator.GRPO_VECTORIZED)
 def compute_grpo_vectorized_outcome_advantage(

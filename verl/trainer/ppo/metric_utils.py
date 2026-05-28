@@ -15,6 +15,7 @@
 Metrics related to the PPO trainer.
 """
 
+from collections.abc import Mapping
 from collections import defaultdict
 from functools import partial
 from typing import Any, Callable
@@ -221,6 +222,21 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         metrics["tool_call_counts/min"] = tool_call_counts.min()
         metrics["tool_call_counts/max"] = tool_call_counts.max()
         metrics["tool_call_counts/mean"] = tool_call_counts.mean()
+
+    # Group-level reward signal metric:
+    # empirical probability that a uid-group has non-zero variance in sequence reward.
+    non_tensor_batch = getattr(batch, "non_tensor_batch", None)
+    if isinstance(non_tensor_batch, Mapping) and ("uid" in non_tensor_batch):
+        uids = np.asarray(non_tensor_batch["uid"])
+        if uids.shape[0] == sequence_reward.shape[0]:
+            sequence_reward_np = sequence_reward.detach().float().cpu().numpy()
+            uid2rewards: dict[Any, list[float]] = defaultdict(list)
+            for uid, reward in zip(uids.tolist(), sequence_reward_np.tolist(), strict=True):
+                uid2rewards[uid].append(float(reward))
+
+            non_zero_var_flags = [float(np.var(group_rewards) > 1e-12) for group_rewards in uid2rewards.values()]
+            if non_zero_var_flags:
+                metrics["critic/non_zero_reward_var"] = float(np.mean(non_zero_var_flags))
 
     return metrics
 

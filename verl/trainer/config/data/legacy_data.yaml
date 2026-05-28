@@ -129,3 +129,9 @@ datagen:
 
 # Additional kwargs when calling tokenizer.apply_chat_template
 apply_chat_template_kwargs: {}
+
+# Whether to append the thinking prefix token to rollout prompts after applying the chat template.
+force_thinking_prefix: False
+
+# Token appended when force_thinking_prefix is enabled.
+thinking_prefix_token: <|inner_prefix|>

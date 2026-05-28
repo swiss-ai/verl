@@ -138,6 +138,11 @@ algorithm:
   pf_ppo:
     reweight_method: pow # ["pow", "max_min", "max_random"]
     weight_pow: 2.0
+  filter_groups:
+    _target_: verl.trainer.config.FilterGroupsConfig
+    enable: False
+    metric: acc
+    max_num_gen_batches: 0
 
 trainer:
   balance_batch: True

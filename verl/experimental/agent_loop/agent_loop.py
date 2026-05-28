@@ -220,6 +220,9 @@ class AgentLoopBase(ABC):
         self.dataset_cls = dataset_cls
         self.dataset_config = dataset_config.config
         self.apply_chat_template_kwargs = self.dataset_config.get("apply_chat_template_kwargs", {})
+        self.force_thinking_prefix = bool(self.dataset_config.get("force_thinking_prefix", False))
+        self.thinking_prefix_token = self.dataset_config.get("thinking_prefix_token", "<|inner_prefix|>")
+        self.thinking_prefix_token_ids = self.tokenizer.encode(self.thinking_prefix_token, add_special_tokens=False)
         self.system_prompt = initialize_system_prompt(self.tokenizer, **self.apply_chat_template_kwargs)
         self.loop = get_event_loop()
 
@@ -264,6 +267,11 @@ class AgentLoopBase(ABC):
         Returns:
             list[int]: Prompt token ids.
         """
+        # Some chat templates (e.g., Llama tool-use templates) switch into function-calling
+        # mode when `tools` is present, even if it's an empty list. Treat empty list as no tools.
+        if not tools:
+            tools = None
+
         if self.processor is not None:
             raw_prompt = await self.loop.run_in_executor(
                 None,
@@ -306,6 +314,8 @@ class AgentLoopBase(ABC):
 
         if remove_system_prompt:
             prompt_ids = prompt_ids[len(self.system_prompt) :]
+        elif self.force_thinking_prefix:
+            prompt_ids = prompt_ids + self.thinking_prefix_token_ids
 
         return prompt_ids
 
@@ -521,6 +531,27 @@ class AgentLoopWorker:
     async def _agent_loop_postprocess(self, output, **kwargs) -> _InternalAgentLoopOutput:
         """Perform post-processing operations on the output of each individual agent loop."""
         output.extra_fields["raw_prompt"] = kwargs["raw_prompt"]
+        prompt_max_len = self.config.actor_rollout_ref.rollout.prompt_length
+        response_max_len = self.config.actor_rollout_ref.rollout.response_length
+
+        prompt_ids = output.prompt_ids[-prompt_max_len:]
+        response_ids = output.response_ids[:response_max_len]
+        response_mask = output.response_mask[:response_max_len]
+        if output.response_logprobs is not None:
+            output.response_logprobs = output.response_logprobs[:response_max_len]
+        if isinstance(prompt_ids, torch.Tensor | np.ndarray):
+            prompt_ids = prompt_ids.tolist()
+        if isinstance(response_ids, torch.Tensor | np.ndarray):
+            response_ids = response_ids.tolist()
+        if isinstance(response_mask, torch.Tensor | np.ndarray):
+            response_mask = response_mask.tolist()
+        if len(response_ids) == 0:
+            logger.warning(
+                "Degenerate rollout sample with empty response_ids detected "
+                "(uid=%s, num_turns=%s). Padding-only response will be produced.",
+                kwargs.get("uid", "unknown"),
+                output.num_turns,
+            )
 
         # Some AgentLoop may have already computed the reward score, e.g SWE-agent.
 
@@ -545,41 +576,33 @@ class AgentLoopWorker:
         # TODO(wuxibin): remove padding and use tensordict.
         self.tokenizer.padding_side = "left"
         prompt_output = self.tokenizer.pad(
-            {"input_ids": output.prompt_ids},
+            {"input_ids": [prompt_ids]},
             padding="max_length",
-            max_length=self.config.actor_rollout_ref.rollout.prompt_length,
+            max_length=prompt_max_len,
             return_tensors="pt",
             return_attention_mask=True,
         )
-        if prompt_output["input_ids"].dim() == 1:
-            prompt_output["input_ids"] = prompt_output["input_ids"].unsqueeze(0)
-            prompt_output["attention_mask"] = prompt_output["attention_mask"].unsqueeze(0)
 
         self.tokenizer.padding_side = "right"
         response_output = self.tokenizer.pad(
-            {"input_ids": output.response_ids},
+            {"input_ids": [response_ids]},
             padding="max_length",
-            max_length=self.config.actor_rollout_ref.rollout.response_length,
+            max_length=response_max_len,
             return_tensors="pt",
             return_attention_mask=True,
         )
-        if response_output["input_ids"].dim() == 1:
-            response_output["input_ids"] = response_output["input_ids"].unsqueeze(0)
-            response_output["attention_mask"] = response_output["attention_mask"].unsqueeze(0)
 
         response_mask_output = self.tokenizer.pad(
-            {"input_ids": output.response_mask},
+            {"input_ids": [response_mask]},
             padding="max_length",
-            max_length=self.config.actor_rollout_ref.rollout.response_length,
+            max_length=response_max_len,
             return_tensors="pt",
             return_attention_mask=False,
         )
-        if response_mask_output["input_ids"].dim() == 1:
-            response_mask_output["input_ids"] = response_mask_output["input_ids"].unsqueeze(0)
 
         response_logprobs = None
         if output.response_logprobs is not None:
-            pad_size = self.config.actor_rollout_ref.rollout.response_length - len(output.response_logprobs)
+            pad_size = response_max_len - len(output.response_logprobs)
             response_logprobs = torch.tensor(output.response_logprobs + [0.0] * pad_size).unsqueeze(0)
 
         response_mask = response_mask_output["input_ids"] * response_output["attention_mask"]
@@ -599,7 +622,7 @@ class AgentLoopWorker:
             routed_experts = torch.zeros(1, total_length, layer_num, topk_num, dtype=experts_tensor.dtype)
 
             # Calculate start position: left padding means original prompt starts at the end
-            start_pos = prompt_output["input_ids"].shape[1] - len(output.prompt_ids)
+            start_pos = prompt_output["input_ids"].shape[1] - len(prompt_ids)
             end_pos = min(start_pos + length, total_length)
 
             # Add boundary checks for robustness
