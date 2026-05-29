@@ -68,16 +68,28 @@ def default_compute_score(
         # To use it, override the `compute_score` function with the following implementation:
 
         from . import math_verify
+
         res = math_verify.compute_score(solution_str, ground_truth)
     elif data_source in ["mmlu", "gpqa_diamond", "gpqa", "Idavidrein/gpqa"]:
         from . import multiple_choice
 
         res = multiple_choice.compute_score(solution_str, ground_truth)
-    elif data_source in ["allenai/IF_multi_constraints_upto5"]:
+    elif data_source in [
+        "allenai/IF_multi_constraints_upto5",
+        "swiss-ai/if-rl-singleturn-prompts",
+        "google/IFEval",
+        "allenai/IFBench_test",
+    ]:
         from . import instruction_following
 
-        res = instruction_following.compute_score(solution_str, ground_truth, extra_info=extra_info)
-    elif data_source in ["math_dapo", "math", "math_dapo_reasoning"] or data_source.startswith("aime"):
+        res = instruction_following.compute_score(
+            solution_str, ground_truth, extra_info=extra_info
+        )
+    elif data_source in [
+        "math_dapo",
+        "math",
+        "math_dapo_reasoning",
+    ] or data_source.startswith("aime"):
         from . import math_dapo
 
         res = math_dapo.compute_score(solution_str, ground_truth)
@@ -106,7 +118,12 @@ def default_compute_score(
 
             # Pass the URL directly, ground_truth likely contains test cases here
             res = sandbox_fusion.compute_score(
-                sandbox_fusion_url, concurrent_semaphore, memory_limit_mb, solution_str, ground_truth, continuous=True
+                sandbox_fusion_url,
+                concurrent_semaphore,
+                memory_limit_mb,
+                solution_str,
+                ground_truth,
+                continuous=True,
             )
         else:
             # If no sandbox URL is provided, fall back to prime_code or raise error
@@ -132,7 +149,9 @@ def default_compute_score(
         res = search_r1_like_qa_em.compute_score(solution_str, ground_truth)
 
     else:
-        raise NotImplementedError(f"Reward function is not implemented for {data_source=}")
+        raise NotImplementedError(
+            f"Reward function is not implemented for {data_source=}"
+        )
 
     if isinstance(res, dict):
         return res
@@ -156,7 +175,13 @@ def _default_compute_score(
     Legacy function API to be deprecated. Please use `default_compute_score` instead.
     """
     return default_compute_score(
-        data_source, solution_str, ground_truth, extra_info, sandbox_fusion_url, concurrent_semaphore, memory_limit_mb
+        data_source,
+        solution_str,
+        ground_truth,
+        extra_info,
+        sandbox_fusion_url,
+        concurrent_semaphore,
+        memory_limit_mb,
     )
 
 

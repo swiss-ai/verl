@@ -197,7 +197,26 @@ EVAL_DATASETS = [
         prompt_key="entry_point",
         sample_size=None,
     ),
-    # IF BENCH
+    DatasetConfig(
+        enabled=True,
+        name="ifeval",
+        dataset_id="google/IFEval",
+        split="train",
+        adapter="if_eval",
+        data_source="google/IFEval",
+        prompt_key="prompt",
+        sample_size=None,
+    ),
+    DatasetConfig(
+        enabled=True,
+        name="ifbench",
+        dataset_id="allenai/IFBench_test",
+        split="train",
+        adapter="if_eval",
+        data_source="allenai/IFBench_test",
+        prompt_key="prompt",
+        sample_size=None,
+    ),
 ]
 
 ADAPTERS: dict[
@@ -424,6 +443,36 @@ def adapt_if_placeholder(
         prompt=prompt,
         ability="instruction_following",
         ground_truth=ground_truth,
+        extra_info=extra_info,
+    )
+
+
+@register_adapter("if_eval")
+def adapt_if_eval(
+    example: dict[str, Any], idx: int, split: str, config: DatasetConfig
+) -> dict[str, Any]:
+    prompt_text = normalize_text(get_value(example, config.prompt_key))
+    instruction_ids = get_value(example, "instruction_id_list", [])
+    kwargs_list = get_value(example, "kwargs", [])
+    ground_truth = {
+        "instruction_id": instruction_ids,
+        "kwargs": kwargs_list,
+    }
+    ground_truth_json = json.dumps(ground_truth, ensure_ascii=False)
+    extra_info = {
+        "key": normalize_text(get_value(example, "key")),
+        "constraint": ground_truth_json,
+        "instruction_id_list": json.dumps(instruction_ids, ensure_ascii=False),
+    }
+    if config.subject_key and config.subject_key in example:
+        extra_info["subject"] = example[config.subject_key]
+    return make_row(
+        config=config,
+        split=split,
+        index=idx,
+        prompt=make_prompt(prompt_text),
+        ability="instruction_following",
+        ground_truth=ground_truth_json,
         extra_info=extra_info,
     )
 

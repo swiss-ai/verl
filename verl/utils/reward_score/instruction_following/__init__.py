@@ -1,4 +1,4 @@
-"""Instruction-following reward for allenai/IF_multi_constraints_upto5."""
+"""Instruction-following rewards for IFEvalG, IFEval, and IFBench."""
 
 from __future__ import annotations
 
@@ -10,6 +10,18 @@ from . import instructions_registry
 
 
 _COT_END_MARKERS = ("</think>", "<|inner_suffix|>")
+
+
+def _get_instruction_cls(instruction_key: str):
+    if instruction_key in instructions_registry.INSTRUCTION_DICT:
+        return instructions_registry.INSTRUCTION_DICT[instruction_key]
+
+    from .ifbench import instructions_registry as ifbench_instructions_registry
+
+    if instruction_key in ifbench_instructions_registry.INSTRUCTION_DICT:
+        return ifbench_instructions_registry.INSTRUCTION_DICT[instruction_key]
+
+    raise KeyError(f"Unknown instruction-following constraint: {instruction_key}")
 
 
 def _parse_constraint(value: Any) -> dict[str, Any]:
@@ -29,7 +41,9 @@ def _parse_constraint(value: Any) -> dict[str, Any]:
             parsed = json.loads(text)
         return _parse_constraint(parsed)
 
-    raise TypeError(f"Unsupported instruction-following constraint type: {type(value)!r}")
+    raise TypeError(
+        f"Unsupported instruction-following constraint type: {type(value)!r}"
+    )
 
 
 def _extract_answer(prediction: str) -> str:
@@ -40,10 +54,12 @@ def _extract_answer(prediction: str) -> str:
     ]
     if not marker_ends:
         return prediction.strip()
-    return prediction[max(marker_ends):].strip()
+    return prediction[max(marker_ends) :].strip()
 
 
-def _constraint_from_inputs(ground_truth: Any, extra_info: dict[str, Any] | None) -> dict[str, Any]:
+def _constraint_from_inputs(
+    ground_truth: Any, extra_info: dict[str, Any] | None
+) -> dict[str, Any]:
     candidates = [ground_truth]
     if extra_info:
         candidates.extend(
@@ -65,11 +81,18 @@ def _constraint_from_inputs(ground_truth: Any, extra_info: dict[str, Any] | None
             return constraint
 
     if last_error is not None:
-        raise ValueError("Could not parse instruction-following constraint.") from last_error
+        raise ValueError(
+            "Could not parse instruction-following constraint."
+        ) from last_error
     raise ValueError("No instruction-following constraint was provided.")
 
 
-def compute_score(solution_str: str, ground_truth: Any, extra_info: dict[str, Any] | None = None, **kwargs) -> float:
+def compute_score(
+    solution_str: str,
+    ground_truth: Any,
+    extra_info: dict[str, Any] | None = None,
+    **kwargs,
+) -> float:
     constraint_dict = _constraint_from_inputs(ground_truth, extra_info)
     answer = _extract_answer(solution_str)
     instruction_keys = constraint_dict["instruction_id"]
@@ -91,10 +114,15 @@ def compute_score(solution_str: str, ground_truth: Any, extra_info: dict[str, An
             args = {}
         args = {key: value for key, value in args.items() if value is not None}
 
-        instruction_cls = instructions_registry.INSTRUCTION_DICT[instruction_key]
+        instruction_cls = _get_instruction_cls(instruction_key)
         instruction_instance = instruction_cls(instruction_key)
         instruction_instance.build_description(**args)
-        rewards.append(float(bool(solution_str.strip()) and instruction_instance.check_following(answer)))
+        rewards.append(
+            float(
+                bool(solution_str.strip())
+                and instruction_instance.check_following(answer)
+            )
+        )
 
     if not rewards:
         return 0.0

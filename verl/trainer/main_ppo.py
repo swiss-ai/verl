@@ -300,19 +300,16 @@ class TaskRunner:
             use_critic=need_critic(config),
         )
 
-        # Download the checkpoint from HDFS to the local machine.
-        # `use_shm` determines whether to use shared memory, which could lead to faster model loading if turned on
-        local_path = copy_to_local(
-            config.actor_rollout_ref.model.path, use_shm=config.actor_rollout_ref.model.get("use_shm", False)
-        )
-
         # Instantiate the tokenizer and processor.
         from verl.utils import hf_processor, hf_tokenizer
 
         trust_remote_code = config.data.get("trust_remote_code", False)
-        tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
+        use_shm = config.actor_rollout_ref.model.get("use_shm", False)
+        tokenizer_path = config.actor_rollout_ref.model.get("tokenizer_path") or config.actor_rollout_ref.model.path
+        local_tokenizer_path = copy_to_local(tokenizer_path, use_shm=use_shm)
+        tokenizer = hf_tokenizer(local_tokenizer_path, trust_remote_code=trust_remote_code)
         # Used for multimodal LLM, could be None
-        processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
+        processor = hf_processor(local_tokenizer_path, trust_remote_code=trust_remote_code, use_fast=True)
 
         # Load the reward manager for training and validation.
         reward_fn = load_reward_manager(

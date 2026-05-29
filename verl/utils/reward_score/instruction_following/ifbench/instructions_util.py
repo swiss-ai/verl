@@ -1,4 +1,4 @@
-# Copyright 2024 The Google Research Authors.
+# Copyright 2025 Allen Institute for AI.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,7 +17,6 @@
 import functools
 import random
 import re
-from types import MappingProxyType
 
 import nltk
 
@@ -1549,56 +1548,31 @@ WORD_LIST = [
     "apartment",
 ]  # pylint: disable=line-too-long
 
-# ISO 639-1 codes to language names.
-LANGUAGE_CODES = MappingProxyType(
-    {
-        "en": "English",
-        "es": "Spanish",
-        "pt": "Portuguese",
-        "ar": "Arabic",
-        "hi": "Hindi",
-        "fr": "French",
-        "ru": "Russian",
-        "de": "German",
-        "ja": "Japanese",
-        "it": "Italian",
-        "bn": "Bengali",
-        "uk": "Ukrainian",
-        "th": "Thai",
-        "ur": "Urdu",
-        "ta": "Tamil",
-        "te": "Telugu",
-        "bg": "Bulgarian",
-        "ko": "Korean",
-        "pl": "Polish",
-        "he": "Hebrew",
-        "fa": "Persian",
-        "vi": "Vietnamese",
-        "ne": "Nepali",
-        "sw": "Swahili",
-        "kn": "Kannada",
-        "mr": "Marathi",
-        "gu": "Gujarati",
-        "pa": "Punjabi",
-        "ml": "Malayalam",
-        "fi": "Finnish",
-    }
-)
+def download_nltk_resources():
+    """Download 'punkt' and 'stopwords' if not already installed"""
+    try:
+        nltk.data.find("tokenizers/punkt")
+    except LookupError:
+        nltk.download("punkt", quiet=True)
+    try:
+        nltk.data.find("tokenizers/punkt_tab")
+    except LookupError:
+        nltk.download("punkt_tab", quiet=True)
+    try:
+        nltk.data.find("corpora/stopwords")
+    except LookupError:
+        nltk.download("stopwords", quiet=True)
+    try:
+        nltk.data.find("taggers/averaged_perceptron_tagger_eng")
+    except LookupError:
+        nltk.download("averaged_perceptron_tagger_eng", quiet=True)
 
-_ALPHABETS = "([A-Za-z])"
-_PREFIXES = "(Mr|St|Mrs|Ms|Dr)[.]"
-_SUFFIXES = "(Inc|Ltd|Jr|Sr|Co)"
-_STARTERS = (
-    r"(Mr|Mrs|Ms|Dr|Prof|Capt|Cpt|Lt|He\s|She\s|It\s|They\s|Their\s|Our\s|We\s|But\s|However\s|That\s|This\s|Wherever)"
-)
-_ACRONYMS = "([A-Z][.][A-Z][.](?:[A-Z][.])?)"
-_WEBSITES = "[.](com|net|org|io|gov|edu|me)"
-_DIGITS = "([0-9])"
-_MULTIPLE_DOTS = r"\.{2,}"
+
+download_nltk_resources()
 
 
 def split_into_sentences(text):
-    """Split the text into sentences.
+    """Split the text into sentences using NLTK.
 
     Args:
       text: A string that consists of more than or equal to one sentences.
@@ -1606,38 +1580,7 @@ def split_into_sentences(text):
     Returns:
       A list of strings where each string is a sentence.
     """
-    text = " " + text + "  "
-    text = text.replace("\n", " ")
-    text = re.sub(_PREFIXES, "\\1<prd>", text)
-    text = re.sub(_WEBSITES, "<prd>\\1", text)
-    text = re.sub(_DIGITS + "[.]" + _DIGITS, "\\1<prd>\\2", text)
-    text = re.sub(_MULTIPLE_DOTS, lambda match: "<prd>" * len(match.group(0)) + "<stop>", text)
-    if "Ph.D" in text:
-        text = text.replace("Ph.D.", "Ph<prd>D<prd>")
-    text = re.sub(r"\s" + _ALPHABETS + "[.] ", " \\1<prd> ", text)
-    text = re.sub(_ACRONYMS + " " + _STARTERS, "\\1<stop> \\2", text)
-    text = re.sub(_ALPHABETS + "[.]" + _ALPHABETS + "[.]" + _ALPHABETS + "[.]", "\\1<prd>\\2<prd>\\3<prd>", text)
-    text = re.sub(_ALPHABETS + "[.]" + _ALPHABETS + "[.]", "\\1<prd>\\2<prd>", text)
-    text = re.sub(" " + _SUFFIXES + "[.] " + _STARTERS, " \\1<stop> \\2", text)
-    text = re.sub(" " + _SUFFIXES + "[.]", " \\1<prd>", text)
-    text = re.sub(" " + _ALPHABETS + "[.]", " \\1<prd>", text)
-    if "”" in text:
-        text = text.replace(".”", "”.")
-    if '"' in text:
-        text = text.replace('."', '".')
-    if "!" in text:
-        text = text.replace('!"', '"!')
-    if "?" in text:
-        text = text.replace('?"', '"?')
-    text = text.replace(".", ".<stop>")
-    text = text.replace("?", "?<stop>")
-    text = text.replace("!", "!<stop>")
-    text = text.replace("<prd>", ".")
-    sentences = text.split("<stop>")
-    sentences = [s.strip() for s in sentences]
-    if sentences and not sentences[-1]:
-        sentences = sentences[:-1]
-    return sentences
+    return nltk.sent_tokenize(text)
 
 
 def count_words(text):
@@ -1648,17 +1591,19 @@ def count_words(text):
     return num_words
 
 
-@functools.cache
+@functools.lru_cache(maxsize=None)
 def _get_sentence_tokenizer():
     return nltk.data.load("nltk:tokenizers/punkt/english.pickle")
 
 
-def count_sentences(text):
-    """Count the number of sentences."""
-    tokenizer = _get_sentence_tokenizer()
-    tokenized_sentences = tokenizer.tokenize(text)
-    return len(tokenized_sentences)
-
+def count_stopwords(text):
+    """Counts the number of stopwords."""
+    """Counts the number of stopwords."""
+    stopwords = nltk.corpus.stopwords.words('english')
+    tokenizer = nltk.tokenize.RegexpTokenizer(r"\w+")
+    tokens = tokenizer.tokenize(text)
+    num_stopwords = len([t for t in tokens if t.lower() in stopwords])
+    return num_stopwords
 
 def generate_keywords(num_keywords):
     """Randomly generates a few keywords."""

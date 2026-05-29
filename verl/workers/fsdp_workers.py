@@ -275,6 +275,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     def _build_model_optimizer(
         self,
         model_path,
+        tokenizer_path,
         fsdp_config: FSDPEngineConfig,
         optim_config,
         override_model_config,
@@ -309,11 +310,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         log_gpu_memory_usage(f"Before init {role} from HF AutoModel", logger=logger)
         local_path = model_path
+        local_tokenizer_path = tokenizer_path or local_path
 
         # note that we have to create model in fp32. Otherwise, the optimizer is in bf16, which is incorrect
         # TODO(zhangchi.usc1992): 1. support create from random initialized model. 2. Support init with FSDP directly
-        self.tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
-        self.processor = hf_processor(local_path, trust_remote_code=trust_remote_code)
+        self.tokenizer = hf_tokenizer(local_tokenizer_path, trust_remote_code=trust_remote_code)
+        self.processor = hf_processor(local_tokenizer_path, trust_remote_code=trust_remote_code)
 
         if self.config.model.get("custom_chat_template", None) is not None:
             if self.processor is not None:
@@ -781,6 +783,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 fsdp_config = FSDPEngineConfig()
 
             local_path = copy_to_local(self.config.model.path, use_shm=use_shm)
+            tokenizer_path = self.config.model.get("tokenizer_path", None) or self.config.model.path
+            local_tokenizer_path = copy_to_local(tokenizer_path, use_shm=use_shm)
             # TiledMLP configuration for memory-efficient MLP computation
             tiled_mlp_config = self.config.model.get("tiled_mlp", {})
             use_tiled_mlp = tiled_mlp_config.get("enabled", False)
@@ -793,6 +797,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 self.actor_model_config,
             ) = self._build_model_optimizer(
                 model_path=local_path,
+                tokenizer_path=local_tokenizer_path,
                 fsdp_config=fsdp_config,
                 optim_config=optim_config,
                 override_model_config=override_model_config,
@@ -838,6 +843,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             if self.rank == 0:
                 print("reference model:", ref_model_path)
             local_path = copy_to_local(ref_model_path, use_shm=use_shm)
+            ref_tokenizer_path = self.config.model.get("tokenizer_path", None) or ref_model_path
+            local_ref_tokenizer_path = copy_to_local(ref_tokenizer_path, use_shm=use_shm)
             use_prefix_grouper = hasattr(self.config, "actor") and self.config.actor.get("use_prefix_grouper", False)
 
             # TiledMLP for ref model: use ref config if specified, otherwise use actor config
@@ -849,6 +856,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
             self.ref_module_fsdp = self._build_model_optimizer(
                 model_path=local_path,
+                tokenizer_path=local_ref_tokenizer_path,
                 fsdp_config=omega_conf_to_dataclass(self.config.ref.fsdp_config),
                 optim_config=None,
                 override_model_config=override_model_config,
