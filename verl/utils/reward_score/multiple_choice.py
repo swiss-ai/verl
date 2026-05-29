@@ -36,6 +36,16 @@ def _completion_text(solution_str: str) -> str:
 
 
 def extract_choice_letter(solution_str: str) -> str | None:
+    """Extract a multiple-choice answer letter from a model response.
+
+    Accepted answer formats include <answer>...</answer> tags,
+    JSON-ish answer fields (`"answer": "C"`), boxed answers (`\\boxed{C}`),
+    explicit phrases such as `Answer: C`, `Final answer is C`,
+    `Choice: C`, `Option C`, or `Letter C`, a single answer line containing
+    only the letter, and a single option-style completion line such as
+    `C. option text` or `C) option text`. If a prompt and completion are both
+    present, known assistant markers are used to ignore prompt options.
+    """
     text = _completion_text(solution_str).upper()
     patterns = [
         r"<ANSWER>\s*([A-Z])\s*</ANSWER>",
