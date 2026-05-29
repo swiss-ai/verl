@@ -82,11 +82,11 @@ TRAIN_DATASETS = [
     ),
     DatasetConfig(
         enabled=True,
-        name="if_multi_constraints_upto5",
-        dataset_id="allenai/IF_multi_constraints_upto5",
+        name="if_rl_singleturn",
+        dataset_id="swiss-ai/if-rl-singleturn-prompts",
         split="train",
         adapter="if_placeholder",
-        data_source="allenai/IF_multi_constraints_upto5",
+        data_source="swiss-ai/if-rl-singleturn-prompts",
         prompt_key="messages",
         answer_key="ground_truth",
         subject_key="constraint_type",
@@ -197,15 +197,21 @@ EVAL_DATASETS = [
         prompt_key="entry_point",
         sample_size=None,
     ),
+    # IF BENCH
 ]
 
-ADAPTERS: dict[str, Callable[[dict[str, Any], int, str, DatasetConfig], dict[str, Any]]] = {}
+ADAPTERS: dict[
+    str, Callable[[dict[str, Any], int, str, DatasetConfig], dict[str, Any]]
+] = {}
 
 
 def register_adapter(name: str):
-    def decorator(func: Callable[[dict[str, Any], int, str, DatasetConfig], dict[str, Any]]):
+    def decorator(
+        func: Callable[[dict[str, Any], int, str, DatasetConfig], dict[str, Any]],
+    ):
         ADAPTERS[name] = func
         return func
+
     return decorator
 
 
@@ -242,7 +248,9 @@ def normalize_messages(messages: Any) -> list[dict[str, str]]:
         content = normalize_text(message.get("content", ""))
         normalized.append({"role": role, "content": content})
 
-    if ENABLE_EMPTY_SYSTEM_PROMPT and not (normalized and normalized[0].get("role") == "system"):
+    if ENABLE_EMPTY_SYSTEM_PROMPT and not (
+        normalized and normalized[0].get("role") == "system"
+    ):
         normalized.insert(0, {"role": "system", "content": ""})
     return normalized
 
@@ -290,7 +298,9 @@ def make_row(
 
 
 @register_adapter("math")
-def adapt_math(example: dict[str, Any], idx: int, split: str, config: DatasetConfig) -> dict[str, Any]:
+def adapt_math(
+    example: dict[str, Any], idx: int, split: str, config: DatasetConfig
+) -> dict[str, Any]:
     question = normalize_text(get_value(example, config.question_key))
     answer = normalize_text(get_value(example, config.answer_key))
     prompt = make_prompt(f"{question} {MATH_FINAL_ANSWER_INSTRUCTION}")
@@ -314,7 +324,9 @@ def adapt_math(example: dict[str, Any], idx: int, split: str, config: DatasetCon
 
 
 @register_adapter("gsm8k")
-def adapt_gsm8k(example: dict[str, Any], idx: int, split: str, config: DatasetConfig) -> dict[str, Any]:
+def adapt_gsm8k(
+    example: dict[str, Any], idx: int, split: str, config: DatasetConfig
+) -> dict[str, Any]:
     question = normalize_text(get_value(example, config.question_key))
     answer_raw = normalize_text(get_value(example, config.answer_key))
     try:
@@ -393,7 +405,9 @@ def adapt_humaneval(example: dict[str, Any], idx: int, split: str, config: Datas
 
 
 @register_adapter("if_placeholder")
-def adapt_if_placeholder(example: dict[str, Any], idx: int, split: str, config: DatasetConfig) -> dict[str, Any]:
+def adapt_if_placeholder(
+    example: dict[str, Any], idx: int, split: str, config: DatasetConfig
+) -> dict[str, Any]:
     prompt = normalize_messages(get_value(example, config.prompt_key))
     ground_truth = get_value(example, config.answer_key)
     extra_info = {
@@ -415,13 +429,19 @@ def adapt_if_placeholder(example: dict[str, Any], idx: int, split: str, config: 
 
 
 @register_adapter("multiple_choice")
-def adapt_multiple_choice(example: dict[str, Any], idx: int, split: str, config: DatasetConfig) -> dict[str, Any]:
+def adapt_multiple_choice(
+    example: dict[str, Any], idx: int, split: str, config: DatasetConfig
+) -> dict[str, Any]:
     question = normalize_text(get_value(example, config.question_key))
     choices = list(get_value(example, config.choices_key, []))
     answer_index = normalize_answer_index(get_value(example, config.answer_key))
     choices, answer_letter = maybe_shuffle_choices(choices, answer_index, config, idx)
     prompt = make_prompt(format_multiple_choice_prompt(question, choices))
-    extra_info = {"question": question, "choices": choices, "answer_index": answer_index}
+    extra_info = {
+        "question": question,
+        "choices": choices,
+        "answer_index": answer_index,
+    }
     if config.subject_key and config.subject_key in example:
         extra_info["subject"] = example[config.subject_key]
     return make_row(
@@ -436,7 +456,9 @@ def adapt_multiple_choice(example: dict[str, Any], idx: int, split: str, config:
 
 
 @register_adapter("gpqa")
-def adapt_gpqa(example: dict[str, Any], idx: int, split: str, config: DatasetConfig) -> dict[str, Any]:
+def adapt_gpqa(
+    example: dict[str, Any], idx: int, split: str, config: DatasetConfig
+) -> dict[str, Any]:
     question = normalize_text(get_value(example, config.question_key))
     correct = normalize_text(get_value(example, config.answer_key))
     choices = [
@@ -461,7 +483,9 @@ def adapt_gpqa(example: dict[str, Any], idx: int, split: str, config: DatasetCon
 
 def format_multiple_choice_prompt(question: str, choices: list[Any]) -> str:
     letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-    options = "\n".join(f"{letters[i]}. {normalize_text(choice)}" for i, choice in enumerate(choices))
+    options = "\n".join(
+        f"{letters[i]}. {normalize_text(choice)}" for i, choice in enumerate(choices)
+    )
     return f"{question}\n\n{options}\n\n{MULTIPLE_CHOICE_FINAL_ANSWER_INSTRUCTION}"
 
 
@@ -540,7 +564,11 @@ def maybe_shuffle_choices(
     if config.shuffle_choices:
         random.Random(f"{SEED}:{config.name}:{idx}").shuffle(indexed_choices)
     new_choices = [choice for _, choice in indexed_choices]
-    new_answer_index = next(new_idx for new_idx, (old_idx, _) in enumerate(indexed_choices) if old_idx == answer_index)
+    new_answer_index = next(
+        new_idx
+        for new_idx, (old_idx, _) in enumerate(indexed_choices)
+        if old_idx == answer_index
+    )
     return new_choices, chr(ord("A") + new_answer_index)
 
 
@@ -561,7 +589,9 @@ def load_raw_dataset(config: DatasetConfig) -> datasets.Dataset:
         **load_kwargs,
     )
     if config.filter_key is not None:
-        raw_dataset = raw_dataset.filter(lambda example: example.get(config.filter_key) == config.filter_value)
+        raw_dataset = raw_dataset.filter(
+            lambda example: example.get(config.filter_key) == config.filter_value
+        )
     if config.sample_size is not None:
         sample_size = min(config.sample_size, len(raw_dataset))
         raw_dataset = raw_dataset.shuffle(seed=SEED).select(range(sample_size))
@@ -574,11 +604,16 @@ def preprocess_dataset(config: DatasetConfig) -> datasets.Dataset:
     print(f"Loading {config.name} from {config.dataset_id}...", flush=True)
     raw_dataset = load_raw_dataset(config)
     adapter = ADAPTERS[config.adapter]
-    rows = [adapter(dict(example), idx, config.split, config) for idx, example in enumerate(raw_dataset)]
+    rows = [
+        adapter(dict(example), idx, config.split, config)
+        for idx, example in enumerate(raw_dataset)
+    ]
     return datasets.Dataset.from_list(rows)
 
 
-def concatenate_named(datasets_by_name: Iterable[tuple[str, datasets.Dataset]]) -> datasets.Dataset:
+def concatenate_named(
+    datasets_by_name: Iterable[tuple[str, datasets.Dataset]],
+) -> datasets.Dataset:
     dataset_list = []
     for name, dataset in datasets_by_name:
         if len(dataset) == 0:
@@ -597,7 +632,9 @@ def save_json_example(dataset: datasets.Dataset, path: str) -> None:
         json.dump(dataset[0], f, indent=2)
 
 
-def write_outputs(train_dataset: datasets.Dataset, eval_datasets: dict[str, datasets.Dataset]) -> None:
+def write_outputs(
+    train_dataset: datasets.Dataset, eval_datasets: dict[str, datasets.Dataset]
+) -> None:
     local_dir = os.path.expanduser(LOCAL_SAVE_DIR)
     eval_dir = os.path.join(local_dir, "eval")
     os.makedirs(eval_dir, exist_ok=True)
@@ -612,13 +649,18 @@ def write_outputs(train_dataset: datasets.Dataset, eval_datasets: dict[str, data
     save_json_example(train_dataset, os.path.join(local_dir, "train_example.json"))
     save_json_example(val_dataset, os.path.join(local_dir, "val_example.json"))
 
-    print(f"Wrote {len(train_dataset)} training rows to {local_dir}/train.parquet", flush=True)
+    print(
+        f"Wrote {len(train_dataset)} training rows to {local_dir}/train.parquet",
+        flush=True,
+    )
     print(f"Wrote {len(val_dataset)} eval rows to {local_dir}/val.parquet", flush=True)
 
 
 def main() -> None:
     train_dataset = concatenate_named(
-        (config.name, preprocess_dataset(config)) for config in TRAIN_DATASETS if config.enabled
+        (config.name, preprocess_dataset(config))
+        for config in TRAIN_DATASETS
+        if config.enabled
     )
     eval_datasets = {
         config.name: preprocess_dataset(config)
