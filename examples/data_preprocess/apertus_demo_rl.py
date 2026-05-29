@@ -32,14 +32,19 @@ import datasets
 
 from verl.utils.reward_score.gsm8k import extract_solution as extract_gsm8k_solution
 
-LOCAL_SAVE_DIR = "~/data/apertus_demo_rl"
-DATASETS_CACHE_DIR = "~/data/apertus_demo_rl/.hf_datasets_cache"
+LOCAL_SAVE_DIR = "./data/apertus_demo_rl"
+DATASETS_CACHE_DIR = "./data/apertus_demo_rl/.hf_datasets_cache"
 SEED = 42
 ENABLE_EMPTY_SYSTEM_PROMPT = True
 
 MATH_FINAL_ANSWER_INSTRUCTION = "Let's think step by step and output the final answer within \\boxed{}."
 GSM8K_FINAL_ANSWER_INSTRUCTION = 'Let\'s think step by step and output the final answer after "####".'
-MULTIPLE_CHOICE_FINAL_ANSWER_INSTRUCTION = "Answer with the letter of the correct option."
+MULTIPLE_CHOICE_FINAL_ANSWER_INSTRUCTION = (
+    "Put the letter of the correct option in <answer></answer>, for example <answer>A</answer>."
+)
+CODE_FINAL_ANSWER_INSTRUCTION = (
+    "You may reason before answering. End your response with a Python code block containing the complete solution."
+)
 
 @dataclass(frozen=True)
 class DatasetConfig:
@@ -73,7 +78,7 @@ TRAIN_DATASETS = [
         question_key="problem",
         answer_key="answer",
         subject_key="domain",
-        sample_size=None,
+        sample_size=1000,
     ),
     DatasetConfig(
         enabled=True,
@@ -85,7 +90,20 @@ TRAIN_DATASETS = [
         prompt_key="messages",
         answer_key="ground_truth",
         subject_key="constraint_type",
-        sample_size=None,
+        sample_size=1000,
+    ),
+    DatasetConfig(
+        enabled=True,
+        name="taco_verified",
+        dataset_id="likaixin/TACO-verified",
+        split="train",
+        adapter="taco",
+        data_source="taco",
+        question_key="question",
+        answer_key="input_output",
+        solution_key="solutions",
+        subject_key="source",
+        sample_size=1000,
     ),
 ]
 
@@ -100,7 +118,7 @@ EVAL_DATASETS = [
         data_source="openai/gsm8k",
         question_key="question",
         answer_key="answer",
-        sample_size=None,
+        sample_size=100,
     ),
     DatasetConfig(
         enabled=True,
@@ -113,7 +131,7 @@ EVAL_DATASETS = [
         answer_key="answer",
         solution_key="solution",
         subject_key="subject",
-        sample_size=None,
+        sample_size=100,
     ),
     DatasetConfig(
         enabled=True,
@@ -165,6 +183,20 @@ EVAL_DATASETS = [
         subject_key="subject",
         sample_size=None,
     ),
+    DatasetConfig(
+        enabled=True,
+        name="openai_humaneval",
+        dataset_id="openai/openai_humaneval",
+        subset="openai_humaneval",
+        split="test",
+        adapter="humaneval",
+        data_source="humaneval",
+        question_key="prompt",
+        answer_key="test",
+        solution_key="canonical_solution",
+        prompt_key="entry_point",
+        sample_size=None,
+    ),
 ]
 
 ADAPTERS: dict[str, Callable[[dict[str, Any], int, str, DatasetConfig], dict[str, Any]]] = {}
@@ -213,6 +245,21 @@ def normalize_messages(messages: Any) -> list[dict[str, str]]:
     if ENABLE_EMPTY_SYSTEM_PROMPT and not (normalized and normalized[0].get("role") == "system"):
         normalized.insert(0, {"role": "system", "content": ""})
     return normalized
+
+
+def parse_json_maybe(value: Any, default: Any = None) -> Any:
+    if value is None:
+        return default
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return default
+    return value
+
+
+def json_dumps(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False)
 
 
 def make_row(
@@ -283,6 +330,65 @@ def adapt_gsm8k(example: dict[str, Any], idx: int, split: str, config: DatasetCo
         ability="math",
         ground_truth=answer,
         extra_info={"question": question, "answer": answer_raw},
+    )
+
+
+@register_adapter("taco")
+def adapt_taco(example: dict[str, Any], idx: int, split: str, config: DatasetConfig) -> dict[str, Any]:
+    question = normalize_text(get_value(example, config.question_key))
+    starter_code = normalize_text(get_value(example, "starter_code"))
+    raw_test_cases = parse_json_maybe(get_value(example, config.answer_key), default={})
+    test_cases = normalize_prime_code_test_cases(raw_test_cases)
+    raw_solutions = get_value(example, config.solution_key)
+    solutions = parse_json_maybe(raw_solutions, default=raw_solutions)
+    reference_solution = first_solution(solutions)
+    prompt = make_prompt(format_code_prompt(question, starter_code))
+    extra_info = {
+        "question": question,
+        "starter_code": starter_code,
+        "difficulty": get_value(example, "difficulty"),
+        "source": get_value(example, "source"),
+        "name": get_value(example, "name"),
+        "url": get_value(example, "url"),
+        "reference_solution": reference_solution,
+    }
+    return make_row(
+        config=config,
+        split=split,
+        index=idx,
+        prompt=prompt,
+        ability="code",
+        ground_truth=json_dumps(test_cases),
+        extra_info=extra_info,
+    )
+
+
+@register_adapter("humaneval")
+def adapt_humaneval(example: dict[str, Any], idx: int, split: str, config: DatasetConfig) -> dict[str, Any]:
+    code_prompt = normalize_text(get_value(example, config.question_key)).rstrip()
+    if not code_prompt.endswith("\n"):
+        code_prompt += "\n"
+    entry_point = normalize_text(get_value(example, config.prompt_key))
+    test = normalize_text(get_value(example, config.answer_key)).rstrip()
+    canonical_solution = get_value(example, config.solution_key, "")
+    prompt = make_prompt(format_code_prompt(code_prompt, ""))
+    ground_truth = {
+        "prompt": code_prompt,
+        "test": test,
+        "entry_point": entry_point,
+    }
+    return make_row(
+        config=config,
+        split=split,
+        index=idx,
+        prompt=prompt,
+        ability="code",
+        ground_truth=json_dumps(ground_truth),
+        extra_info={
+            "task_id": get_value(example, "task_id"),
+            "entry_point": entry_point,
+            "canonical_solution": canonical_solution,
+        },
     )
 
 
@@ -357,6 +463,61 @@ def format_multiple_choice_prompt(question: str, choices: list[Any]) -> str:
     letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
     options = "\n".join(f"{letters[i]}. {normalize_text(choice)}" for i, choice in enumerate(choices))
     return f"{question}\n\n{options}\n\n{MULTIPLE_CHOICE_FINAL_ANSWER_INSTRUCTION}"
+
+
+def format_code_prompt(question: str, starter_code: str) -> str:
+    if starter_code:
+        return f"{question}\n\n```python\n{starter_code}\n```\n\n{CODE_FINAL_ANSWER_INSTRUCTION}"
+    return f"{question}\n\n{CODE_FINAL_ANSWER_INSTRUCTION}"
+
+
+def first_solution(solutions: Any) -> str:
+    if isinstance(solutions, list) and solutions:
+        return normalize_text(solutions[0])
+    return normalize_text(solutions)
+
+
+def normalize_prime_code_test_cases(test_cases: Any) -> dict[str, Any]:
+    """Convert TACO input_output into the dict schema expected by prime_code."""
+    if not isinstance(test_cases, dict):
+        raise ValueError(f"Expected dict test cases, got {type(test_cases)}")
+
+    inputs = test_cases.get("inputs", [])
+    outputs = test_cases.get("outputs", [])
+    normalized = {"inputs": [], "outputs": []}
+    if test_cases.get("fn_name") is not None:
+        normalized["fn_name"] = test_cases["fn_name"]
+        normalized["inputs"] = [serialize_call_based_input(case) for case in inputs]
+        normalized["outputs"] = [json_dumps(output) for output in outputs]
+    else:
+        normalized["inputs"] = [serialize_standard_input(case) for case in inputs]
+        normalized["outputs"] = [serialize_standard_output(case) for case in outputs]
+    return normalized
+
+
+def serialize_call_based_input(value: Any) -> str:
+    """Serialize one call-based test case as newline-separated JSON args."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list | tuple):
+        return "\n".join(json_dumps(item) for item in value)
+    return json_dumps(value)
+
+
+def serialize_standard_input(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list | tuple):
+        return "\n".join(str(item) for item in value)
+    return str(value)
+
+
+def serialize_standard_output(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list | tuple):
+        return "\n".join(str(item) for item in value)
+    return str(value)
 
 
 def normalize_answer_index(answer: Any) -> int:

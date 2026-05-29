@@ -21,6 +21,7 @@ import platform
 import signal
 import sys
 import traceback
+import types
 
 # used for debugging to time steps
 from datetime import datetime
@@ -33,7 +34,12 @@ from io import StringIO
 from unittest.mock import mock_open, patch
 
 import numpy as np
-from pyext import RuntimeModule
+
+
+def runtime_module_from_string(name, source):
+    module = types.ModuleType(name)
+    exec(compile(source, "<string>", "exec"), module.__dict__)
+    return module
 
 
 def truncatefn(s, length=300):
@@ -121,7 +127,7 @@ def run_test(in_outs, test=None, debug=False, timeout=15):
                 print(f"sol = {sol}")
             signal.alarm(timeout)
             try:
-                tmp_sol = RuntimeModule.from_string("tmp_sol", "", sol)
+                tmp_sol = runtime_module_from_string("tmp_sol", sol)
                 tmp = tmp_sol if "class Solution" not in test else tmp_sol.Solution()
                 signal.alarm(0)
             except Exception as e:
@@ -181,7 +187,7 @@ def run_test(in_outs, test=None, debug=False, timeout=15):
             method_name = "code"
             signal.alarm(timeout)
             try:
-                tmp_sol = RuntimeModule.from_string("tmp_sol", "", sol)
+                tmp_sol = runtime_module_from_string("tmp_sol", sol)
                 tmp = tmp_sol
                 signal.alarm(0)
             except Exception as e:

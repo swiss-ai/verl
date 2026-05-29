@@ -13,20 +13,26 @@
 # limitations under the License.
 
 import json
+import multiprocessing
 import traceback
 
+from .testing_util import reliability_guard
 from .utils import check_correctness as apps_check_correctness
 
 
 def compute_score(completion, test_cases, continuous=False):
     # try to get code solution from completion. if the completion is pure code, this will not take effect.
-    solution = completion.split("```python")[-1].split("```")[0]
+    solution = extract_python_solution(completion)
     try:
         try:
             if not isinstance(test_cases, dict):
                 test_cases = json.loads(test_cases)
         except Exception as e:
             print(f"Error:{e}")
+
+        if is_humaneval_test_cases(test_cases):
+            success, metadata = compute_humaneval_score(solution, test_cases)
+            return success, metadata
 
         # Complete check on all in-out pairs first. If there is no failure, per-sample test can be skipped.
         try:
@@ -71,3 +77,57 @@ def compute_score(completion, test_cases, continuous=False):
         success = False
         metadata_list = None
     return success, metadata_list
+
+
+def extract_python_solution(completion):
+    if "```python" in completion:
+        return completion.split("```python")[-1].split("```")[0]
+    if "```" in completion:
+        return completion.split("```")[-2]
+    return completion
+
+
+def is_humaneval_test_cases(test_cases):
+    return isinstance(test_cases, dict) and {"prompt", "test", "entry_point"}.issubset(test_cases)
+
+
+def build_humaneval_candidate(solution, test_cases):
+    prompt = test_cases["prompt"]
+    entry_point = test_cases["entry_point"]
+    if f"def {entry_point}" in solution:
+        return solution
+    if not prompt.endswith("\n"):
+        prompt += "\n"
+    return prompt + solution
+
+
+def compute_humaneval_score(solution, test_cases, timeout=10):
+    """Run HumanEval's assertion-style tests.
+
+    HumanEval examples do not use the APPS/TACO ``{"inputs": ..., "outputs": ...}``
+    schema handled by ``apps_check_correctness``. They provide a function prompt,
+    a test module containing ``check(candidate)``, and an entry point. 
+    This separate method is kept so the standard-input and call-based verifier remains unchanged.
+    """
+    candidate = build_humaneval_candidate(solution, test_cases)
+    result_queue = multiprocessing.Queue()
+    process = multiprocessing.Process(target=run_humaneval_test, args=(candidate, test_cases, result_queue))
+    process.start()
+    process.join(timeout=timeout)
+    if process.is_alive():
+        process.kill()
+        process.join()
+        return False, {"error": "timeout", "timeout": timeout}
+    if result_queue.empty():
+        return False, {"error": "no_result"}
+    return result_queue.get()
+
+
+def run_humaneval_test(candidate, test_cases, result_queue):
+    try:
+        reliability_guard()
+        namespace = {}
+        exec(candidate + "\n" + test_cases["test"] + f"\ncheck({test_cases['entry_point']})", namespace)
+        result_queue.put((True, {}))
+    except Exception as exc:
+        result_queue.put((False, {"error": repr(exc), "traceback": traceback.format_exc(limit=10)}))

@@ -92,7 +92,14 @@ def default_compute_score(
         from . import prime_math
 
         res = prime_math.compute_score(solution_str, ground_truth)
-    elif data_source in ["codecontests", "apps", "codeforces", "taco"]:
+    elif data_source in ["taco", "humaneval", "openai/openai_humaneval"]:
+        from . import prime_code
+
+        # TODO: continuous is temporarily set to True, but this could impact
+        # the exposure of the model to coding tasks as DAPO-like filtering will likely
+        # reject fewer prompts.
+        res = prime_code.compute_score(solution_str, ground_truth, continuous=True)
+    elif data_source in ["codecontests", "apps", "codeforces"]:
         # Use the passed sandbox_fusion_url if available
         if sandbox_fusion_url:
             from . import sandbox_fusion

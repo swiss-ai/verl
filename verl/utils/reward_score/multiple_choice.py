@@ -24,20 +24,40 @@ def _normalize_text(value: Any) -> str:
     return str(value).strip()
 
 
+def _completion_text(solution_str: str) -> str:
+    text = _normalize_text(solution_str)
+    for marker in ("<|assistant_start|>", "<|im_start|>assistant", "assistant\n"):
+        if marker in text:
+            text = text.rsplit(marker, 1)[-1]
+    for marker in ("<|assistant_end|>", "<|im_end|>"):
+        if marker in text:
+            text = text.split(marker, 1)[0]
+    return re.sub(r"(?:<pad>|\s)+$", "", text, flags=re.IGNORECASE).strip()
+
+
 def extract_choice_letter(solution_str: str) -> str | None:
-    text = _normalize_text(solution_str).upper()
+    text = _completion_text(solution_str).upper()
     patterns = [
+        r"<ANSWER>\s*([A-Z])\s*</ANSWER>",
+        r"['\"]ANSWER['\"]\s*:\s*['\"]?([A-Z])['\"]?",
         r"\\BOXED\{\s*([A-Z])\s*\}",
+        r"\bCHOICE\s*[:\-]\s*([A-Z])\b",
+        r"\bOPTION\s*[:\-]\s*([A-Z])\b",
         r"\bANSWER\s*[:\-]\s*([A-Z])\b",
         r"\bFINAL\s+ANSWER\s*[:\-]?\s*([A-Z])\b",
+        r"\bFINAL\s+ANSWER\s+IS\s+([A-Z])\b",
         r"\bTHE\s+ANSWER\s+IS\s+([A-Z])\b",
+        r"\b(?:OPTION|CHOICE|LETTER)\s+([A-Z])\b",
     ]
     for pattern in patterns:
         match = re.search(pattern, text)
         if match:
             return match.group(1)
-    matches = re.findall(r"\b([A-Z])\b", text)
-    return matches[-1] if matches else None
+    option_line_matches = re.findall(r"(?m)^\s*([A-Z])\s*[\).:\-]\s+\S", text)
+    if len(set(option_line_matches)) == 1:
+        return option_line_matches[0]
+    exact_line_matches = re.findall(r"(?m)^\s*([A-Z])\s*$", text)
+    return exact_line_matches[-1] if exact_line_matches else None
 
 
 def compute_score(solution_str: str, ground_truth: Any, format_score: float = 0.0, score: float = 1.0) -> float:

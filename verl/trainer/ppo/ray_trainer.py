@@ -131,6 +131,13 @@ def compute_response_mask(data: DataProto):
     return attention_mask[:, -response_length:]
 
 
+def decode_keep_special_tokens_without_pad(tokenizer, token_ids):
+    pad_token_id = getattr(tokenizer, "pad_token_id", None)
+    if pad_token_id is not None:
+        token_ids = token_ids[token_ids != pad_token_id]
+    return tokenizer.decode(token_ids, skip_special_tokens=False)
+
+
 def compute_advantage(
     data: DataProto,
     adv_estimator: AdvantageEstimator,
@@ -708,7 +715,7 @@ class RayPPOTrainer:
 
             # Store generated outputs
             output_ids = test_output_gen_batch.batch["responses"]
-            output_texts = [self.tokenizer.decode(ids, skip_special_tokens=False) for ids in output_ids]
+            output_texts = [decode_keep_special_tokens_without_pad(self.tokenizer, ids) for ids in output_ids]
             sample_outputs.extend(output_texts)
 
             test_batch = test_batch.union(test_output_gen_batch)

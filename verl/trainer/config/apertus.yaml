@@ -19,6 +19,8 @@ data:
   max_prompt_length: 1024
   max_response_length: 8192
   truncation: left
+  # force_thinking_prefix: false
+  # thinking_prefix_token: <|inner_prefix|>
 
 actor_rollout_ref:
   nccl_timeout: 1800
