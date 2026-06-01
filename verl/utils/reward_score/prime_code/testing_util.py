@@ -15,7 +15,6 @@
 import ast
 import faulthandler
 import json
-import platform
 
 # to run the solution files we're using a timing based approach
 import signal
@@ -34,6 +33,8 @@ from io import StringIO
 from unittest.mock import mock_open, patch
 
 import numpy as np
+
+MAX_MEMORY_BYTES = 1024 * 1024 * 1024  # 1 GB
 
 
 def runtime_module_from_string(name, source):
@@ -97,7 +98,7 @@ def run_test(in_outs, test=None, debug=False, timeout=15):
     otherwise it'll just return an input and output pair.
     """
     # Disable functionalities that can make destructive changes to the test.
-    reliability_guard()
+    reliability_guard(maximum_memory_bytes=MAX_MEMORY_BYTES)
 
     if debug:
         print(f"start = {datetime.now().time()}")
@@ -621,10 +622,25 @@ def reliability_guard(maximum_memory_bytes=None):
     if maximum_memory_bytes is not None:
         import resource
 
-        resource.setrlimit(resource.RLIMIT_AS, (maximum_memory_bytes, maximum_memory_bytes))
-        resource.setrlimit(resource.RLIMIT_DATA, (maximum_memory_bytes, maximum_memory_bytes))
-        if platform.uname().system != "Darwin":
-            resource.setrlimit(resource.RLIMIT_STACK, (maximum_memory_bytes, maximum_memory_bytes))
+        def _current_proc_status_bytes(key):
+            try:
+                with open("/proc/self/status") as status_file:
+                    for line in status_file:
+                        if line.startswith(f"{key}:"):
+                            return int(line.split()[1]) * 1024
+            except OSError:
+                pass
+            return 0
+
+        def _set_limit(limit_kind, current_bytes=0):
+            limit = current_bytes + maximum_memory_bytes
+            _, hard = resource.getrlimit(limit_kind)
+            if hard != resource.RLIM_INFINITY:
+                limit = min(limit, hard)
+            resource.setrlimit(limit_kind, (limit, limit))
+
+        _set_limit(resource.RLIMIT_AS, _current_proc_status_bytes("VmSize"))
+        _set_limit(resource.RLIMIT_DATA, _current_proc_status_bytes("VmData"))
 
     faulthandler.disable()
 

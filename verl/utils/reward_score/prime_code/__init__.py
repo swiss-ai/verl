@@ -19,6 +19,7 @@ import traceback
 from .testing_util import reliability_guard
 from .utils import check_correctness as apps_check_correctness
 
+MAX_MEMORY_BYTES = 1024 * 1024 * 1024  # 1 GB
 
 def compute_score(completion, test_cases, continuous=False):
     # try to get code solution from completion. if the completion is pure code, this will not take effect.
@@ -110,24 +111,27 @@ def compute_humaneval_score(solution, test_cases, timeout=10):
     This separate method is kept so the standard-input and call-based verifier remains unchanged.
     """
     candidate = build_humaneval_candidate(solution, test_cases)
-    result_queue = multiprocessing.Queue()
-    process = multiprocessing.Process(target=run_humaneval_test, args=(candidate, test_cases, result_queue))
+    result_conn, child_conn = multiprocessing.Pipe(duplex=False)
+    process = multiprocessing.Process(target=run_humaneval_test, args=(candidate, test_cases, child_conn))
     process.start()
+    child_conn.close()
     process.join(timeout=timeout)
     if process.is_alive():
         process.kill()
         process.join()
         return False, {"error": "timeout", "timeout": timeout}
-    if result_queue.empty():
+    if not result_conn.poll():
         return False, {"error": "no_result"}
-    return result_queue.get()
+    return result_conn.recv()
 
 
-def run_humaneval_test(candidate, test_cases, result_queue):
+def run_humaneval_test(candidate, test_cases, result_conn):
     try:
-        reliability_guard()
+        reliability_guard(maximum_memory_bytes=MAX_MEMORY_BYTES)
         namespace = {}
         exec(candidate + "\n" + test_cases["test"] + f"\ncheck({test_cases['entry_point']})", namespace)
-        result_queue.put((True, {}))
+        result_conn.send((True, {}))
     except Exception as exc:
-        result_queue.put((False, {"error": repr(exc), "traceback": traceback.format_exc(limit=10)}))
+        result_conn.send((False, {"error": repr(exc), "traceback": traceback.format_exc(limit=10)}))
+    finally:
+        result_conn.close()
