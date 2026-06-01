@@ -10,12 +10,12 @@ algorithm:
 
 data:
   apply_chat_template_kwargs:
-    enable_thinking: true
+    enable_thinking: false
   train_files:
-    - ./data/math/train.parquet
+    - ./data/apertus_demo_rl/train.parquet
   val_files:
-    - ./data/math/test.parquet
-  train_batch_size: 512
+    - ./data/apertus_demo_rl/val.parquet
+  train_batch_size: 256
   max_prompt_length: 1024
   max_response_length: 8192
   truncation: left
@@ -34,8 +34,10 @@ actor_rollout_ref:
       attn_implementation: flash_attention_3
 
   actor:
-    ppo_mini_batch_size: 64
-    ppo_micro_batch_size_per_gpu: 16
+    ppo_mini_batch_size: 128
+    # use_dynamic_bsz: True
+    # ppo_max_token_len_per_gpu: 49152
+    ppo_micro_batch_size_per_gpu: 4
     optim:
       optimizer: _AdamW
       lr: 1e-6
@@ -68,7 +70,10 @@ actor_rollout_ref:
 
   rollout:
     gpu_memory_utilization: 0.6
-    log_prob_micro_batch_size_per_gpu: 16
+    log_prob_micro_batch_size_per_gpu: 4
+    # log_prob_use_dynamic_bsz: True
+    # log_prob_max_token_len_per_gpu: 49152
+
     tensor_model_parallel_size: 1
     n: 8
     max_num_batched_tokens: 8192
@@ -86,15 +91,18 @@ actor_rollout_ref:
       temperature: 0.7
 
 trainer:
-  total_epochs: 100
-  total_training_steps: 250
-  save_freq: -1
-  test_freq: 20
-  max_actor_ckpt_to_keep: null
+  # NOTE: as we have DAPO group filtering, completing one epoch
+  # may not correspond to going through the entire dataset
+  total_epochs: 2
+  # 176213 samples / 256 batch size = ~689
+  total_training_steps: 689
+  save_freq: 20
+  test_freq: 10
+  max_actor_ckpt_to_keep: 10
   project_name: apertus-rl-tests
   experiment_name: gmpo-loo-group-filtering
   logger: ["console", "wandb"]
-  nnodes: 4
+  nnodes: 16
   n_gpus_per_node: 4
   log_val_generations: 5
   val_before_train: true

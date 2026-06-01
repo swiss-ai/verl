@@ -15,7 +15,7 @@ git checkout rl-apertus-test
 
 
 #### Environment
-Create the following environment configuration under `~/.edf/reasoning.toml` (or your preferred path, making sure to edit the `#SBATCH --environment=...` option in [`gsm8k.sh`](experiments/debug/gsm8k.sh))
+Create the following environment configuration under `~/.edf/reasoning.toml` (or your preferred path, making sure to edit the `#SBATCH --environment=...` option in [`gsm8k.sh`](gsm8k.sh))
 
 ```
 image = "/capstor/store/cscs/swissai/infra01/reasoning/imgs/projects/vs:251215/image.sqsh"
@@ -61,7 +61,6 @@ mkdir /iopsstor/scratch/cscs/$(whoami)/checkpoints
 # (optionally setup striping before copying the model weights)
 
 cp -r /capstor/store/cscs/swissai/infra01/hf-checkpoints/Apertus-1p5-8B-sft-capfilter-linear-it8816-thinking-token-fixed/ /iopsstor/scratch/cscs/$(whoami)/checkpoints/Apertus-1p5-8B-sft-capfilter-linear-it8816-thinking-token-fixed
-# cp -r /capstor/store/cscs/swissai/infra01/hf-checkpoints/Apertus-8B_it2627139/ /iopsstor/scratch/cscs/$(whoami)/checkpoints/Apertus-8B_it2627139
 ```
 
 (For some reason) most of the SFT checkpoints folders contain a tokenizer but do not contain any chat template. Unless you're planning to use a tokenizer from a separate directory, you should add the `chat_template.jinja` to your checkpoint directory.
@@ -81,13 +80,13 @@ python
 ```
 
 ### Step 2: launch training
-The [`gsm8k.sh`](experiments/debug/gsm8k.sh) script can be used to launch a minimal RL training on GSM8k dataset. The full configuration used by this training run is defined in [`gsm8k.yaml`](verl/trainer/config/gsm8k_reproducibility.yaml).
+The [`gsm8k.sh`](gsm8k.sh) script can be used to launch a minimal RL training on GSM8k dataset. The full configuration used by this training run is defined in [`gsm8k.yaml`](../../verl/trainer/config/gsm8k_reproducibility.yaml).
 
 To test different model/tokenizers, modify the values `MODEL_PATH` and `TOKENIZER_PATH`.
 If `TOKENIZER_PATH` is not set, the tokenizer under the same path as the model will be used (if any).
 
 ```bash
-sbatch experiments/debug/gsm8k.sh
+sbatch apertus/debug/gsm8k.sh
 ```
 
 Some checkpoints to test:

@@ -4,7 +4,7 @@
 #SBATCH --container-writable
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --time=02:00:00
+#SBATCH --time=05:00:00
 #SBATCH --environment=reasoning
 #SBATCH --reservation=SD-69241-apertus-1-5-0
 #SBATCH --output=slurm_logs/%j.out
@@ -14,7 +14,9 @@ set -euo pipefail
 
 # Defaults
 WORKING_DIR=/iopsstor/scratch/cscs/msantelmo/apertus_rl
-model_path="/capstor/scratch/cscs/msantelmo/huggingface/hub/models--swiss-ai--Apertus-8B-Instruct-2509/snapshots/50761a511195fde9d958f62f3b6344329d4bd191"
+# model_path="/iopsstor/scratch/cscs/msantelmo/checkpoints/Apertus-1p5-8B-sft-capfilter-linear-it8816"
+model_path="/capstor/scratch/cscs/msantelmo/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca"
+# model_path="/capstor/scratch/cscs/msantelmo/huggingface/hub/models--swiss-ai--Apertus-8B-Instruct-2509/snapshots/50761a511195fde9d958f62f3b6344329d4bd191"
 run_name="debug_$(date +%Y%m%d-%H%M%S)"
 wandb_project="apertus-rl-tests"
 
@@ -43,6 +45,7 @@ HYDRA_FULL_ERROR=1 python -m verl.trainer.main_ppo \
 	trainer.nnodes=1 \
 	trainer.experiment_name="${run_name}" \
 	trainer.project_name="${wandb_project}" \
+	trainer.rollout_data_dir="${output_dir}/rollout/" \
 	actor_rollout_ref.model.path="${model_path}" \
 	data.train_files="['./data/debug/train.parquet']" \
 	data.val_files="['./data/debug/val.parquet']" \

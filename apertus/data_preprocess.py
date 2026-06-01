@@ -156,7 +156,7 @@ EVAL_DATASETS = [
         data_source="openai/gsm8k",
         question_key="question",
         answer_key="answer",
-        sample_size=10,
+        sample_size=100,
     ),
     DatasetConfig(
         enabled=True,
@@ -169,7 +169,7 @@ EVAL_DATASETS = [
         answer_key="answer",
         solution_key="solution",
         subject_key="subject",
-        sample_size=10,
+        sample_size=50,
     ),
     DatasetConfig(
         enabled=True,
@@ -181,7 +181,7 @@ EVAL_DATASETS = [
         question_key="problem",
         answer_key="answer",
         solution_key="solution",
-        sample_size=10,
+        sample_size=None,
     ),
     DatasetConfig(
         enabled=True,
@@ -192,7 +192,7 @@ EVAL_DATASETS = [
         data_source="aime2025",
         question_key="problem",
         answer_key="answer",
-        sample_size=10,
+        sample_size=None,
     ),
     DatasetConfig(
         enabled=True,
@@ -205,7 +205,7 @@ EVAL_DATASETS = [
         question_key="Question",
         answer_key="Correct Answer",
         shuffle_choices=True,
-        sample_size=10,
+        sample_size=100,
     ),
     DatasetConfig(
         enabled=True,
@@ -219,7 +219,7 @@ EVAL_DATASETS = [
         choices_key="choices",
         answer_key="answer",
         subject_key="subject",
-        sample_size=10,
+        sample_size=100,
     ),
     DatasetConfig(
         enabled=True,
@@ -233,7 +233,7 @@ EVAL_DATASETS = [
         answer_key="test",
         solution_key="canonical_solution",
         prompt_key="entry_point",
-        sample_size=10,
+        sample_size=100,
     ),
     DatasetConfig(
         enabled=True,
@@ -243,7 +243,7 @@ EVAL_DATASETS = [
         adapter="if_eval",
         data_source="google/IFEval",
         prompt_key="prompt",
-        sample_size=10,
+        sample_size=100,
     ),
     DatasetConfig(
         enabled=True,
@@ -253,7 +253,7 @@ EVAL_DATASETS = [
         adapter="if_eval",
         data_source="allenai/IFBench_test",
         prompt_key="prompt",
-        sample_size=10,
+        sample_size=100,
     ),
 ]
 
