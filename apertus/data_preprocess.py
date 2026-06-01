@@ -32,10 +32,11 @@ import datasets
 
 from verl.utils.reward_score.gsm8k import extract_solution as extract_gsm8k_solution
 
-LOCAL_SAVE_DIR = "../data/apertus_demo_rl"
-DATASETS_CACHE_DIR = "../data/apertus_demo_rl/.hf_datasets_cache"
-SEED = 42
-ENABLE_EMPTY_SYSTEM_PROMPT = True
+LOCAL_SAVE_DIR = "./data/apertus_demo_rl"
+DATASETS_CACHE_DIR = "./data/apertus_demo_rl/.hf_datasets_cache"
+SEED = 85
+EMPTY_SYSTEM_PROMPT = True
+CODE_CONTESTS_MAX_GENERATED_TESTS = 50
 
 MATH_FINAL_ANSWER_INSTRUCTION = (
     "Let's think step by step and output the final answer within \\boxed{}."
@@ -79,7 +80,20 @@ TRAIN_DATASETS = [
         question_key="problem",
         answer_key="answer",
         subject_key="domain",
-        sample_size=10_000,
+        sample_size=50_000,
+    ),
+    DatasetConfig(
+        enabled=True,
+        name="deepmath103k",
+        dataset_id="zwhe99/DeepMath-103K",
+        split="train",
+        adapter="math",
+        data_source="zwhe99/DeepMath-103K",
+        question_key="question",
+        answer_key="final_answer",
+        solution_key="r1_solution_1",
+        subject_key="topic",
+        sample_size=50_000,
     ),
     DatasetConfig(
         enabled=True,
@@ -91,7 +105,7 @@ TRAIN_DATASETS = [
         prompt_key="messages",
         answer_key="ground_truth",
         subject_key="constraint_type",
-        sample_size=10_000,
+        sample_size=40_000,
     ),
     DatasetConfig(
         enabled=True,
@@ -116,7 +130,18 @@ TRAIN_DATASETS = [
         answer_key="input_output",
         solution_key="solutions",
         subject_key="source",
-        sample_size=10_000,
+        sample_size=None,
+    ),
+    DatasetConfig(
+        enabled=True,
+        name="code_contests",
+        dataset_id="deepmind/code_contests",
+        split="train",
+        adapter="code_contests",
+        data_source="codecontests",
+        question_key="description",
+        solution_key="solutions",
+        sample_size=None,
     ),
 ]
 
@@ -257,7 +282,7 @@ def normalize_text(value: Any) -> str:
 
 def make_prompt(user_content: str) -> list[dict[str, str]]:
     messages = []
-    if ENABLE_EMPTY_SYSTEM_PROMPT:
+    if EMPTY_SYSTEM_PROMPT:
         messages.append({"role": "system", "content": ""})
     messages.append({"role": "user", "content": user_content})
     return messages
@@ -280,7 +305,7 @@ def normalize_messages(messages: Any) -> list[dict[str, str]]:
         content = normalize_text(message.get("content", ""))
         normalized.append({"role": role, "content": content})
 
-    if ENABLE_EMPTY_SYSTEM_PROMPT and not (
+    if EMPTY_SYSTEM_PROMPT and not (
         normalized and normalized[0].get("role") == "system"
     ):
         normalized.insert(0, {"role": "system", "content": ""})
@@ -343,7 +368,9 @@ def adapt_math(
     if config.solution_key and config.solution_key in example:
         extra_info["solution"] = example[config.solution_key]
     if config.subject_key and config.subject_key in example:
-        extra_info["subject"] = example[config.subject_key]
+        extra_info["subject"] = normalize_text(example[config.subject_key])
+    if "difficulty" in example:
+        extra_info["difficulty"] = normalize_text(example["difficulty"])
     return make_row(
         config=config,
         split=split,
@@ -397,6 +424,44 @@ def adapt_taco(
         "name": get_value(example, "name"),
         "url": get_value(example, "url"),
         "reference_solution": reference_solution,
+    }
+    return make_row(
+        config=config,
+        split=split,
+        index=idx,
+        prompt=prompt,
+        ability="code",
+        ground_truth=json_dumps(test_cases),
+        extra_info=extra_info,
+    )
+
+
+@register_adapter("code_contests")
+def adapt_code_contests(
+    example: dict[str, Any], idx: int, split: str, config: DatasetConfig
+) -> dict[str, Any]:
+    question = normalize_text(get_value(example, config.question_key))
+    test_cases = normalize_code_contests_test_cases(example)
+    solutions = get_value(example, config.solution_key)
+    reference_solution = first_solution(
+        solutions.get("solution", []) if isinstance(solutions, dict) else solutions
+    )
+    prompt = make_prompt(format_code_prompt(question, ""))
+    extra_info = {
+        "question": question,
+        "difficulty": normalize_text(get_value(example, "difficulty")),
+        "source": normalize_text(get_value(example, "source")),
+        "name": normalize_text(get_value(example, "name")),
+        "reference_solution": reference_solution,
+        "cf_contest_id": get_value(example, "cf_contest_id"),
+        "cf_index": normalize_text(get_value(example, "cf_index")),
+        "cf_points": get_value(example, "cf_points"),
+        "cf_rating": get_value(example, "cf_rating"),
+        "cf_tags": json_dumps(get_value(example, "cf_tags", [])),
+        "num_public_tests": len(get_test_values(get_value(example, "public_tests"), "input")),
+        "num_private_tests": len(get_test_values(get_value(example, "private_tests"), "input")),
+        "num_generated_tests": len(get_test_values(get_value(example, "generated_tests"), "input")),
+        "num_used_tests": len(test_cases["inputs"]),
     }
     return make_row(
         config=config,
@@ -585,6 +650,59 @@ def normalize_prime_code_test_cases(test_cases: Any) -> dict[str, Any]:
     return normalized
 
 
+def normalize_code_contests_test_cases(example: dict[str, Any]) -> dict[str, list[str]]:
+    """Convert CodeContests tests into the standard-input schema expected by prime_code."""
+    inputs: list[str] = []
+    outputs: list[str] = []
+    for key, max_cases in (
+        ("public_tests", None),
+        ("private_tests", None),
+        ("generated_tests", CODE_CONTESTS_MAX_GENERATED_TESTS),
+    ):
+        test_group = get_value(example, key)
+        test_inputs = get_test_values(test_group, "input")
+        test_outputs = get_test_values(test_group, "output")
+        if max_cases is not None:
+            test_inputs = test_inputs[:max_cases]
+            test_outputs = test_outputs[:max_cases]
+        for test_input, test_output in zip(test_inputs, test_outputs):
+            inputs.append(normalize_text(test_input))
+            outputs.append(normalize_text(test_output))
+    if not inputs:
+        raise ValueError("CodeContests example has no usable tests")
+    return {"inputs": inputs, "outputs": outputs}
+
+
+def code_contests_has_tests(example: dict[str, Any]) -> bool:
+    for key, max_cases in (
+        ("public_tests", None),
+        ("private_tests", None),
+        ("generated_tests", CODE_CONTESTS_MAX_GENERATED_TESTS),
+    ):
+        test_group = get_value(example, key)
+        test_inputs = get_test_values(test_group, "input")
+        test_outputs = get_test_values(test_group, "output")
+        if max_cases is not None:
+            test_inputs = test_inputs[:max_cases]
+            test_outputs = test_outputs[:max_cases]
+        if len(test_inputs) != len(test_outputs):
+            continue
+        if any(True for _ in zip(test_inputs, test_outputs)):
+            return True
+    return False
+
+
+def get_test_values(test_group: Any, key: str) -> list[Any]:
+    if not test_group:
+        return []
+    if isinstance(test_group, dict):
+        values = test_group.get(key, [])
+        return list(values) if values is not None else []
+    if isinstance(test_group, list):
+        return [test_case.get(key, "") for test_case in test_group if isinstance(test_case, dict)]
+    return []
+
+
 def serialize_call_based_input(value: Any) -> str:
     """Serialize one call-based test case as newline-separated JSON args."""
     if isinstance(value, str):
@@ -654,13 +772,22 @@ def load_raw_dataset(config: DatasetConfig) -> datasets.Dataset:
         cache_dir=os.path.expanduser(DATASETS_CACHE_DIR),
         **load_kwargs,
     )
+    print(f"Loaded {len(raw_dataset)} rows for {config.name}.", flush=True)
+
     if config.filter_key is not None:
         raw_dataset = raw_dataset.filter(
             lambda example: example.get(config.filter_key) == config.filter_value
         )
+    if config.adapter == "code_contests":
+        rows_before_filter = len(raw_dataset)
+        raw_dataset = raw_dataset.filter(code_contests_has_tests)
+        filtered = rows_before_filter - len(raw_dataset)
+        if filtered:
+            print(f"Filtered {filtered} rows from {config.name}.", flush=True)
     if config.sample_size is not None:
         sample_size = min(config.sample_size, len(raw_dataset))
         raw_dataset = raw_dataset.shuffle(seed=SEED).select(range(sample_size))
+        print(f"Sampled {len(raw_dataset)} rows for {config.name} after filtering and sampling.", flush=True)
     return raw_dataset
 
 
