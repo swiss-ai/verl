@@ -21,8 +21,6 @@ import re
 
 import datasets
 
-from verl.utils.hdfs_io import copy, makedirs
-
 
 def extract_solution(solution_str):
     solution = re.search("#### (\\-?[0-9\\.\\,]+)", solution_str)
@@ -35,7 +33,6 @@ def extract_solution(solution_str):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--local_dir", default=None, help="The save directory for the preprocessed dataset.")
-    parser.add_argument("--hdfs_dir", default=None)
     parser.add_argument("--local_dataset_path", default=None, help="The local path to the raw dataset, if it exists.")
     parser.add_argument(
         "--local_save_dir", default="~/data/gsm8k", help="The save directory for the preprocessed dataset."
@@ -49,7 +46,7 @@ if __name__ == "__main__":
     if local_dataset_path is not None:
         dataset = datasets.load_dataset(local_dataset_path, "main")
     else:
-        dataset = datasets.load_dataset(data_source, "main")
+        dataset = datasets.load_dataset(data_source, "main", download_mode="force_redownload")
 
     train_dataset = dataset["train"]
     test_dataset = dataset["test"]
@@ -89,17 +86,14 @@ if __name__ == "__main__":
     train_dataset = train_dataset.map(function=make_map_fn("train"), with_indices=True)
     test_dataset = test_dataset.map(function=make_map_fn("test"), with_indices=True)
 
-    hdfs_dir = args.hdfs_dir
     local_save_dir = args.local_dir
     if local_save_dir is not None:
         print("Warning: Argument 'local_dir' is deprecated. Please use 'local_save_dir' instead.")
     else:
         local_save_dir = args.local_save_dir
 
+    local_save_dir = os.path.expanduser(local_save_dir)
+    os.makedirs(local_save_dir, exist_ok=True)
+
     train_dataset.to_parquet(os.path.join(local_save_dir, "train.parquet"))
     test_dataset.to_parquet(os.path.join(local_save_dir, "test.parquet"))
-
-    if hdfs_dir is not None:
-        makedirs(hdfs_dir)
-
-        copy(src=local_save_dir, dst=hdfs_dir)
