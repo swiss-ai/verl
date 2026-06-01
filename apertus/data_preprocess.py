@@ -32,19 +32,20 @@ import datasets
 
 from verl.utils.reward_score.gsm8k import extract_solution as extract_gsm8k_solution
 
-LOCAL_SAVE_DIR = "./data/apertus_demo_rl"
-DATASETS_CACHE_DIR = "./data/apertus_demo_rl/.hf_datasets_cache"
+LOCAL_SAVE_DIR = "../data/apertus_demo_rl"
+DATASETS_CACHE_DIR = "../data/apertus_demo_rl/.hf_datasets_cache"
 SEED = 42
 ENABLE_EMPTY_SYSTEM_PROMPT = True
 
-MATH_FINAL_ANSWER_INSTRUCTION = "Let's think step by step and output the final answer within \\boxed{}."
-GSM8K_FINAL_ANSWER_INSTRUCTION = 'Let\'s think step by step and output the final answer after "####".'
-MULTIPLE_CHOICE_FINAL_ANSWER_INSTRUCTION = (
-    "Put the letter of the correct option in <answer></answer>, for example <answer>A</answer>."
+MATH_FINAL_ANSWER_INSTRUCTION = (
+    "Let's think step by step and output the final answer within \\boxed{}."
 )
-CODE_FINAL_ANSWER_INSTRUCTION = (
-    "You may reason before answering. End your response with a Python code block containing the complete solution."
+GSM8K_FINAL_ANSWER_INSTRUCTION = (
+    'Let\'s think step by step and output the final answer after "####".'
 )
+MULTIPLE_CHOICE_FINAL_ANSWER_INSTRUCTION = "Put the letter of the correct option in <answer></answer>, for example <answer>A</answer>."
+CODE_FINAL_ANSWER_INSTRUCTION = "You may reason before answering. End your response with a Python code block containing the complete solution."
+
 
 @dataclass(frozen=True)
 class DatasetConfig:
@@ -78,7 +79,7 @@ TRAIN_DATASETS = [
         question_key="problem",
         answer_key="answer",
         subject_key="domain",
-        sample_size=1000,
+        sample_size=10_000,
     ),
     DatasetConfig(
         enabled=True,
@@ -90,7 +91,19 @@ TRAIN_DATASETS = [
         prompt_key="messages",
         answer_key="ground_truth",
         subject_key="constraint_type",
-        sample_size=1000,
+        sample_size=10_000,
+    ),
+    DatasetConfig(
+        enabled=True,
+        name="if_rl_singleturn_hard",
+        dataset_id="swiss-ai/if-rl-singleturn-hard-prompts",
+        split="train",
+        adapter="if_placeholder",
+        data_source="swiss-ai/if-rl-singleturn-hard-prompts",
+        prompt_key="messages",
+        answer_key="ground_truth",
+        subject_key="constraint_type",
+        sample_size=10_000,
     ),
     DatasetConfig(
         enabled=True,
@@ -103,7 +116,7 @@ TRAIN_DATASETS = [
         answer_key="input_output",
         solution_key="solutions",
         subject_key="source",
-        sample_size=1000,
+        sample_size=10_000,
     ),
 ]
 
@@ -118,7 +131,7 @@ EVAL_DATASETS = [
         data_source="openai/gsm8k",
         question_key="question",
         answer_key="answer",
-        sample_size=100,
+        sample_size=10,
     ),
     DatasetConfig(
         enabled=True,
@@ -131,7 +144,7 @@ EVAL_DATASETS = [
         answer_key="answer",
         solution_key="solution",
         subject_key="subject",
-        sample_size=100,
+        sample_size=10,
     ),
     DatasetConfig(
         enabled=True,
@@ -143,7 +156,7 @@ EVAL_DATASETS = [
         question_key="problem",
         answer_key="answer",
         solution_key="solution",
-        sample_size=None,
+        sample_size=10,
     ),
     DatasetConfig(
         enabled=True,
@@ -154,7 +167,7 @@ EVAL_DATASETS = [
         data_source="aime2025",
         question_key="problem",
         answer_key="answer",
-        sample_size=None,
+        sample_size=10,
     ),
     DatasetConfig(
         enabled=True,
@@ -167,7 +180,7 @@ EVAL_DATASETS = [
         question_key="Question",
         answer_key="Correct Answer",
         shuffle_choices=True,
-        sample_size=None,
+        sample_size=10,
     ),
     DatasetConfig(
         enabled=True,
@@ -181,7 +194,7 @@ EVAL_DATASETS = [
         choices_key="choices",
         answer_key="answer",
         subject_key="subject",
-        sample_size=None,
+        sample_size=10,
     ),
     DatasetConfig(
         enabled=True,
@@ -195,7 +208,7 @@ EVAL_DATASETS = [
         answer_key="test",
         solution_key="canonical_solution",
         prompt_key="entry_point",
-        sample_size=None,
+        sample_size=10,
     ),
     DatasetConfig(
         enabled=True,
@@ -205,7 +218,7 @@ EVAL_DATASETS = [
         adapter="if_eval",
         data_source="google/IFEval",
         prompt_key="prompt",
-        sample_size=None,
+        sample_size=10,
     ),
     DatasetConfig(
         enabled=True,
@@ -215,7 +228,7 @@ EVAL_DATASETS = [
         adapter="if_eval",
         data_source="allenai/IFBench_test",
         prompt_key="prompt",
-        sample_size=None,
+        sample_size=10,
     ),
 ]
 
@@ -365,7 +378,9 @@ def adapt_gsm8k(
 
 
 @register_adapter("taco")
-def adapt_taco(example: dict[str, Any], idx: int, split: str, config: DatasetConfig) -> dict[str, Any]:
+def adapt_taco(
+    example: dict[str, Any], idx: int, split: str, config: DatasetConfig
+) -> dict[str, Any]:
     question = normalize_text(get_value(example, config.question_key))
     starter_code = normalize_text(get_value(example, "starter_code"))
     raw_test_cases = parse_json_maybe(get_value(example, config.answer_key), default={})
@@ -395,7 +410,9 @@ def adapt_taco(example: dict[str, Any], idx: int, split: str, config: DatasetCon
 
 
 @register_adapter("humaneval")
-def adapt_humaneval(example: dict[str, Any], idx: int, split: str, config: DatasetConfig) -> dict[str, Any]:
+def adapt_humaneval(
+    example: dict[str, Any], idx: int, split: str, config: DatasetConfig
+) -> dict[str, Any]:
     code_prompt = normalize_text(get_value(example, config.question_key)).rstrip()
     if not code_prompt.endswith("\n"):
         code_prompt += "\n"

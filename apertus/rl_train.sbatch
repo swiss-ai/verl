@@ -94,7 +94,7 @@ build_overrides() {
     "trainer.experiment_name=${RUN_NAME}"
     "trainer.default_local_dir=${RUN_DIR}"
     "trainer.validation_data_dir=${RUN_DIR}/validation"
-    "trainer.val_before_train=false"
+    "trainer.val_before_train=true"
     "actor_rollout_ref.rollout.n=${ROLLOUT_N}"
     "trainer.total_epochs=10"
     # "trainer.total_training_steps=1000000"
@@ -105,7 +105,7 @@ build_overrides() {
     "actor_rollout_ref.actor.checkpoint.save_contents=['hf_model']"
     "critic.checkpoint.save_contents=[]"
     "trainer.save_freq=-1"
-    "trainer.test_freq=-1"
+    "trainer.test_freq=10"
     "trainer.max_actor_ckpt_to_keep=null"
     "trainer.max_critic_ckpt_to_keep=null"
     "actor_rollout_ref.actor.strategy=fsdp2"
@@ -188,6 +188,7 @@ set -x
 
 export WANDB_RUN_GROUP="${RUN_NAME%__seed${SEED}}"
 export WANDB_NAME="${RUN_NAME}"
+export WANDB_ENTITY="apertus"
 
 nodes_array=($(scontrol show hostnames "${SLURM_JOB_NODELIST}"))
 if [ "${#nodes_array[@]}" -lt "${NNODES}" ]; then
