@@ -68,11 +68,10 @@ actor_rollout_ref:
     gpu_memory_utilization: 0.8
     log_prob_use_dynamic_bsz: True
     log_prob_max_token_len_per_gpu: 49152
-
     tensor_model_parallel_size: 1
     n: 8
-    max_num_batched_tokens: 8192
-    max_num_seqs: 256
+    max_num_batched_tokens: 32768
+    max_num_seqs: 512
     name: sglang
     dtype: bfloat16
     multi_stage_wake_up: true
@@ -95,7 +94,7 @@ trainer:
   test_freq: 10
   max_actor_ckpt_to_keep: 10
   project_name: apertus-rl-tests
-  experiment_name: gmpo-loo-group-filtering
+  experiment_name: grpo-group-filtering
   logger: ["console", "wandb"]
   nnodes: 16
   n_gpus_per_node: 4

@@ -109,7 +109,6 @@ build_overrides() {
     "+ray_kwargs.ray_init.runtime_env.env_vars.PYTHONPATH=${PY_DEPS_DIR}:${WORKING_DIR}:${PYTHONPATH:-}"
     "+ray_kwargs.ray_init.runtime_env.env_vars.NLTK_DATA=${NLTK_DATA_DIR}"
     "+ray_kwargs.ray_init.runtime_env.env_vars.MATH_VERIFY_PYTHONPATH=${MATH_VERIFY_DEPS_DIR}"
-    "trainer.resume_mode=disable"
   )
 
   if [ -n "${TOKENIZER_NAME_OR_PATH}" ]; then
