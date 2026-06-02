@@ -7,7 +7,7 @@
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=64
 #SBATCH --environment=reasoning_fixed
-#SBATCH --time=06:00:00
+#SBATCH --time=09:00:00
 #SBATCH --reservation=SD-69241-apertus-1-5-0
 #SBATCH --output=slurm_logs/%x_%j.out
 #SBATCH --error=slurm_logs/%x_%j.err
@@ -21,10 +21,12 @@ WORKING_DIR=/iopsstor/scratch/cscs/msantelmo/apertus_rl
 HF_HOME=/capstor/scratch/cscs/msantelmo/huggingface
 HF_HUB_CACHE_DIR=${HF_HOME}/hub
 
+cd "${WORKING_DIR}"
+
 MODEL_NAME_OR_PATH=/iopsstor/scratch/cscs/msantelmo/checkpoints/Apertus-1p5-8B-sft-capfilter-linear-it8816
 TOKENIZER_NAME_OR_PATH="" # Use the same as the model by default
 PROJECT_NAME=apertus-rl-tests
-CONFIG_NAME=apertus
+CONFIG_NAME=1p5_gmpo-loo  # 1p5_grpo
 
 ROLLOUT_N=8
 SEED=85
@@ -71,24 +73,17 @@ resolve_run_name() {
   if [ -z "${RUN_NAME}" ]; then
     RUN_NAME="${model_tag}"
   fi
-  RUN_NAME="${RUN_NAME}_${NNODES}nodes"
+  RUN_NAME="${RUN_NAME}_${CONFIG_NAME}_${NNODES}nodes"
 
   # if force thinking, add a tag to the run name
   if [ "${FORCE_THINKING}" = true ]; then
     RUN_NAME="${RUN_NAME}_force-think"
   fi
   RUN_NAME="${RUN_NAME}__seed${SEED}"
+  RUN_NAME="${RUN_NAME}__$(date +%Y%m%d-%H%M%S)"
   RUN_DIR="${OUTPUT_ROOT}/${RUN_NAME}"
   mkdir -p "${RUN_DIR}"
 }
-
-# if tokenizer path is provided, add it to the overrides
-if [ -n "${TOKENIZER_NAME_OR_PATH}" ]; then
-  TOKENIZER_OVERRIDE="actor_rollout_ref.model.tokenizer_path=${TOKENIZER_NAME_OR_PATH}"
-else
-  TOKENIZER_OVERRIDE=""
-fi
-
 
 resolve_run_name
 
@@ -115,9 +110,15 @@ build_overrides() {
     "+ray_kwargs.ray_init.runtime_env.env_vars.NLTK_DATA=${NLTK_DATA_DIR}"
     "+ray_kwargs.ray_init.runtime_env.env_vars.MATH_VERIFY_PYTHONPATH=${MATH_VERIFY_DEPS_DIR}"
     "trainer.resume_mode=disable"
-    "${TOKENIZER_OVERRIDE}"
-    "${FORCE_THINKING_FLAGS[@]}"
   )
+
+  if [ -n "${TOKENIZER_NAME_OR_PATH}" ]; then
+    overrides+=("actor_rollout_ref.model.tokenizer_path=${TOKENIZER_NAME_OR_PATH}")
+  fi
+
+  if [ "${#FORCE_THINKING_FLAGS[@]}" -gt 0 ]; then
+    overrides+=("${FORCE_THINKING_FLAGS[@]}")
+  fi
 }
 
 cleanup_ray() {

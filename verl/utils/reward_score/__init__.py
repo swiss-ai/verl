@@ -78,6 +78,7 @@ def default_compute_score(
     elif data_source in [
         "allenai/IF_multi_constraints_upto5",
         "swiss-ai/if-rl-singleturn-prompts",
+        "swiss-ai/if-rl-singleturn-hard-prompts",
         "google/IFEval",
         "allenai/IFBench_test",
     ]:

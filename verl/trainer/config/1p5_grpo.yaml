@@ -3,7 +3,7 @@ defaults:
   - _self_
 
 algorithm:
-  adv_estimator: rloo_vectorized
+  adv_estimator: grpo
   norm_adv_by_std_in_grpo: false
   filter_groups:
     enable: true
@@ -35,9 +35,8 @@ actor_rollout_ref:
 
   actor:
     ppo_mini_batch_size: 128
-    # use_dynamic_bsz: True
-    # ppo_max_token_len_per_gpu: 49152
-    ppo_micro_batch_size_per_gpu: 4
+    use_dynamic_bsz: True
+    ppo_max_token_len_per_gpu: 49152
     optim:
       optimizer: _AdamW
       lr: 1e-6
@@ -62,17 +61,13 @@ actor_rollout_ref:
     clip_ratio_low: 0.2
     use_kl_loss: false
     shuffle: true
-    policy_loss:
-      loss_mode: geo_mean
-
     # loss_agg_mode is unused by geo_mean but set for consistency
-    loss_agg_mode: seq-mean-token-mean
+    loss_agg_mode: token-mean
 
   rollout:
-    gpu_memory_utilization: 0.6
-    log_prob_micro_batch_size_per_gpu: 4
-    # log_prob_use_dynamic_bsz: True
-    # log_prob_max_token_len_per_gpu: 49152
+    gpu_memory_utilization: 0.8
+    log_prob_use_dynamic_bsz: True
+    log_prob_max_token_len_per_gpu: 49152
 
     tensor_model_parallel_size: 1
     n: 8

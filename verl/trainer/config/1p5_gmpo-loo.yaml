@@ -1,0 +1,113 @@
+defaults:
+  - ppo_trainer
+  - _self_
+
+algorithm:
+  adv_estimator: rloo_vectorized
+  norm_adv_by_std_in_grpo: false
+  filter_groups:
+    enable: true
+
+data:
+  apply_chat_template_kwargs:
+    enable_thinking: false
+  train_files:
+    - ./data/apertus_demo_rl/train.parquet
+  val_files:
+    - ./data/apertus_demo_rl/val.parquet
+  train_batch_size: 256
+  max_prompt_length: 1024
+  max_response_length: 8192
+  truncation: left
+  # force_thinking_prefix: false
+  # thinking_prefix_token: <|inner_prefix|>
+
+actor_rollout_ref:
+  nccl_timeout: 1800
+
+  model:
+    path: swiss-ai/Apertus-8B-Instruct-2509
+    use_remove_padding: true
+    enable_gradient_checkpointing: true
+    use_shm: false
+    override_config:
+      attn_implementation: flash_attention_3
+
+  actor:
+    ppo_mini_batch_size: 128
+    use_dynamic_bsz: True
+    ppo_max_token_len_per_gpu: 49152
+    optim:
+      optimizer: _AdamW
+      lr: 1e-6
+      weight_decay: 0.01
+      clip_grad: 1.0
+      optimizer_impl: torchao.optim
+      override_optimizer_config:
+        bf16_stochastic_round: true
+    strategy: fsdp2
+    fsdp_config:
+      strategy: fsdp2
+      param_offload: false
+      optimizer_offload: false
+      entropy_from_logits_with_chunking: ${oc.select:actor_rollout_ref.actor.entropy_from_logits_with_chunking,false}
+      entropy_checkpointing: ${oc.select:actor_rollout_ref.actor.entropy_checkpointing,false}
+      model_dtype: bf16
+      mixed_precision:
+        param_dtype: bf16
+        reduce_dtype: bf16
+        buffer_dtype: bf16
+    clip_ratio_high: 0.4
+    clip_ratio_low: 0.4
+    use_kl_loss: false
+    shuffle: true
+    policy_loss:
+      loss_mode: geo_mean
+
+    # loss_agg_mode is unused by geo_mean but set for consistency
+    loss_agg_mode: seq-mean-token-mean
+
+  rollout:
+    gpu_memory_utilization: 0.8
+    log_prob_use_dynamic_bsz: True
+    log_prob_max_token_len_per_gpu: 49152
+
+    tensor_model_parallel_size: 1
+    n: 8
+    max_num_batched_tokens: 8192
+    max_num_seqs: 256
+    name: sglang
+    dtype: bfloat16
+    multi_stage_wake_up: true
+    free_cache_engine: true
+    enforce_eager: false
+    load_format: safetensors
+    val_kwargs:
+      do_sample: True
+      n: 4
+      top_p: 0.95
+      temperature: 0.7
+
+trainer:
+  # NOTE: as we have DAPO group filtering, completing one epoch
+  # may not correspond to going through the entire dataset
+  total_epochs: 2
+  # 176213 samples / 256 batch size = ~689
+  total_training_steps: 689
+  save_freq: 20
+  test_freq: 10
+  max_actor_ckpt_to_keep: 10
+  project_name: apertus-rl-tests
+  experiment_name: gmpo-loo-group-filtering
+  logger: ["console", "wandb"]
+  nnodes: 16
+  n_gpus_per_node: 4
+  log_val_generations: 5
+  val_before_train: true
+  default_local_dir: ./outputs/${trainer.project_name}/${trainer.experiment_name}
+  validation_data_dir: ${trainer.default_local_dir}/validation/
+
+ray_kwargs:
+  ray_init:
+    num_cpus: ${oc.decode:${oc.env:SLURM_CPUS_PER_TASK,null}}
+  timeline_json_file: null
