@@ -307,9 +307,17 @@ class TaskRunner:
         use_shm = config.actor_rollout_ref.model.get("use_shm", False)
         tokenizer_path = config.actor_rollout_ref.model.get("tokenizer_path") or config.actor_rollout_ref.model.path
         local_tokenizer_path = copy_to_local(tokenizer_path, use_shm=use_shm)
-        tokenizer = hf_tokenizer(local_tokenizer_path, trust_remote_code=trust_remote_code)
+        tokenizer_kwargs = OmegaConf.to_container(
+            OmegaConf.create(config.actor_rollout_ref.model.get("tokenizer_kwargs", {})), resolve=True
+        )
+        tokenizer = hf_tokenizer(local_tokenizer_path, trust_remote_code=trust_remote_code, **tokenizer_kwargs)
         # Used for multimodal LLM, could be None
-        processor = hf_processor(local_tokenizer_path, trust_remote_code=trust_remote_code, use_fast=True)
+        processor = hf_processor(
+            local_tokenizer_path,
+            trust_remote_code=trust_remote_code,
+            use_fast=True,
+            tokenizer_kwargs=tokenizer_kwargs,
+        )
 
         # Load the reward manager for training and validation.
         reward_fn = load_reward_manager(

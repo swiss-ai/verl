@@ -102,6 +102,7 @@ class HFModelConfig(BaseConfig):
     # whether to use shared memory
     use_shm: bool = False
     trust_remote_code: bool = False
+    tokenizer_kwargs: dict[str, Any] = field(default_factory=dict)
 
     # custom chat template for the model
     custom_chat_template: Optional[str] = None
@@ -153,8 +154,14 @@ class HFModelConfig(BaseConfig):
         # construct tokenizer
         if self.load_tokenizer:
             self.local_tokenizer_path = copy_to_local(self.tokenizer_path, use_shm=self.use_shm)
-            self.tokenizer = hf_tokenizer(self.local_tokenizer_path, trust_remote_code=self.trust_remote_code)
-            self.processor = hf_processor(self.local_tokenizer_path, trust_remote_code=self.trust_remote_code)
+            self.tokenizer = hf_tokenizer(
+                self.local_tokenizer_path, trust_remote_code=self.trust_remote_code, **self.tokenizer_kwargs
+            )
+            self.processor = hf_processor(
+                self.local_tokenizer_path,
+                trust_remote_code=self.trust_remote_code,
+                tokenizer_kwargs=self.tokenizer_kwargs,
+            )
 
         if self.custom_chat_template is not None:
             if self.processor is not None:

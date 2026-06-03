@@ -49,5 +49,6 @@ HYDRA_FULL_ERROR=1 python -m verl.trainer.main_ppo \
 	trainer.experiment_name="${RUN_NAME}" \
 	trainer.project_name="${WANDB_PROJECT}" \
 	actor_rollout_ref.model.path="${MODEL_PATH}" \
+	+actor_rollout_ref.model.tokenizer_kwargs.fix_mistral_regex=true \
 	${tokenizer_flag} \
 	"$@"

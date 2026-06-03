@@ -115,6 +115,7 @@ class MegatronWorker(Worker):
         trust_remote_code=False,
         megatron_config=None,
         enable_mtp=False,
+        tokenizer_kwargs=None,
     ):
         from transformers import AutoConfig
 
@@ -125,12 +126,21 @@ class MegatronWorker(Worker):
 
         # Step 1: initialize the tokenizer
         self.local_path = copy_to_local(model_path)
+        tokenizer_kwargs = tokenizer_kwargs or {}
         if tokenizer_or_path is None:
-            self.tokenizer = hf_tokenizer(self.local_path, trust_remote_code=trust_remote_code)
-            self.processor = hf_processor(self.local_path, trust_remote_code=trust_remote_code)
+            self.tokenizer = hf_tokenizer(self.local_path, trust_remote_code=trust_remote_code, **tokenizer_kwargs)
+            self.processor = hf_processor(
+                self.local_path, trust_remote_code=trust_remote_code, tokenizer_kwargs=tokenizer_kwargs
+            )
         elif isinstance(tokenizer_or_path, str):
-            self.tokenizer = hf_tokenizer(copy_to_local(tokenizer_or_path), trust_remote_code=trust_remote_code)
-            self.processor = hf_processor(copy_to_local(tokenizer_or_path), trust_remote_code=trust_remote_code)
+            self.tokenizer = hf_tokenizer(
+                copy_to_local(tokenizer_or_path), trust_remote_code=trust_remote_code, **tokenizer_kwargs
+            )
+            self.processor = hf_processor(
+                copy_to_local(tokenizer_or_path),
+                trust_remote_code=trust_remote_code,
+                tokenizer_kwargs=tokenizer_kwargs,
+            )
         else:
             self.tokenizer = tokenizer_or_path
             self.processor = tokenizer_or_path
@@ -393,6 +403,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             self.config.model.get("trust_remote_code", False),
             self.config.actor.megatron if not self._is_ref else self.config.ref.megatron,
             self.config.model.get("mtp", {}).get("enable", False),
+            OmegaConf.to_container(OmegaConf.create(self.config.model.get("tokenizer_kwargs", {})), resolve=True),
         )
         self.generation_config = get_generation_config(
             self.local_path,

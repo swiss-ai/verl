@@ -289,6 +289,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         use_prefix_grouper=False,
         use_tiled_mlp=False,
         tiled_mlp_shards=4,
+        tokenizer_kwargs=None,
     ):
         from torch.distributed.fsdp import CPUOffload, MixedPrecision
         from transformers import (
@@ -314,8 +315,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # note that we have to create model in fp32. Otherwise, the optimizer is in bf16, which is incorrect
         # TODO(zhangchi.usc1992): 1. support create from random initialized model. 2. Support init with FSDP directly
-        self.tokenizer = hf_tokenizer(local_tokenizer_path, trust_remote_code=trust_remote_code)
-        self.processor = hf_processor(local_tokenizer_path, trust_remote_code=trust_remote_code)
+        tokenizer_kwargs = tokenizer_kwargs or {}
+        self.tokenizer = hf_tokenizer(local_tokenizer_path, trust_remote_code=trust_remote_code, **tokenizer_kwargs)
+        self.processor = hf_processor(
+            local_tokenizer_path, trust_remote_code=trust_remote_code, tokenizer_kwargs=tokenizer_kwargs
+        )
 
         if self.config.model.get("custom_chat_template", None) is not None:
             if self.processor is not None:
@@ -811,6 +815,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 use_prefix_grouper=self.config.actor.get("use_prefix_grouper", False),
                 use_tiled_mlp=use_tiled_mlp,
                 tiled_mlp_shards=tiled_mlp_shards,
+                tokenizer_kwargs=OmegaConf.to_container(
+                    OmegaConf.create(self.config.model.get("tokenizer_kwargs", {})), resolve=True
+                ),
             )
 
             # get the original unwrapped module
@@ -868,6 +875,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 use_prefix_grouper=use_prefix_grouper,
                 use_tiled_mlp=ref_use_tiled_mlp,
                 tiled_mlp_shards=ref_tiled_mlp_shards,
+                tokenizer_kwargs=OmegaConf.to_container(
+                    OmegaConf.create(self.config.model.get("tokenizer_kwargs", {})), resolve=True
+                ),
             )[0]
             OmegaConf.set_struct(self.config.ref, True)
             with open_dict(self.config.ref):
