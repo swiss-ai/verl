@@ -128,3 +128,7 @@ logs
 log
 outputs
 .history
+data/
+slurm_logs/
+core_nid*
+.codex
