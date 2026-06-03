@@ -21,6 +21,9 @@ use_shm: False
 # whether to trust remote code.
 trust_remote_code: False
 
+# additional keyword arguments passed to the tokenizer.
+tokenizer_kwargs: {}
+
 # custom chat template for the model
 custom_chat_template: null
 
