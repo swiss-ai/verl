@@ -20,6 +20,7 @@ PORT=8000
 POLL_SECS=3
 MAX_WAIT=600
 GIVEN_URL="${SCHEDULER_URL:-}"
+CODEGYM_REWARD_CONTINUOUS=true
 
 if [[ $# -gt 0 && "$1" =~ ^https?:// ]]; then
   GIVEN_URL="${1%/}"
@@ -99,7 +100,8 @@ done
 log "  -> Scheduler reachable at ${URL}"
 
 log "\n[4/4] Submit multi-node VERL training"
-TRAIN_SUBMIT="$(sbatch --export=ALL,SCHEDULER_URL="${URL}" "${TRAIN_SCRIPT}" "$@")"
+log "  -> code-gym continuous=${CODEGYM_REWARD_CONTINUOUS}"
+TRAIN_SUBMIT="$(sbatch --export=ALL,SCHEDULER_URL="${URL}",CODEGYM_REWARD_CONTINUOUS="${CODEGYM_REWARD_CONTINUOUS}" "${TRAIN_SCRIPT}" "$@")"
 TRAIN_ID="$(awk '{print $NF}' <<<"${TRAIN_SUBMIT}")"
 [[ "${TRAIN_ID}" =~ ^[0-9]+$ ]] || { echo "Failed to parse training job id: ${TRAIN_SUBMIT}" >&2; exit 1; }
 log "  -> Training JobID: ${TRAIN_ID}"

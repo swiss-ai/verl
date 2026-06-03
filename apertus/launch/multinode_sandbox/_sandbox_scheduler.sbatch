@@ -7,7 +7,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=288
 #SBATCH --gpus=0
-#SBATCH --time=03:00:00
+#SBATCH --time=05:00:00
 #SBATCH --reservation=SD-69241-apertus-1-5-0
 #SBATCH --output=slurm_logs/sandbox_scheduler_%j.out
 #SBATCH --error=slurm_logs/sandbox_scheduler_%j.err

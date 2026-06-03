@@ -7,7 +7,7 @@
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=64
 #SBATCH --environment=reasoning_fixed
-#SBATCH --time=09:00:00
+#SBATCH --time=05:00:00
 #SBATCH --reservation=SD-69241-apertus-1-5-0
 #SBATCH --output=slurm_logs/multinode_sandbox_%j.out
 #SBATCH --error=slurm_logs/multinode_sandbox_%j.err
@@ -32,6 +32,7 @@ PROJECT_NAME=apertus-rl-tests
 CONFIG_NAME=1p5_gmpo-loo  # 1p5_grpo
 DEFAULT_MEMORY_LIMIT_MB=512
 CODEGYM_REWARD_MAX_CONCURRENT=128
+CODEGYM_REWARD_CONTINUOUS="${CODEGYM_REWARD_CONTINUOUS:-true}"
 
 ROLLOUT_N=8
 SEED=85
@@ -78,6 +79,13 @@ resolve_run_name() {
   if [ -z "${RUN_NAME}" ]; then
     RUN_NAME="${model_tag}"
   fi
+  # if continuous reward, add a tag to the run name
+  if [ "${CODEGYM_REWARD_CONTINUOUS}" = true ]; then
+    RUN_NAME="continuous_${RUN_NAME}"
+  else
+    RUN_NAME="binary_${RUN_NAME}"
+  fi
+
   RUN_NAME="${RUN_NAME}_${CONFIG_NAME}_${NNODES}nodes"
 
   # if force thinking, add a tag to the run name
@@ -118,6 +126,7 @@ build_overrides() {
     "reward_model.sandbox_fusion.url=${SCHEDULER_URL}"
     "reward_model.sandbox_fusion.memory_limit_mb=${DEFAULT_MEMORY_LIMIT_MB}"
     "reward_model.sandbox_fusion.max_concurrent=${CODEGYM_REWARD_MAX_CONCURRENT}"
+    "+reward_model.sandbox_fusion.continuous=${CODEGYM_REWARD_CONTINUOUS}"
   )
 
   if [ -n "${TOKENIZER_NAME_OR_PATH}" ]; then

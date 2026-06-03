@@ -35,6 +35,7 @@ def default_compute_score(
     sandbox_fusion_url=None,
     concurrent_semaphore=None,
     memory_limit_mb=None,
+    continuous=True,
     **kwargs,
 ):
     """Compute the score for a given solution based on the data source.
@@ -144,12 +145,13 @@ def default_compute_score(
                 sandbox_fusion_url=scheduler_url,
                 concurrent_semaphore=concurrent_semaphore,
                 memory_limit_mb=memory_limit_mb,
+                continuous=continuous,
             )
         else:
             # Fallback to prime code scoring
             from . import prime_code
             test_cases = _code_test_cases_for_prime_code(ground_truth, extra_info)
-            res = prime_code.compute_score(solution_str, test_cases, continuous=True)
+            res = prime_code.compute_score(solution_str, test_cases, continuous=continuous)
     elif data_source in ["hiyouga/geometry3k"]:
         from . import geo3k
 
