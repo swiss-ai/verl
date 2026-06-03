@@ -13,7 +13,18 @@
 # limitations under the License.
 # from . import gsm8k, math, prime_math, prime_code
 
+import os
+
 from verl.utils.import_utils import deprecated
+
+
+def _code_test_cases_for_prime_code(ground_truth, extra_info):
+    if isinstance(extra_info, dict):
+        for key in ("prime_code_input_output", "input_output"):
+            value = extra_info.get(key)
+            if value:
+                return value
+    return ground_truth
 
 
 def default_compute_score(
@@ -51,6 +62,7 @@ def default_compute_score(
         "HuggingFaceH4/MATH-500",
         "SynthLabsAI/Big-Math-RL-Verified",
         "zwhe99/DeepMath-103K",
+        "deepmath",
         "deepscaler",
         "math500",
         "amc23",
@@ -106,33 +118,38 @@ def default_compute_score(
         from . import prime_math
 
         res = prime_math.compute_score(solution_str, ground_truth)
-    elif data_source in ["taco", "humaneval", "openai/openai_humaneval"]:
+    elif data_source in [
+        "humaneval",
+        "openai/openai_humaneval",
+    ]:
         from . import prime_code
-
-        # TODO: continuous is temporarily set to True, but this could impact
-        # the exposure of the model to coding tasks as DAPO-like filtering will likely
-        # reject fewer prompts.
         res = prime_code.compute_score(solution_str, ground_truth, continuous=True)
-    elif data_source in ["codecontests", "apps", "codeforces"]:
-        # Use the passed sandbox_fusion_url if available
-        if sandbox_fusion_url:
-            from . import sandbox_fusion
+    elif data_source in [
+        "taco",
+        "likaixin/TACO-verified",
+        "codecontests",
+        "deepmind/code_contests",
+        "apps",
+        "codeforces",
+    ]:
+        scheduler_url = sandbox_fusion_url or os.environ.get("SCHEDULER_URL")
+        if scheduler_url:
+            from . import codegym_sandbox
 
-            # Pass the URL directly, ground_truth likely contains test cases here
-            res = sandbox_fusion.compute_score(
-                sandbox_fusion_url,
-                concurrent_semaphore,
-                memory_limit_mb,
-                solution_str,
-                ground_truth,
-                continuous=True,
+            res = codegym_sandbox.compute_score(
+                data_source=data_source,
+                solution_str=solution_str,
+                ground_truth=ground_truth,
+                extra_info=extra_info,
+                sandbox_fusion_url=scheduler_url,
+                concurrent_semaphore=concurrent_semaphore,
+                memory_limit_mb=memory_limit_mb,
             )
         else:
-            # If no sandbox URL is provided, fall back to prime_code or raise error
+            # Fallback to prime code scoring
             from . import prime_code
-
-            # Assuming prime_code doesn't need the URL
-            res = prime_code.compute_score(solution_str, ground_truth, continuous=True)
+            test_cases = _code_test_cases_for_prime_code(ground_truth, extra_info)
+            res = prime_code.compute_score(solution_str, test_cases, continuous=True)
     elif data_source in ["hiyouga/geometry3k"]:
         from . import geo3k
 

@@ -44,8 +44,14 @@ MATH_FINAL_ANSWER_INSTRUCTION = (
 GSM8K_FINAL_ANSWER_INSTRUCTION = (
     'Let\'s think step by step and output the final answer after "####".'
 )
-MULTIPLE_CHOICE_FINAL_ANSWER_INSTRUCTION = "Put the letter of the correct option in <answer></answer>, for example <answer>A</answer>."
-CODE_FINAL_ANSWER_INSTRUCTION = "You may reason before answering. End your response with a Python code block containing the complete solution."
+MULTIPLE_CHOICE_FINAL_ANSWER_INSTRUCTION = (
+    "Put the letter of the correct option in <answer></answer>, "
+    "for example <answer>A</answer>."
+)
+CODE_FINAL_ANSWER_INSTRUCTION = (
+    "You may reason before answering. End your response with a Python 3 code "
+    "block containing the complete solution."
+)
 
 
 @dataclass(frozen=True)
@@ -411,7 +417,7 @@ def adapt_taco(
     question = normalize_text(get_value(example, config.question_key))
     starter_code = normalize_text(get_value(example, "starter_code"))
     raw_test_cases = parse_json_maybe(get_value(example, config.answer_key), default={})
-    test_cases = normalize_prime_code_test_cases(raw_test_cases)
+    prime_code_test_cases = normalize_prime_code_test_cases(raw_test_cases)
     raw_solutions = get_value(example, config.solution_key)
     solutions = parse_json_maybe(raw_solutions, default=raw_solutions)
     reference_solution = first_solution(solutions)
@@ -424,6 +430,10 @@ def adapt_taco(
         "name": get_value(example, "name"),
         "url": get_value(example, "url"),
         "reference_solution": reference_solution,
+        "language": "python",
+        "input_output": json_dumps(raw_test_cases),
+        "prime_code_input_output": json_dumps(prime_code_test_cases),
+        "sandbox_data_source": "likaixin/TACO-verified",
     }
     return make_row(
         config=config,
@@ -431,7 +441,7 @@ def adapt_taco(
         index=idx,
         prompt=prompt,
         ability="code",
-        ground_truth=json_dumps(test_cases),
+        ground_truth=reference_solution,
         extra_info=extra_info,
     )
 
@@ -443,9 +453,7 @@ def adapt_code_contests(
     question = normalize_text(get_value(example, config.question_key))
     test_cases = normalize_code_contests_test_cases(example)
     solutions = get_value(example, config.solution_key)
-    reference_solution = first_solution(
-        solutions.get("solution", []) if isinstance(solutions, dict) else solutions
-    )
+    reference_solution = first_code_contests_solution(solutions)
     prompt = make_prompt(format_code_prompt(question, ""))
     extra_info = {
         "question": question,
@@ -453,6 +461,10 @@ def adapt_code_contests(
         "source": normalize_text(get_value(example, "source")),
         "name": normalize_text(get_value(example, "name")),
         "reference_solution": reference_solution,
+        "language": "python",
+        "input_output": json_dumps(test_cases),
+        "prime_code_input_output": json_dumps(test_cases),
+        "sandbox_data_source": "lighteval/code_generation_lite",
         "cf_contest_id": get_value(example, "cf_contest_id"),
         "cf_index": normalize_text(get_value(example, "cf_index")),
         "cf_points": get_value(example, "cf_points"),
@@ -469,7 +481,7 @@ def adapt_code_contests(
         index=idx,
         prompt=prompt,
         ability="code",
-        ground_truth=json_dumps(test_cases),
+        ground_truth=reference_solution,
         extra_info=extra_info,
     )
 
@@ -630,6 +642,15 @@ def first_solution(solutions: Any) -> str:
     if isinstance(solutions, list) and solutions:
         return normalize_text(solutions[0])
     return normalize_text(solutions)
+
+
+def first_code_contests_solution(solutions: Any) -> str:
+    if isinstance(solutions, dict):
+        solution_values = solutions.get("solution", [])
+        if not solution_values:
+            return ""
+        return first_solution(solution_values)
+    return first_solution(solutions)
 
 
 def normalize_prime_code_test_cases(test_cases: Any) -> dict[str, Any]:
