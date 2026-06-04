@@ -20,7 +20,7 @@ import aiohttp
 import numpy as np
 import ray
 import torch
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from tensordict import TensorDict
 
 from verl.protocol import DataProto
@@ -62,12 +62,24 @@ class RewardLoopWorker:
         self._init_reward_fn()
 
     def _init_reward_fn(self):
-        input_tokenizer_local_path = copy_to_local(self.config.actor_rollout_ref.model.path)
-        self.input_tokenizer = hf_tokenizer(input_tokenizer_local_path, trust_remote_code=True)
+        actor_model_config = self.config.actor_rollout_ref.model
+        input_tokenizer_path = actor_model_config.get("tokenizer_path") or actor_model_config.path
+        input_tokenizer_local_path = copy_to_local(input_tokenizer_path)
+        input_tokenizer_kwargs = OmegaConf.to_container(
+            OmegaConf.create(actor_model_config.get("tokenizer_kwargs", {})), resolve=True
+        )
+        self.input_tokenizer = hf_tokenizer(
+            input_tokenizer_local_path, trust_remote_code=True, **input_tokenizer_kwargs
+        )
         self.reward_model_tokenizer = None
         if self.config.reward_model.enable:
             reward_model_tokenizer_local_path = copy_to_local(self.config.reward_model.model.path)
-            self.reward_model_tokenizer = hf_tokenizer(reward_model_tokenizer_local_path, trust_remote_code=True)
+            reward_model_tokenizer_kwargs = OmegaConf.to_container(
+                OmegaConf.create(self.config.reward_model.model.get("tokenizer_kwargs", {})), resolve=True
+            )
+            self.reward_model_tokenizer = hf_tokenizer(
+                reward_model_tokenizer_local_path, trust_remote_code=True, **reward_model_tokenizer_kwargs
+            )
         self.reward_fn = get_custom_reward_fn(self.config)
 
         # Load reward loop manager class

@@ -376,11 +376,16 @@ class AgentLoopWorker:
         self.dataset_cls = get_dataset_class(config.data)
         self.reward_router_address = reward_router_address
 
-        model_path = config.actor_rollout_ref.model.path
+        model_config = config.actor_rollout_ref.model
+        model_path = model_config.path
         self.model_name = "/".join(model_path.split("/")[-2:])
-        local_path = copy_to_local(config.actor_rollout_ref.model.path)
-        self.tokenizer = hf_tokenizer(local_path, trust_remote_code=True)
-        self.processor = hf_processor(local_path, trust_remote_code=True)
+        tokenizer_path = model_config.get("tokenizer_path") or model_path
+        local_path = copy_to_local(tokenizer_path)
+        tokenizer_kwargs = OmegaConf.to_container(
+            OmegaConf.create(model_config.get("tokenizer_kwargs", {})), resolve=True
+        )
+        self.tokenizer = hf_tokenizer(local_path, trust_remote_code=True, **tokenizer_kwargs)
+        self.processor = hf_processor(local_path, trust_remote_code=True, tokenizer_kwargs=tokenizer_kwargs)
 
         agent_loop_config_path = config.actor_rollout_ref.rollout.agent.agent_loop_config_path
         if agent_loop_config_path:
