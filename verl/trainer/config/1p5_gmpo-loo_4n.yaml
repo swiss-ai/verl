@@ -1,0 +1,15 @@
+defaults:
+  - 1p5_gmpo-loo
+  - _self_
+
+actor_rollout_ref:
+  actor:
+    ppo_max_token_len_per_gpu: 32768
+
+  rollout:
+    log_prob_max_token_len_per_gpu: 32768
+    max_num_batched_tokens: 8192
+    max_num_seqs: 256
+
+trainer:
+  nnodes: 4

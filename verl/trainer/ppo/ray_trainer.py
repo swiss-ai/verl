@@ -733,7 +733,7 @@ class RayPPOTrainer:
 
             # Store original inputs
             input_ids = test_batch.batch["prompts"]
-            input_texts = [self.tokenizer.decode(ids, skip_special_tokens=False) for ids in input_ids]
+            input_texts = [decode_keep_special_tokens_without_pad(self.tokenizer, ids) for ids in input_ids]
             sample_inputs.extend(input_texts)
             sample_uids.extend(test_batch.non_tensor_batch["uid"])
             batch_data_sources = np.asarray(

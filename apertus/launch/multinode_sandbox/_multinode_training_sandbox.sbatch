@@ -7,7 +7,7 @@
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=64
 #SBATCH --environment=reasoning_fixed
-#SBATCH --time=05:00:00
+#SBATCH --time=12:00:00
 #SBATCH --reservation=SD-69241-apertus-1-5-0
 #SBATCH --output=slurm_logs/multinode_sandbox_%j.out
 #SBATCH --error=slurm_logs/multinode_sandbox_%j.err
@@ -25,20 +25,21 @@ HF_HUB_CACHE_DIR=${HF_HOME}/hub
 
 cd "${WORKING_DIR}"
 
-# MODEL_NAME_OR_PATH=/capstor/scratch/cscs/msantelmo/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca
-MODEL_NAME_OR_PATH=/iopsstor/scratch/cscs/msantelmo/checkpoints/Apertus-1p5-8B-sft-capfilter-linear-it8816
-TOKENIZER_NAME_OR_PATH="" # Use the same as the model by default
-PROJECT_NAME=apertus-rl-tests
-CONFIG_NAME=1p5_gmpo-loo  # 1p5_grpo
-DEFAULT_MEMORY_LIMIT_MB=512
-CODEGYM_REWARD_MAX_CONCURRENT=128
-CODEGYM_REWARD_CONTINUOUS="${CODEGYM_REWARD_CONTINUOUS:-true}"
+PROJECT_NAME="${PROJECT_NAME:-apertus-rl-tests}"
 
-ROLLOUT_N=8
-SEED=85
-ENABLE_THINKING=false
-FORCE_THINKING=false
-THINK_PREFIX_TOKEN="<think>"
+MODEL_NAME_OR_PATH="${MODEL_NAME_OR_PATH:-/iopsstor/scratch/cscs/msantelmo/checkpoints/Apertus-1p5-8B-sft-capfilter-linear-it8816}"
+TOKENIZER_NAME_OR_PATH="${TOKENIZER_NAME_OR_PATH:-}" # Use the same as the model by default
+CONFIG_NAME="${CONFIG_NAME:-1p5_gmpo-loo}"
+ROLLOUT_N="${ROLLOUT_N:-8}"
+SEED="${SEED:-85}"
+ENABLE_THINKING="${ENABLE_THINKING:-false}"
+FORCE_THINKING="${FORCE_THINKING:-false}"
+THINK_PREFIX_TOKEN="${THINK_PREFIX_TOKEN:-<think>}"
+
+# Sandbox and code reward settings
+DEFAULT_MEMORY_LIMIT_MB=512
+CODEGYM_REWARD_MAX_CONCURRENT=64
+CODEGYM_REWARD_CONTINUOUS="${CODEGYM_REWARD_CONTINUOUS:-false}" # default to binary reward
 
 PY_DEPS_DIR=/iopsstor/scratch/cscs/msantelmo/python_deps/apertus_reward_py312
 MATH_VERIFY_DEPS_DIR=/iopsstor/scratch/cscs/msantelmo/python_deps/math_verify_py312
@@ -49,13 +50,13 @@ DEPS_LOCK=${DEPS_STAMP_DIR}/apertus_reward_py312.lock
 IF_REWARD_PIP_PACKAGES="immutabledict nltk langdetect absl-py emoji syllapy antlr4-python3-runtime==4.9.3 requests"
 MATH_VERIFY_PIP_PACKAGES="math_verify"
 
-NNODES="${SLURM_NNODES:-${SLURM_JOB_NUM_NODES:-2}}"
+NNODES="${NNODES:-${SLURM_NNODES:-${SLURM_JOB_NUM_NODES:-2}}}"
 GPUS_PER_NODE="${GPUS_PER_NODE:-${SLURM_GPUS_ON_NODE:-${SLURM_GPUS_PER_NODE:-4}}}"
 GPUS_PER_NODE="${GPUS_PER_NODE%%(*}"
 GPUS_PER_NODE="${GPUS_PER_NODE##*:}"
 CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-64}"
 
-DATA_DIR=${WORKING_DIR}/data/apertus_demo_rl
+DATA_DIR="${TRAINING_DATA_DIR:-${WORKING_DIR}/data/apertus_demo_rl}"
 TRAIN_FILE=${DATA_DIR}/train.parquet
 TEST_FILE=${DATA_DIR}/val.parquet
 OUTPUT_ROOT=${WORKING_DIR}/outputs/${PROJECT_NAME}
@@ -64,35 +65,19 @@ RUN_NAME="${RUN_NAME:-}"
 
 ####################################################################################################
 
-if [ "${FORCE_THINKING}" = true ]; then
-  FORCE_THINKING_FLAGS=(
-    "data.force_thinking_prefix=true"
-    "data.thinking_prefix_token='${THINK_PREFIX_TOKEN}'"
-  )
-else
-  FORCE_THINKING_FLAGS=()
-fi
-
 resolve_run_name() {
   local model_tag
   model_tag="$(basename "${MODEL_NAME_OR_PATH}" | tr '/:.' '-' | tr -c '[:alnum:]_-' '-')"
   if [ -z "${RUN_NAME}" ]; then
     RUN_NAME="${model_tag}"
-  fi
-  # if continuous reward, add a tag to the run name
-  if [ "${CODEGYM_REWARD_CONTINUOUS}" = true ]; then
-    RUN_NAME="continuous_${RUN_NAME}"
-  else
-    RUN_NAME="binary_${RUN_NAME}"
+    RUN_NAME="${RUN_NAME}_${CONFIG_NAME}_${NNODES}nodes"
+
+    if [ "${FORCE_THINKING}" = true ]; then
+      RUN_NAME="${RUN_NAME}_force-think"
+    fi
+    RUN_NAME="${RUN_NAME}__seed${SEED}"
   fi
 
-  RUN_NAME="${RUN_NAME}_${CONFIG_NAME}_${NNODES}nodes"
-
-  # if force thinking, add a tag to the run name
-  if [ "${FORCE_THINKING}" = true ]; then
-    RUN_NAME="${RUN_NAME}_force-think"
-  fi
-  RUN_NAME="${RUN_NAME}__seed${SEED}"
   RUN_NAME="${RUN_NAME}__$(date +%Y%m%d-%H%M%S)"
   RUN_DIR="${OUTPUT_ROOT}/${RUN_NAME}"
   mkdir -p "${RUN_DIR}"
@@ -108,6 +93,8 @@ build_overrides() {
     "data.val_files=['${TEST_FILE}']"
     "data.seed=${SEED}"
     "data.apply_chat_template_kwargs.enable_thinking=${ENABLE_THINKING}"
+    "data.force_thinking_prefix=${FORCE_THINKING}"
+    "data.thinking_prefix_token='${THINK_PREFIX_TOKEN}'"
     "trainer.project_name=${PROJECT_NAME}"
     "trainer.experiment_name=${RUN_NAME}"
     "trainer.default_local_dir=${RUN_DIR}"
@@ -131,10 +118,6 @@ build_overrides() {
 
   if [ -n "${TOKENIZER_NAME_OR_PATH}" ]; then
     overrides+=("actor_rollout_ref.model.tokenizer_path=${TOKENIZER_NAME_OR_PATH}")
-  fi
-
-  if [ "${#FORCE_THINKING_FLAGS[@]}" -gt 0 ]; then
-    overrides+=("${FORCE_THINKING_FLAGS[@]}")
   fi
 }
 
