@@ -1,0 +1,9 @@
+defaults:
+  - 1p5_gmpo-loo_4n
+  - _self_
+
+algorithm:
+  adv_estimator: maxrl
+
+trainer:
+  experiment_name: gmpo-maxrl-group-filtering

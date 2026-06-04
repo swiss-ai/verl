@@ -1,0 +1,9 @@
+defaults:
+  - 1p5_grpo_4n
+  - _self_
+
+algorithm:
+  adv_estimator: maxrl
+
+trainer:
+  experiment_name: maxrl-group-filtering

@@ -349,9 +349,9 @@ def compute_maxrl_outcome_advantage(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute MaxRL-style outcome advantages.
 
-    Match the reference MaxRL implementation:
+    For an empirical per-prompt success rate p_hat_g:
         A_i = (r_i - p_hat_g) / (p_hat_g + epsilon),
-    where p_hat_g is the empirical group mean reward.
+    with zero gradient for groups with no successful rollouts.
     """
     del norm_adv_by_std_in_grpo, config
 
@@ -360,7 +360,11 @@ def compute_maxrl_outcome_advantage(
         g = as_torch_index(index, device=scores.device)
         mean_g, _, _ = group_mean_std(scores, g, eps=epsilon, device=scores.device)
         group_mean = mean_g[g]
-        scalar_advantages = (scores - group_mean) / (group_mean + epsilon)
+        scalar_advantages = torch.where(
+            group_mean > 0.0,
+            (scores - group_mean) / (group_mean + epsilon),
+            torch.zeros_like(scores),
+        )
         advantages = scalar_advantages.unsqueeze(-1) * response_mask
         return advantages, advantages
 
