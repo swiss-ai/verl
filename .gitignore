@@ -131,6 +131,8 @@ logs
 log
 outputs
 .history
+slurm_logs/
+scratch/
 
 # core dumps
 core_*

@@ -192,6 +192,12 @@ class SimpleCommGroup:
         if (not isinstance(other, SimpleCommGroup)):
             return False
         return other.ranks == self.ranks
+    
+    def __hash__(self):
+        return hash(tuple(
+            (r.local_rank, r.session_id)
+            for r in self.ranks
+        ))
 
 class DataParallelSimpleTopology:
     """

@@ -74,12 +74,12 @@ except ImportError as e:
 try:
     from .cxi_checkpoint_engine import ShardedCxiCheckpointEngine
     __all__ += ["ShardedCxiCheckpointEngine"]
-except ImportError:
+except ImportError as e:
+    print(f"Error importing CXI checkpoint engine: {e}")
     ShardedCxiCheckpointEngine = None
 
 try:
     from .cxi_double_door import DoubleDoorCxiCheckpointEngine
     __all__ += ["DoubleDoorCxiCheckpointEngine"]
 except ImportError:
-    print("error importing")
     DoubleDoorCxiCheckpointEngine = None
