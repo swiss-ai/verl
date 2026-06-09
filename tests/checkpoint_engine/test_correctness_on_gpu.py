@@ -246,8 +246,8 @@ if __name__ == "__main__":
 
     asyncio.run(test_mooncake_checkpoint_engine(
         rebuild_group=False,
-        num_trainer=3,
-        num_rollout=1,
+        num_trainer=2,
+        num_rollout=2,
         num_gpus_per_node=4,
         device="cuda"
     ))
