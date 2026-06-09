@@ -1,16 +1,3 @@
-# Copyright 2024 Bytedance Ltd. and/or its affiliates
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 import asyncio
 from typing import Generator
 
@@ -29,10 +16,30 @@ from verl.workers.rollout import BaseRollout, RolloutReplica
 from verl.single_controller.base import Worker
 import os
 import time
+from verl.utils.device import get_torch_device
+from verl.utils.distributed import initialize_global_process_group_ray, set_numa_affinity
 
-class TrainingWorkerTest(TrainingWorker):
-    def __init__(self, config: TrainingWorkerConfig, checkpoint_engine_config: CheckpointEngineConfig) -> None:
-        super().__init__(config)
+def generate_random_weights(size = 2048 * 2048):
+    torch.random.manual_seed(192767)
+    weights = []
+    for i in range(32):
+        weights.append(
+            (f"weight_{i}", torch.arange(start=i*size, end=(i+1)*size, dtype = torch.int64, device="cuda"))
+        )
+    return weights
+
+
+class MockTrainingWorker(Worker):
+
+    def __init__(self, checkpoint_engine_config: CheckpointEngineConfig) -> None:
+        Worker.__init__(self)
+
+
+        # dist stuff
+        initialize_global_process_group_ray(timeout_second=None)
+        set_numa_affinity()
+        
+        # CE init
         backend = checkpoint_engine_config.backend
         bucket_size = checkpoint_engine_config.update_weights_bucket_megabytes << 20
         engine_kwargs = checkpoint_engine_config.engine_kwargs.get(backend, {})
@@ -40,28 +47,22 @@ class TrainingWorkerTest(TrainingWorker):
             engine_kwargs["is_master"] = True
         self.checkpoint_engine = CheckpointEngineRegistry.new(backend, bucket_size=bucket_size, **engine_kwargs)
 
+        self.weights = generate_random_weights()
+
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     async def update_weights(self, global_steps: int = None, mode: str = "auto"):
-        per_tensor_param, _ = self.engine.get_per_tensor_param()
-        # device_map = {}
-        # for (name, weight) in per_tensor_param:
-        #     if (weight.device not in device_map):
-        #         device_map[weight.device] = [name]
-        #     else:
-        #         device_map[weight].append(name)
-        # print(device_map)
+        per_tensor_param = self.weights
         await self.checkpoint_engine.send_weights(per_tensor_param)
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE, blocking=False)
     def execute_checkpoint_engine(self, method: str, *args, **kwargs):
         return getattr(self.checkpoint_engine, method)(*args, **kwargs)
 
-
 class MockServerAdapter(BaseRollout):
     def __init__(self, config: RolloutConfig, model_config: HFModelConfig, check_allclose: bool = True):
         super().__init__(config, model_config, device_mesh=None)
         self.check_allclose = check_allclose
-        self.model = None
+        self.weights = generate_random_weights()
         self.received_weights: dict[str, torch.Tensor] = {}
 
     async def resume(self, tags: list[str]):
@@ -76,19 +77,16 @@ class MockServerAdapter(BaseRollout):
         **kwargs,
     ):
         async for name, weight in weights:
-            weight = weight.clone()
             if self.check_allclose:
-                self.received_weights[name] = weight.clone()
+                self.received_weights[name] = torch.empty_like(weight, device="cuda")
+                # print(f"copying..., weight is on={weight.device}")
+                self.received_weights[name].copy_(weight, non_blocking=True)
 
     def check_weights(self):
         if not self.check_allclose:
             return
-
-        if self.model is None:
-            local_path = copy_to_local(self.model_config.path)
-            self.model = AutoModelForCausalLM.from_pretrained(local_path, torch_dtype=torch.bfloat16, device_map="cpu")
-
-        for name, weight in self.model.state_dict().items():
+        
+        for name, weight in self.weights:
             assert name in self.received_weights, f"weight {name} not received"
             received = self.received_weights[name].flatten()
             target = weight.to(received.device).flatten()
@@ -96,16 +94,7 @@ class MockServerAdapter(BaseRollout):
             mask = ~(target == received)
             idx = mask.nonzero()
             if (mask.any()):
-                print(f"{idx.shape[0]} mismatches")
-
-                for i in idx[:2]:  # print first 10
-                    i = tuple(i.tolist())
-                    print(
-                        f"index={i}, "
-                        f"a={received[i]}, "
-                        f"b={target[i]}, "
-                        f"diff={abs(received[i] - target[i])}"
-                    )
+                print(f"{name} mismatch at {idx.shape[0]}")
             # print(f"{name}:\n{weight.to(received.device)}\n{received}")
             torch.testing.assert_close(target, received)
             # assert torch.allclose(weight.to(received.device), received), f"weight {name} not equal: {weight.to(received.device)} vs {received}"
@@ -133,7 +122,7 @@ class MockReplica(RolloutReplica):
         raise NotImplementedError
 
 
-class CheckpointEngineWorkerTest(CheckpointEngineWorker):
+class MockCheckpointEngineWorker(CheckpointEngineWorker):
     def __init__(
         self, rollout_config: RolloutConfig, model_config: HFModelConfig, check_allclose: bool = True, *args, **kwargs
     ) -> None:
@@ -144,20 +133,11 @@ class CheckpointEngineWorkerTest(CheckpointEngineWorker):
     def check_weights(self):
         self.server_adapter.check_weights()
 
-
-def create_trainer_worker_group(
-    resource_pool: RayResourcePool, model_config: HFModelConfig, checkpoint_engine_config: CheckpointEngineConfig
+def create_mock_trainer_wg(
+    resource_pool: RayResourcePool, checkpoint_engine_config: CheckpointEngineConfig
 ) -> RayWorkerGroup:
-    engine_config = FSDPEngineConfig(forward_only=True, fsdp_size=resource_pool.world_size, strategy="fsdp")
-    trainer_config = TrainingWorkerConfig(
-        model_type="language_model",
-        model_config=model_config,
-        engine_config=engine_config,
-    )
-
     ray_cls_with_init = RayClassWithInitArgs(
-        cls=ray.remote(TrainingWorkerTest),
-        config=trainer_config,
+        cls=ray.remote(MockTrainingWorker),
         checkpoint_engine_config=checkpoint_engine_config,
     )
     ray_cls_with_init.update_options(
@@ -172,8 +152,7 @@ def create_trainer_worker_group(
     wg = RayWorkerGroup(resource_pool=resource_pool, ray_cls_with_init=ray_cls_with_init, device_name=get_device_name())
     return wg
 
-
-async def create_rollout_worker_group(
+async def create_mock_rollout_wg(
     resource_pool: RayResourcePool,
     model_config: HFModelConfig,
     rollout_config: RolloutConfig,
@@ -181,7 +160,7 @@ async def create_rollout_worker_group(
 ) -> tuple[RayWorkerGroup, list[MockReplica]]:
     # create rollout worker group
     ray_cls_with_init = RayClassWithInitArgs(
-        cls=ray.remote(CheckpointEngineWorkerTest),
+        cls=ray.remote(MockCheckpointEngineWorker),
         model_config=model_config,
         rollout_config=rollout_config,
         check_allclose=check_allclose,
@@ -206,3 +185,4 @@ async def create_rollout_worker_group(
     await asyncio.gather(*[replica.init_hybrid(wg) for replica in replicas])
 
     return wg, replicas
+

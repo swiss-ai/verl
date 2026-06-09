@@ -21,7 +21,7 @@ from typing import Any, AsyncGenerator, Generator
 import ray
 import torch
 from mooncake.engine import TransferEngine
-from vllm.distributed.utils import StatelessProcessGroup
+from verl.checkpoint_engine.utils import StatelessProcessGroup
 
 from verl.checkpoint_engine.base import CheckpointEngine, CheckpointEngineRegistry, TensorMeta
 from verl.utils.device import get_torch_device

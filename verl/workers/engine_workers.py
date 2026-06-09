@@ -609,7 +609,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # 4. build checkpoint engine
         if "actor" in self.role:
-            checkpoint_engine_config = omega_conf_to_dataclass(self.config.rollout.checkpoint_engine)
+            checkpoint_engine_config = omega_conf_to_dataclass(self.config.checkpoint_engine)
             backend = checkpoint_engine_config.backend
             bucket_size = checkpoint_engine_config.update_weights_bucket_megabytes << 20
             engine_kwargs = checkpoint_engine_config.engine_kwargs.get(backend, {})
