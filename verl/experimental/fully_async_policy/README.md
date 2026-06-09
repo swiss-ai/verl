@@ -2,7 +2,7 @@
 
 **Author:** `https://github.com/meituan-search`
 
-Last updated: 05/09/2026.
+Last updated: 05/25/2026.
 
 This document introduces a fully asynchronous PPO training system that completely decouples the Trainer and Rollouter,
 supporting asynchronous sample generation and training.
@@ -229,6 +229,12 @@ https://github.com/ArronHZG/verl-community/blob/main/docs/fully_async_policy_rev
 ![fully_async_policy_mode](
 https://github.com/ArronHZG/verl-community/blob/main/docs/fully_async_policy_mode.svg?raw=true)
 
+### Dynamic Sampling
+
+Fully async training supports DAPO-style group filtering (dynamic sampling) through `algorithm.filter_groups`.
+When enabled, the Rollouter can drops group before queueing if all its trajectories have the same value of configured metric. Supported metrics are reward extras returned by the reward function, such as `acc`, and
+`seq_reward` derived from `rm_scores`. `seq_final_reward` is supported only when `algorithm.use_kl_in_reward=False` as KL term is computed on Trainer side.
+
 ### Key Metrics
 
 | metrics                                        | implication                                                                                            |
@@ -237,6 +243,8 @@ https://github.com/ArronHZG/verl-community/blob/main/docs/fully_async_policy_mod
 | `rollouter/idle_ratio`                         | Rollouter idle rate                                                                                    |
 | `fully_async/count/stale_samples_processed`    | Total number of old samples used in training                                                           |
 | `fully_async/count/stale_trajectory_processed` | Total number of old trajectories used in training (one sample produces rollout.n trajectories)         |
+| `fully_async/count/filtered_group_samples`     | Total number of prompt/groups dropped by `algorithm.filter_groups` before queue insertion              |
+| `fully_async/count/filtered_group_trajectories` | Total number of trajectories dropped by `algorithm.filter_groups` before queue insertion              |
 | `fully_async/partial/total_partial_num`        | Number of partial samples processed by Trainer between two trigger_parameter_sync_step                 |
 | `fully_async/partial/partial_ratio`            | Ratio of partial samples processed by Trainer between two trigger_parameter_sync_step                  |
 | `fully_async/partial/max_partial_span`         | Maximum parameter span of partial samples processed by Trainer between two trigger_parameter_sync_step |
@@ -565,14 +573,3 @@ To validate the performance of `fully_async_policy` on multi-turn tool-calling t
 | fully_async_policy 	 | 16: 16              	 | 221.36 	  | 40.59   	 | \            	 | 179.58       	 | 6h 19m<br>(1.55x)      	 | 14h 4m<br>(1.60x)      	 |   start:0.11<br>last:0.2044 	   |
 
 > source data: https://wandb.ai/hou-zg-meituan/fully-async-policy-multiturn-tool?nw=nwuserhouzg
-
-## Future Plans
-
-* GRPO experiments
-* Megatron adaptation
-* SGLang integration
-* Transfer queue integration
-* Asynchronous parameter synchronization
-* AReaL asynchronous algorithm implementation
-* TPPO algorithm implementation
-* Multi-turn and Tool support

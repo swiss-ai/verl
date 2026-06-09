@@ -22,6 +22,7 @@ import json
 import os
 import uuid
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from pprint import pprint
 from typing import Any, Optional
 
@@ -46,6 +47,8 @@ from verl.trainer.ppo.metric_utils import (
     compute_timing_metrics,
     compute_variance_proxy_metrics,
     process_validation_metrics,
+    compute_generation_sample_metrics,
+    aggregate_generation_sample_metrics,
 )
 from verl.trainer.ppo.reward import extract_reward
 from verl.trainer.ppo.utils import (
@@ -63,8 +66,8 @@ from verl.utils.debug import marked_timer
 from verl.utils.import_utils import deprecated, load_class_from_fqn
 from verl.utils.metric import reduce_metrics
 from verl.utils.py_functional import rename_dict
-from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
+from verl.utils.skip.skip_manager import SkipManager
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.config import DistillationConfig, EngineConfig
@@ -130,6 +133,61 @@ def compute_response_mask(data: DataProto):
     response_length = responses.size(1)
     attention_mask = data.batch["attention_mask"]
     return attention_mask[:, -response_length:]
+
+
+def decode_keep_special_tokens_without_pad(tokenizer, token_ids):
+    pad_token_id = getattr(tokenizer, "pad_token_id", None)
+    if pad_token_id is not None:
+        token_ids = token_ids[token_ids != pad_token_id]
+    return tokenizer.decode(token_ids, skip_special_tokens=False)
+
+def compute_spec_decode_metrics(
+    spec_drafts,
+    spec_accepts,
+    spec_verifies,
+    non_padding_mask=None,
+) -> dict:
+    """Aggregate per-request speculative decoding stats.
+
+    Ratios are computed per request and then averaged, so long and short
+    responses have equal metric weight.
+
+    The three inputs come from the rollout engine (vLLM request spec-decode
+    stats or sglang ``meta_info["spec_*"]`` keys). Either all three are ``None``
+    (caller didn't fetch them, e.g. spec rollout disabled) and the function
+    is a no-op, or all three are populated; mixed state is a programmer error.
+
+    ``non_padding_mask`` is a numpy bool array used by sync PPO to drop padded
+    placeholder samples; pass ``None`` for async PPO.
+    """
+    if spec_drafts is None and spec_accepts is None and spec_verifies is None:
+        return {}
+    assert spec_drafts is not None and spec_accepts is not None and spec_verifies is not None, (
+        "spec_decode metrics require all three of spec_num_draft_tokens / "
+        "spec_num_accepted_tokens / spec_num_verify_steps; got partial inputs"
+    )
+
+    drafts = spec_drafts.tolist() if hasattr(spec_drafts, "tolist") else list(spec_drafts)
+    accepts = spec_accepts.tolist() if hasattr(spec_accepts, "tolist") else list(spec_accepts)
+    verifies = spec_verifies.tolist() if hasattr(spec_verifies, "tolist") else list(spec_verifies)
+
+    if non_padding_mask is not None:
+        drafts = [d for d, keep in zip(drafts, non_padding_mask, strict=True) if keep]
+        accepts = [a for a, keep in zip(accepts, non_padding_mask, strict=True) if keep]
+        verifies = [v for v, keep in zip(verifies, non_padding_mask, strict=True) if keep]
+
+    if len(drafts) == 0:
+        return {}
+
+    # Treat zero-denominator samples as 0.0 and keep them in the mean.
+    per_sample_accept_rate = [(a / d) if d > 0 else 0.0 for a, d in zip(accepts, drafts, strict=True)]
+    per_sample_accept_length = [(1.0 + a / v) if v > 0 else 0.0 for a, v in zip(accepts, verifies, strict=True)]
+
+    n = len(drafts)
+    return {
+        "rollout/spec_accept_rate": float(sum(per_sample_accept_rate) / n),
+        "rollout/spec_accept_length": float(sum(per_sample_accept_length) / n),
+    }
 
 
 def compute_advantage(
@@ -319,6 +377,7 @@ class RayPPOTrainer:
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
         self.checkpoint_manager = None
+        self._init_dump_executor()
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
@@ -402,10 +461,11 @@ class RayPPOTrainer:
         except Exception as e:
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
 
-    def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
-        """Dump rollout/validation samples as JSONL."""
+    @staticmethod
+    def _write_generations(inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path, global_steps, extra_fields=None):
+        """Write generation samples as JSONL (runs in background thread)."""
         os.makedirs(dump_path, exist_ok=True)
-        filename = os.path.join(dump_path, f"{self.global_steps}.jsonl")
+        filename = os.path.join(dump_path, f"{global_steps}.jsonl")
 
         n = len(inputs)
         base_data = {
@@ -413,22 +473,71 @@ class RayPPOTrainer:
             "output": outputs,
             "gts": gts,
             "score": scores,
-            "step": [self.global_steps] * n,
+            "step": [global_steps] * n,
         }
 
         for k, v in reward_extra_infos_dict.items():
             if len(v) == n:
                 base_data[k] = v
+        if extra_fields is not None:
+            for k, v in extra_fields.items():
+                if len(v) == n:
+                    base_data[k] = v
+
+        def json_ready(value):
+            if isinstance(value, np.generic):
+                return value.item()
+            if isinstance(value, torch.Tensor) and value.numel() == 1:
+                return value.item()
+            return value
 
         lines = []
         for i in range(n):
-            entry = {k: v[i] for k, v in base_data.items()}
-            lines.append(json.dumps(entry, ensure_ascii=False, default=str))
+            entry = {k: json_ready(v[i]) for k, v in base_data.items()}
+            lines.append(json.dumps(entry, ensure_ascii=False))
 
         with open(filename, "w") as f:
-            f.write("\n".join(lines) + "\n")
+            for i in range(n):
+                entry = {k: v[i] for k, v in base_data.items()}
+                f.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
 
         print(f"Dumped generations to {filename}")
+
+    def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path, extra_fields=None):
+        """Dump rollout/validation samples as JSONL asynchronously."""
+        global_steps = self.global_steps
+        future = self._dump_executor.submit(
+            self._write_generations,
+            inputs,
+            outputs,
+            gts,
+            scores,
+            reward_extra_infos_dict,
+            dump_path,
+            global_steps,
+            extra_fields,
+        )
+        self._dump_futures.append(future)
+        # Clean up completed futures and surface any exceptions early
+        still_pending = []
+        for f in self._dump_futures:
+            if f.done():
+                f.result()  # re-raises if the write failed
+            else:
+                still_pending.append(f)
+        self._dump_futures = still_pending
+
+    def _init_dump_executor(self):
+        """Create or recreate the dump executor and futures list."""
+        self._dump_executor = ThreadPoolExecutor(max_workers=1)
+        self._dump_futures = []
+
+    def _shutdown_dump_executor(self):
+        """Drain pending dump futures and shut down the executor."""
+        for f in self._dump_futures:
+            f.result()
+        self._dump_futures.clear()
+        self._dump_executor.shutdown(wait=True)
 
     def _log_rollout_data(
         self, batch: DataProto, reward_extra_infos_dict: dict, timing_raw: dict, rollout_data_dir: str
@@ -441,13 +550,15 @@ class RayPPOTrainer:
             rollout_data_dir (str): Directory path to save the rollout data
         """
         with marked_timer("dump_rollout_generations", timing_raw, color="green"):
-            inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
-            outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
+            input_ids = batch.batch["prompts"]
+            inputs = [decode_keep_special_tokens_without_pad(self.tokenizer, ids) for ids in input_ids]
+            output_ids = batch.batch["responses"]
+            outputs = [decode_keep_special_tokens_without_pad(self.tokenizer, ids) for ids in output_ids]
             scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
             sample_gts = [item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in batch]
 
             reward_extra_infos_to_dump = {
-                k: (v.tolist() if isinstance(v, np.ndarray) else v) for k, v in reward_extra_infos_dict.items()
+                k: (v.tolist() if hasattr(v, "tolist") else v) for k, v in reward_extra_infos_dict.items()
             }
             if "request_id" in batch.non_tensor_batch:
                 reward_extra_infos_to_dump.setdefault(
@@ -504,6 +615,12 @@ class RayPPOTrainer:
 
         return gen_batch
 
+    def _prompt_thinking_start_tokens(self) -> set[str] | None:
+        if self.config.data.get("force_thinking_prefix", False):
+            return {self.config.data.get("thinking_prefix_token", "<|inner_prefix|>")}
+        return None
+
+
     def _compute_reward_colocate(self, batch: DataProto) -> tuple[torch.Tensor, dict[str, Any]] | torch.Tensor:
         """
         compute reward use colocate reward model
@@ -523,6 +640,9 @@ class RayPPOTrainer:
         sample_scores = []
         sample_turns = []
         sample_uids = []
+        sample_data_sources = []
+        sample_indices = []
+        generation_sample_metrics: dict[str, list[float]] = defaultdict(list)
 
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
@@ -575,18 +695,35 @@ class RayPPOTrainer:
 
             # Store generated outputs
             output_ids = test_output_gen_batch.batch["responses"]
-            output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
+            output_texts = [decode_keep_special_tokens_without_pad(self.tokenizer, ids) for ids in output_ids]
             sample_outputs.extend(output_texts)
 
             test_batch = test_batch.union(test_output_gen_batch)
             test_batch.meta_info["validate"] = True
+            if "response_mask" not in test_batch.batch.keys():
+                test_batch.batch["response_mask"] = compute_response_mask(test_batch)
+
+            batch_generation_sample_metrics = compute_generation_sample_metrics(
+                test_batch,
+                tokenizer=self.tokenizer,
+                prompt_thinking_start_tokens=self._prompt_thinking_start_tokens(),
+            )
+            for key, values in batch_generation_sample_metrics.items():
+                generation_sample_metrics[key].extend(values)
 
             # Store original inputs
             input_ids = test_batch.batch["prompts"]
-            # TODO: Can we keep special tokens except for padding tokens?
-            input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
+            input_texts = [decode_keep_special_tokens_without_pad(self.tokenizer, ids) for ids in input_ids]
             sample_inputs.extend(input_texts)
             sample_uids.extend(test_batch.non_tensor_batch["uid"])
+            batch_data_sources = np.asarray(
+                test_batch.non_tensor_batch.get("data_source", ["unknown"] * len(test_batch)), dtype=object
+            )
+            batch_indices = np.asarray(
+                test_batch.non_tensor_batch.get("index", [None] * len(test_batch)), dtype=object
+            )
+            sample_data_sources.extend(batch_data_sources.tolist())
+            sample_indices.extend(batch_indices.tolist())
 
             # evaluate using reward_function
             reward_tensor, reward_extra_info = extract_reward(test_batch)
@@ -607,13 +744,18 @@ class RayPPOTrainer:
             if "__num_turns__" in test_batch.non_tensor_batch:
                 sample_turns.append(test_batch.non_tensor_batch["__num_turns__"])
 
-            data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
+            data_source_lst.append(batch_data_sources)
 
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
 
         # dump generations
         val_data_dir = self.config.trainer.get("validation_data_dir", None)
         if val_data_dir:
+            generation_dump_fields = {
+                "data_source": sample_data_sources,
+                "index": sample_indices,
+                **generation_sample_metrics,
+            }
             self._dump_generations(
                 inputs=sample_inputs,
                 outputs=sample_outputs,
@@ -621,10 +763,13 @@ class RayPPOTrainer:
                 scores=sample_scores,
                 reward_extra_infos_dict=reward_extra_infos_dict,
                 dump_path=val_data_dir,
+                extra_fields=generation_dump_fields,
             )
 
         for key_info, lst in reward_extra_infos_dict.items():
             assert len(lst) == 0 or len(lst) == len(sample_scores), f"{key_info}: {len(lst)=}, {len(sample_scores)=}"
+        for key_info, lst in generation_sample_metrics.items():
+            assert len(lst) == len(sample_scores), f"{key_info}: {len(lst)=}, {len(sample_scores)=}"
 
         if merged:
             print("_merge_validation_results validate result will be merged")
@@ -633,11 +778,21 @@ class RayPPOTrainer:
                 "sample_uids": sample_uids,
                 "sample_turns": sample_turns,
                 "reward_extra_infos_dict": reward_extra_infos_dict,
+                "generation_sample_metrics": generation_sample_metrics,
             }
         data_sources = np.concatenate(data_source_lst, axis=0)
-        return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
+        return self._val_metrics_update(
+            data_sources, sample_uids, reward_extra_infos_dict, sample_turns, generation_sample_metrics
+        )
 
-    def _val_metrics_update(self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns):
+    def _val_metrics_update(
+        self,
+        data_sources,
+        sample_uids,
+        reward_extra_infos_dict,
+        sample_turns,
+        generation_sample_metrics=None,
+    ):
         data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
         metric_dict = {}
         for data_source, var2metric2val in data_src2var2metric2val.items():
@@ -662,15 +817,44 @@ class RayPPOTrainer:
             metric_dict["val-aux/num_turns/max"] = sample_turns.max()
             metric_dict["val-aux/num_turns/mean"] = sample_turns.mean()
 
+        if generation_sample_metrics:
+            data_sources = np.asarray(data_sources)
+            for data_source in np.unique(data_sources):
+                source_indices = np.where(data_sources == data_source)[0]
+                source_sample_metrics = {
+                    key: [values[idx] for idx in source_indices]
+                    for key, values in generation_sample_metrics.items()
+                    if len(values) == len(data_sources)
+                }
+                metric_dict.update(
+                    aggregate_generation_sample_metrics(
+                        source_sample_metrics,
+                        prefix=f"val-aux/{data_source}/generation/",
+                        include_response_length=True,
+                    )
+                )
+
         return metric_dict
 
     def _merge_validation_results(self, result_a, result_b):
         if result_a is None and result_b is None:
             return {}
         if result_a is None:
-            result_a = {"data_sources": [], "sample_uids": [], "sample_turns": [], "reward_extra_infos_dict": {}}
+            result_a = {
+                "data_sources": [],
+                "sample_uids": [],
+                "sample_turns": [],
+                "reward_extra_infos_dict": {},
+                "generation_sample_metrics": {},
+            }
         if result_b is None:
-            result_b = {"data_sources": [], "sample_uids": [], "sample_turns": [], "reward_extra_infos_dict": {}}
+            result_b = {
+                "data_sources": [],
+                "sample_uids": [],
+                "sample_turns": [],
+                "reward_extra_infos_dict": {},
+                "generation_sample_metrics": {},
+            }
 
         if not result_a.get("data_sources") and not result_b.get("data_sources"):
             return {}
@@ -686,7 +870,18 @@ class RayPPOTrainer:
             list_b = result_b["reward_extra_infos_dict"].get(key, [])
             reward_extra_infos_dict[key] = list_a + list_b
 
-        return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
+        generation_sample_metrics = {}
+        all_generation_keys = set(result_a.get("generation_sample_metrics", {}).keys()) | set(
+            result_b.get("generation_sample_metrics", {}).keys()
+        )
+        for key in all_generation_keys:
+            list_a = result_a.get("generation_sample_metrics", {}).get(key, [])
+            list_b = result_b.get("generation_sample_metrics", {}).get(key, [])
+            generation_sample_metrics[key] = list_a + list_b
+
+        return self._val_metrics_update(
+            data_sources, sample_uids, reward_extra_infos_dict, sample_turns, generation_sample_metrics
+        )
 
     def init_workers(self):
         """Initialize distributed training workers using Ray backend.
@@ -735,6 +930,7 @@ class RayPPOTrainer:
                 engine_config=engine_config,
                 optimizer_config=orig_critic_cfg.optim,
                 checkpoint_config=orig_critic_cfg.checkpoint,
+                extra_context=getattr(self, "_critic_extra_context", {}),
             )
 
             critic_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Critic], config=critic_cfg)
@@ -1281,6 +1477,9 @@ class RayPPOTrainer:
         to construct the PPO dataflow.
         The light-weight advantage computation is done on the driver process.
         """
+        if self._dump_executor._shutdown:
+            self._init_dump_executor()
+
         from omegaconf import OmegaConf
 
         from verl.utils.tracking import Tracking
@@ -1300,6 +1499,8 @@ class RayPPOTrainer:
 
         current_epoch = self.global_steps // len(self.train_dataloader)
 
+        SkipManager.init(self.config)
+
         # perform validation before training
         # currently, we only support validation using the reward_function.
         if self.config.trainer.get("val_before_train", True):
@@ -1308,11 +1509,8 @@ class RayPPOTrainer:
             pprint(f"Initial validation metrics: {val_metrics}")
             logger.log(data=val_metrics, step=self.global_steps)
             if self.config.trainer.get("val_only", False):
+                self._shutdown_dump_executor()
                 return
-
-        if self.config.actor_rollout_ref.rollout.skip.get("enable", False):
-            rollout_skip = RolloutSkip(self.config, self.async_rollout_manager)
-            rollout_skip.wrap_generate_sequences()
 
         # add tqdm
         progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
@@ -1321,6 +1519,8 @@ class RayPPOTrainer:
         self.global_steps += 1
         last_val_metrics = None
         self.max_steps_duration = 0
+
+        SkipManager.set_step(self.global_steps)
 
         prev_step_profile = False
         curr_step_profile = (
@@ -1416,6 +1616,19 @@ class RayPPOTrainer:
                     # but might affect the loss calculation (due to the change of mini-batching).
                     if self.config.trainer.balance_batch:
                         self._balance_batch(batch, metrics=metrics)
+
+                    generation_sample_metrics = compute_generation_sample_metrics(
+                        batch,
+                        tokenizer=self.tokenizer,
+                        prompt_thinking_start_tokens=self._prompt_thinking_start_tokens(),
+                    )
+                    metrics.update(
+                        aggregate_generation_sample_metrics(
+                            generation_sample_metrics,
+                            prefix="generation/",
+                            include_response_length=False,
+                        )
+                    )
 
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
@@ -1648,15 +1861,26 @@ class RayPPOTrainer:
                 metrics.update(compute_variance_proxy_metrics(batch=batch, gradient_norm=gradient_norm))
                 # Note: mismatch metrics (KL, PPL, etc.) are collected at line 1179 after advantage computation
 
+                # Per-request spec decode metrics.
+                metrics.update(
+                    compute_spec_decode_metrics(
+                        batch.non_tensor_batch.get("spec_num_draft_tokens", None),
+                        batch.non_tensor_batch.get("spec_num_accepted_tokens", None),
+                        batch.non_tensor_batch.get("spec_num_verify_steps", None),
+                    )
+                )
+
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
 
                 progress_bar.update(1)
                 self.global_steps += 1
+                SkipManager.set_step(self.global_steps)
 
                 if is_last_step:
                     if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
                         self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=True)
+                    self._shutdown_dump_executor()
                     pprint(f"Final validation metrics: {last_val_metrics}")
                     progress_bar.close()
                     return
@@ -1666,3 +1890,6 @@ class RayPPOTrainer:
                 if hasattr(self.train_dataset, "on_batch_end"):
                     # The dataset may be changed after each training batch
                     self.train_dataset.on_batch_end(batch=batch)
+
+        # Ensure dump executor is shut down when training loop ends without reaching is_last_step
+        self._shutdown_dump_executor()

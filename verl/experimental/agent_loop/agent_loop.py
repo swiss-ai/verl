@@ -59,6 +59,7 @@ from verl.utils.rollout_trace import (
     RolloutTraceConfig,
     rollout_trace_attr,
 )
+from verl.utils.skip import SkipManager
 from verl.utils.tokenizer import (
     build_multimodal_processor_inputs,
     get_processor_token_id,
@@ -222,6 +223,9 @@ class AgentLoopBase(ABC):
         self.dataset_cls = dataset_cls
         self.data_config = data_config.config
         self.apply_chat_template_kwargs = self.data_config.get("apply_chat_template_kwargs", {})
+        self.force_thinking_prefix = bool(self.data_config.get("force_thinking_prefix", False))
+        self.thinking_prefix_token = self.data_config.get("thinking_prefix_token", "<|inner_prefix|>")
+        self.thinking_prefix_token_ids = self.tokenizer.encode(self.thinking_prefix_token, add_special_tokens=False)
         self.mm_processor_kwargs = self.data_config.get("mm_processor_kwargs", {})
         processing_class = self.processor if self.processor is not None else self.tokenizer
         self.system_prompt = initialize_system_prompt(processing_class, **self.apply_chat_template_kwargs)
@@ -331,6 +335,32 @@ class AgentLoopBase(ABC):
 
         if remove_system_prompt:
             prompt_ids = prompt_ids[len(self.system_prompt) :]
+        if self.force_thinking_prefix:
+            prompt_ids = prompt_ids + self.thinking_prefix_token_ids
+
+
+        # Mirror the response-side ``response_ids[:response_length]`` cap on the prompt side:
+        # every prompt produced by the agent loop must fit in ``rollout.prompt_length`` so that
+        # ``_pad_token_ids`` (and downstream ``torch.cat``) can rely on uniform shapes.
+        # Multimodal prompts cannot be sliced here because placeholder tokens must remain
+        # aligned 1:1 with ``multi_modal_inputs`` features, so we fail loudly instead.
+        prompt_length = self.rollout_config.prompt_length
+        if len(prompt_ids) > prompt_length:
+            if images or videos or audios:
+                raise ValueError(
+                    f"Multimodal prompt produced {len(prompt_ids)} tokens, exceeding "
+                    f"rollout.prompt_length={prompt_length}. Truncating multimodal token "
+                    f"sequences corrupts vision/audio feature alignment, so this is treated "
+                    f"as a configuration error. Reduce the multimodal input size "
+                    f"(e.g. ``total_pixels`` / ``max_pixels`` / fps / number of frames) or "
+                    f"increase ``rollout.prompt_length``."
+                )
+            logger.warning(
+                "Prompt of %d tokens exceeds rollout.prompt_length=%d; left-truncating.",
+                len(prompt_ids),
+                prompt_length,
+            )
+            prompt_ids = prompt_ids[-prompt_length:]
 
         return prompt_ids
 
@@ -576,6 +606,29 @@ class AgentLoopWorker:
             output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
             return await self._agent_loop_postprocess(output, trajectory["validate"], **kwargs)
 
+    def _pad_token_ids(
+        self,
+        tokens: list[int],
+        *,
+        max_length: int,
+        padding_side: str,
+        return_attention_mask: bool,
+    ) -> dict[str, torch.Tensor]:
+        """Right/left pad a flat list of token ids to a ``(1, max_length)`` tensor."""
+        self.tokenizer.padding_side = padding_side
+        padded = self.tokenizer.pad(
+            {"input_ids": tokens},
+            padding="max_length",
+            max_length=max_length,
+            return_tensors="pt",
+            return_attention_mask=return_attention_mask,
+        )
+        if padded["input_ids"].dim() == 1:
+            padded["input_ids"] = padded["input_ids"].unsqueeze(0)
+            if return_attention_mask:
+                padded["attention_mask"] = padded["attention_mask"].unsqueeze(0)
+        return padded
+
     async def _agent_loop_postprocess(self, output, validate, **kwargs) -> _InternalAgentLoopOutput:
         """Perform post-processing operations on the output of each individual agent loop."""
         output.extra_fields["raw_prompt"] = kwargs["raw_prompt"]
@@ -601,39 +654,26 @@ class AgentLoopWorker:
         #   e.g., [0,0,0,0,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,0,0,0,0]
 
         # TODO(wuxibin): remove padding and use tensordict.
-        self.tokenizer.padding_side = "left"
-        prompt_output = self.tokenizer.pad(
-            {"input_ids": output.prompt_ids},
-            padding="max_length",
+        prompt_output = self._pad_token_ids(
+            output.prompt_ids,
             max_length=self.rollout_config.prompt_length,
-            return_tensors="pt",
+            padding_side="left",
             return_attention_mask=True,
         )
-        if prompt_output["input_ids"].dim() == 1:
-            prompt_output["input_ids"] = prompt_output["input_ids"].unsqueeze(0)
-            prompt_output["attention_mask"] = prompt_output["attention_mask"].unsqueeze(0)
 
-        self.tokenizer.padding_side = "right"
-        response_output = self.tokenizer.pad(
-            {"input_ids": output.response_ids},
-            padding="max_length",
+        response_output = self._pad_token_ids(
+            output.response_ids,
             max_length=self.rollout_config.response_length,
-            return_tensors="pt",
+            padding_side="right",
             return_attention_mask=True,
         )
-        if response_output["input_ids"].dim() == 1:
-            response_output["input_ids"] = response_output["input_ids"].unsqueeze(0)
-            response_output["attention_mask"] = response_output["attention_mask"].unsqueeze(0)
 
-        response_mask_output = self.tokenizer.pad(
-            {"input_ids": output.response_mask},
-            padding="max_length",
+        response_mask_output = self._pad_token_ids(
+            output.response_mask,
             max_length=self.rollout_config.response_length,
-            return_tensors="pt",
+            padding_side="right",
             return_attention_mask=False,
         )
-        if response_mask_output["input_ids"].dim() == 1:
-            response_mask_output["input_ids"] = response_mask_output["input_ids"].unsqueeze(0)
 
         response_logprobs = None
         if output.response_logprobs is not None:
@@ -1066,6 +1106,7 @@ class AgentLoopManager:
             )
 
     @auto_await
+    @SkipManager.annotate(role="rollout")
     async def generate_sequences(self, prompts: DataProto) -> DataProto:
         """Split input batch and dispatch to agent loop workers.
 

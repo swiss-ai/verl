@@ -227,6 +227,7 @@ async def test_mooncake_checkpoint_engine(
     resource_pool = RayResourcePool(process_on_nodes=[num_gpus_per_node] * num_nodes, max_colocate_count=1)
     resource_pool.get_placement_groups(device_name=get_device_name())
     trainer_pool, rollout_pool = split_resource_pool(resource_pool, [num_trainer, num_rollout])
+    print(f"trainer_pool={trainer_pool}, rollout_pool={rollout_pool}")
     trainer = create_trainer_worker_group(trainer_pool, model_config, checkpoint_engine_config_trainer)
     trainer.reset()
     rollout, replicas = await create_rollout_worker_group(rollout_pool, model_config, rollout_config, check_allclose)
@@ -245,8 +246,8 @@ if __name__ == "__main__":
 
     asyncio.run(test_mooncake_checkpoint_engine(
         rebuild_group=False,
-        num_trainer=2,
-        num_rollout=2,
+        num_trainer=3,
+        num_rollout=1,
         num_gpus_per_node=4,
         device="cuda"
     ))

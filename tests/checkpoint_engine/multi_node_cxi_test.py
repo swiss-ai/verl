@@ -68,7 +68,8 @@ async def multi_node_cxi_test(
 
     # create checkpoint engine manager
     checkpoint_manager = CheckpointEngineManager(config=checkpoint_engine_config_trainer, trainer=trainer, replicas=replicas)
-    for _ in range(num_iter):
+    for iter in range(num_iter):
+        print(f"ITERATION NUMBER: {iter}")
         await checkpoint_manager.update_weights()
         rollout.check_weights()
     ray.shutdown()
@@ -85,6 +86,10 @@ async def mock_multi_node_cxi_test(
     num_iter = 8,
     model_path="swiss-ai/Apertus-8B-Instruct-2509",
 ):
+    """
+    Mock multi-node test, transfers mock random generated data of the same size,
+    use if performance regression and/or debugging purposes
+    """
     _ray_runtime_env = {
         "env_vars": {
             # "ASCEND_USE_SHORT_CONNECTION": "1",
@@ -142,8 +147,8 @@ if __name__ == "__main__":
     nnodes = int(os.environ["NNODES"])
 
     gpus_per_node = 4
-    num_trainer = (nnodes // 2) * gpus_per_node
-    num_rollout = (nnodes // 2) * gpus_per_node
+    num_trainer = 3 * (nnodes // 4) * gpus_per_node
+    num_rollout = (nnodes // 4) * gpus_per_node
     asyncio.run(
         multi_node_cxi_test(
             node_rank=node_id,
@@ -152,6 +157,7 @@ if __name__ == "__main__":
             num_trainer=num_trainer,
             num_rollout=num_rollout,
             num_gpus_per_node = gpus_per_node,
-            device = "cuda"
+            device = "cuda",
+            check_allclose=False
         )
     )

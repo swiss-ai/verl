@@ -54,7 +54,11 @@ def prepare_single_generation_data(batch_dict, config) -> DataProto:
     non_tensor_batch_keys_to_pop = []
 
     existing_batch_keys = [k for k in batch_keys_to_pop if k in full_batch.batch.keys()]
-    existing_non_tensor_keys = [k for k in non_tensor_batch_keys_to_pop if k in full_batch.non_tensor_batch.keys()]
+    existing_non_tensor_keys = [
+        k
+        for k in non_tensor_batch_keys_to_pop
+        if k in full_batch.non_tensor_batch.keys()
+    ]
 
     if existing_batch_keys or existing_non_tensor_keys:
         full_batch.pop(
@@ -64,11 +68,79 @@ def prepare_single_generation_data(batch_dict, config) -> DataProto:
 
     # Setting selected agent, that supports partial
     if not config.actor_rollout_ref.rollout.multi_turn.enable:
-        full_batch.non_tensor_batch["agent_name"] = np.array(["single_turn_agent"] * len(full_batch), dtype=object)
+        full_batch.non_tensor_batch["agent_name"] = np.array(
+            ["single_turn_agent"] * len(full_batch), dtype=object
+        )
 
     # Add global step count to generated data
-    full_batch = full_batch.repeat(repeat_times=config.actor_rollout_ref.rollout.n, interleave=True)
+    full_batch = full_batch.repeat(
+        repeat_times=config.actor_rollout_ref.rollout.n, interleave=True
+    )
     return full_batch
+
+
+def validate_async_filter_groups_config(config, logger=None):
+    """Validate filter_groups settings in config."""
+    filter_groups_config = config.algorithm.get("filter_groups", None)
+    if filter_groups_config is None or not filter_groups_config.enable:
+        return
+
+    metric_name = filter_groups_config.metric
+    if not metric_name:
+        raise ValueError(
+            "algorithm.filter_groups.metric must be set when filter_groups.enable=True"
+        )
+
+    if metric_name == "seq_final_reward" and config.algorithm.use_kl_in_reward:
+        raise ValueError(
+            "algorithm.filter_groups.metric='seq_final_reward' is not supported in fully async mode when "
+            "algorithm.use_kl_in_reward=True because KL-adjusted rewards are computed on the trainer."
+        )
+
+    min_group = filter_groups_config.get("min", None)
+    max_group = filter_groups_config.get("max", None)
+    if min_group is None or max_group is None:
+        raise ValueError(
+            "algorithm.filter_groups.min and algorithm.filter_groups.max must be set"
+        )
+    if min_group >= max_group:
+        raise ValueError(
+            f"algorithm.filter_groups.min must be less than algorithm.filter_groups.max, got {min_group} >= {max_group}"
+        )
+
+    max_num_gen_batches = filter_groups_config.get("max_num_gen_batches", 0)
+    if max_num_gen_batches > 0 and logger is not None:
+        logger.warning(
+            "algorithm.filter_groups.max_num_gen_batches=%s is ignored in fully async streaming mode; "
+            "filtered samples are simply skipped before queue insertion.",
+            max_num_gen_batches,
+        )
+
+
+def should_keep_async_filter_group(batch: DataProto, filter_groups_config) -> bool:
+    """Return whether a fully async rollout group should be enqueued for training."""
+    metric_name = filter_groups_config.metric
+    if metric_name in {"seq_reward", "seq_final_reward"}:
+        if batch.batch is None or "rm_scores" not in batch.batch.keys():
+            raise ValueError(
+                f"algorithm.filter_groups.metric={metric_name!r} requires 'rm_scores' in the rollout output"
+            )
+        metric_values = batch.batch["rm_scores"].sum(dim=-1)
+    else:
+        if metric_name not in batch.non_tensor_batch:
+            raise ValueError(
+                f"algorithm.filter_groups.metric={metric_name!r} was not found in rollout reward extras. "
+                "Use a metric returned by the reward function or one of: seq_reward, seq_final_reward."
+            )
+        metric_values = batch.non_tensor_batch[metric_name]
+
+    if isinstance(metric_values, torch.Tensor):
+        metric_values = metric_values.detach().cpu().numpy()
+    metric_values = np.asarray(metric_values, dtype=np.float64).reshape(-1)
+    return bool(
+        np.std(metric_values) > 0
+        and filter_groups_config.min < np.mean(metric_values) < filter_groups_config.max
+    )
 
 
 def addition_process(output: DataProto):
@@ -105,12 +177,16 @@ def assemble_batch_from_rollout_samples(
     if not rollout_samples:
         raise ValueError("Empty rollout_samples provided for batch assembly")
 
-    print(f"[BatchUtils] Assembling batch from {len(rollout_samples)} RolloutSample objects")
+    print(
+        f"[BatchUtils] Assembling batch from {len(rollout_samples)} RolloutSample objects"
+    )
 
     rollout_samples_batch = []
     rollout_status = rollout_samples[0].rollout_status
     # Add a prefix to all rollout_status keys
-    rollout_status = {f"fully_async/{key}": value for key, value in rollout_status.items()}
+    rollout_status = {
+        f"fully_async/{key}": value for key, value in rollout_status.items()
+    }
 
     for rs in rollout_samples:
         batch = addition_process(rs.full_batch)
@@ -126,7 +202,9 @@ def assemble_batch_from_rollout_samples(
 
     # Calculate the global valid token number
     if "attention_mask" in final_batch.batch:
-        final_batch.meta_info["global_token_num"] = torch.sum(final_batch.batch["attention_mask"], dim=-1).tolist()
+        final_batch.meta_info["global_token_num"] = torch.sum(
+            final_batch.batch["attention_mask"], dim=-1
+        ).tolist()
 
     processing_times = final_batch.non_tensor_batch["processing_times"]
     tool_calls = final_batch.non_tensor_batch["tool_calls_times"]
@@ -146,15 +224,20 @@ def assemble_batch_from_rollout_samples(
             "timing_s/agent_loop/tool_calls/min": np.min(tool_calls),
             "timing_s/agent_loop/tool_calls/mean": np.mean(tool_calls),
         }
-    processing_time_stats = {f"fully_async/{key}": value for key, value in processing_time_stats.items()}
+    processing_time_stats = {
+        f"fully_async/{key}": value for key, value in processing_time_stats.items()
+    }
 
     param_version_start = final_batch.non_tensor_batch["min_global_steps"]
     param_version_end = final_batch.non_tensor_batch["max_global_steps"]
-    param_version_diff = [abs(a - b) for a, b in zip(param_version_end, param_version_start, strict=False)]
+    param_version_diff = [
+        abs(a - b) for a, b in zip(param_version_end, param_version_start, strict=False)
+    ]
     num_diff0 = param_version_diff.count(0)
     partial_stats = {
         "fully_async/partial/total_partial_num": len(param_version_diff) - num_diff0,
-        "fully_async/partial/partial_ratio": (len(param_version_diff) - num_diff0) / len(param_version_diff),
+        "fully_async/partial/partial_ratio": (len(param_version_diff) - num_diff0)
+        / len(param_version_diff),
         "fully_async/partial/max_partial_span": max(param_version_diff),
     }
     # add meta_info
@@ -208,11 +291,15 @@ class MetricsAggregator:
                 "fully_async/count/stale_trajectory_processed",
                 "fully_async/count/current_param_version",
                 "fully_async/count/dropped_stale_samples",
+                "fully_async/count/filtered_group_samples",
+                "fully_async/count/filtered_group_trajectories",
                 "training/global_step",  # TODO change name to: total_step
             ],
         }
 
-    def add_step_metrics(self, metrics: dict[str, Any], sample_count: int, timestamp: float = None):
+    def add_step_metrics(
+        self, metrics: dict[str, Any], sample_count: int, timestamp: float = None
+    ):
         """Adding a single-step metrics"""
         if timestamp is None:
             timestamp = time.time()
@@ -270,7 +357,9 @@ class MetricsAggregator:
             if total_samples == 0:
                 return sum(values) / len(values)
 
-            weighted_sum = sum(v * c for v, c in zip(values, self.sample_counts, strict=False))
+            weighted_sum = sum(
+                v * c for v, c in zip(values, self.sample_counts, strict=False)
+            )
             return weighted_sum / total_samples
 
         elif agg_type == "sum" or agg_type == "time_sum":
@@ -313,10 +402,16 @@ class MetricsAggregator:
 
         # global_seqlen/minmax_diff
         if "global_seqlen/minmax_diff" in aggregated.keys():
-            aggregated["global_seqlen/minmax_diff"] = aggregated["global_seqlen/max"] - aggregated["global_seqlen/min"]
+            aggregated["global_seqlen/minmax_diff"] = (
+                aggregated["global_seqlen/max"] - aggregated["global_seqlen/min"]
+            )
 
         # perf/throughput
-        REQUIRED_PERF_KEYS = {"perf/throughput", "perf/total_num_tokens", "perf/time_per_step"}
+        REQUIRED_PERF_KEYS = {
+            "perf/throughput",
+            "perf/total_num_tokens",
+            "perf/time_per_step",
+        }
         if REQUIRED_PERF_KEYS.issubset(aggregated):
             aggregated["perf/throughput"] = aggregated["perf/total_num_tokens"] / (
                 aggregated["perf/time_per_step"] * self.total_gpus
@@ -324,7 +419,9 @@ class MetricsAggregator:
 
         # trainer/idle_ratio
         if "timing_s/gen" in aggregated.keys() and "timing_s/step" in aggregated.keys():
-            aggregated["fully_async/trainer/idle_ratio"] = aggregated["timing_s/gen"] / aggregated["timing_s/step"]
+            aggregated["fully_async/trainer/idle_ratio"] = (
+                aggregated["timing_s/gen"] / aggregated["timing_s/step"]
+            )
 
         return aggregated
 

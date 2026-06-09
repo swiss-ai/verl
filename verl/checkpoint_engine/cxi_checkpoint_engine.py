@@ -485,6 +485,7 @@ class ShardedCxiCheckpointEngine(CheckpointEngine):
         self.group = None
 
         self._prefetch = False
+        self._debug = False
 
         self.weight_info = None
         self.buckets = []
@@ -538,6 +539,8 @@ class ShardedCxiCheckpointEngine(CheckpointEngine):
             self.sends = self.group.should_send(self.group_local_rank)
             if (self.recvs):
                 self.recv_te_addr = self.group.recv_te_addr(self.group_local_rank)
+        else:
+            print(f"called initialize on {self.group_local_rank}")
 
     def finalize(self):
         if (self.rebuild_group):
@@ -596,7 +599,7 @@ class ShardedCxiCheckpointEngine(CheckpointEngine):
 
 
     @torch.no_grad()
-    async def send_weights(self, weights: Generator[tuple[str, torch.Tensor], None, None]):
+    async def send_weights(self, weights: Generator[tuple[str, torch.Tensor], None, None], global_steps: int | None = None):
         """Send weights using Mooncake TransferEngine"""
         if not self.sends:
             for name, weight in weights:
@@ -615,7 +618,8 @@ class ShardedCxiCheckpointEngine(CheckpointEngine):
             self.buckets = b
             self.group.send({"buckets": self.buckets}, self.group_local_rank)
             wl_sr_end = time.perf_counter()
-            print(f"rank: {self.group_local_rank}, weight meta time: {(wl_sr_end-wl_sr_start)*1000:.2f} ms")
+            if self._debug:
+                print(f"rank: {self.group_local_rank}, weight meta time: {(wl_sr_end-wl_sr_start)*1000:.2f} ms")
 
 
         # bucket_meta: dict[str, TensorMeta] = {}
@@ -624,7 +628,6 @@ class ShardedCxiCheckpointEngine(CheckpointEngine):
         # idx = 0
         # current = bufs[idx]
         for idx, bucket in enumerate(self.buckets):
-            print(f"SEND: bucket {idx}")
             current = self.buffers[idx % self.pipeline_stages]
             if (idx >= self.pipeline_stages):
                 current.wait_spin()
@@ -654,7 +657,7 @@ class ShardedCxiCheckpointEngine(CheckpointEngine):
         )
 
     @torch.no_grad()
-    async def receive_weights(self) -> AsyncGenerator[tuple[str, torch.Tensor], None]:
+    async def receive_weights(self, global_steps: int | None = None) -> AsyncGenerator[tuple[str, torch.Tensor], None]:
         
         # total_bytes = 0
         start_time = time.time()
@@ -678,7 +681,8 @@ class ShardedCxiCheckpointEngine(CheckpointEngine):
                 if (self.sends):
                     self.group.send(obj, self.group_local_rank)
                 wl_sr_end = time.perf_counter()
-                print(f"rank: {self.group_local_rank}, weight meta time: {(wl_sr_end-wl_sr_start)*1000:.2f} ms")
+                if self._debug:
+                    print(f"rank: {self.group_local_rank}, weight meta time: {(wl_sr_end-wl_sr_start)*1000:.2f} ms")
 
 
             idx = 0
@@ -704,7 +708,8 @@ class ShardedCxiCheckpointEngine(CheckpointEngine):
                     info = self.group.recv(self.group_local_rank)
                 t1 = time.perf_counter()
 
-                print(f"[idx={idx}] rank: {self.group_local_rank}, recv in {(t1-t0) * 1000:.2f} ms for metadata")
+                if self._debug:
+                    print(f"[idx={idx}] rank: {self.group_local_rank}, recv in {(t1-t0) * 1000:.2f} ms for metadata")
 
                 if (idx >= self.pipeline_stages):
                     get_torch_device().synchronize()
@@ -744,7 +749,8 @@ class ShardedCxiCheckpointEngine(CheckpointEngine):
                     recv_start = time.perf_counter()
                     info_next = self.group.recv(self.group_local_rank)
                     recv_dur = (time.perf_counter() - recv_start) * 1000
-                    print(f"[idx={idx}][rank={self.group_local_rank}] recv_time={recv_dur:.2f} ms")
+                    if self._debug:
+                        print(f"[idx={idx}][rank={self.group_local_rank}] recv_time={recv_dur:.2f} ms")
             
                 while (True):
                     status = self.engine.transfer_check_status(track)
@@ -758,7 +764,8 @@ class ShardedCxiCheckpointEngine(CheckpointEngine):
                 # benchmark transfer speed
                 time_cost_this_step = transfer_dur
                 bandwidth_this_step = bucket["len"] / time_cost_this_step / (1e9)
-                print(f"RANK: {self.group_local_rank}, step {idx}: this step bandwidth: {bandwidth_this_step} GB/s, duration: {transfer_dur * 1000:.2f} ms")
+                if self._debug:
+                    print(f"RANK: {self.group_local_rank}, step {idx}: this step bandwidth: {bandwidth_this_step} GB/s, duration: {transfer_dur * 1000:.2f} ms")
 
                 done_queue.put(item=(slot, bucket, current.buffer))
 
@@ -784,7 +791,8 @@ class ShardedCxiCheckpointEngine(CheckpointEngine):
                 )
                 wb_end = time.perf_counter()
                 assert ret == 0, f"transfer_sync_write failed {ret}"
-                print(f"[idx={idx}] rank: {self.group_local_rank}, wb_duration={(wb_end-wb_start) * 1000:.2f} ms")
+                if self._debug:
+                    print(f"[idx={idx}] rank: {self.group_local_rank}, wb_duration={(wb_end-wb_start) * 1000:.2f} ms")
                 # 5 swap buffer
                 idx += 1
                 current = self.buffers[idx % self.pipeline_stages]

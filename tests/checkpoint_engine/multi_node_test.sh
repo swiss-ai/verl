@@ -2,13 +2,13 @@
 #SBATCH --account=infra01
 #SBATCH --partition=normal
 #SBATCH --container-writable
-#SBATCH --nodes=8
+#SBATCH --nodes=6
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=4
 #SBATCH --time=00:20:00
 #SBATCH --reservation=SD-69241-apertus-1-5-0
-#SBATCH --output=slurm_logs/test_2.out
-#SBATCH --error=slurm_logs/test_2.err
+#SBATCH --output=slurm_logs/test_%j.out
+#SBATCH --error=slurm_logs/test_%j.err
 
 set -xeuo pipefail
 

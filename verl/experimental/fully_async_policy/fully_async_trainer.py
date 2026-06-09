@@ -30,6 +30,12 @@ from verl.experimental.fully_async_policy.detach_utils import (
     assemble_batch_from_rollout_samples,
 )
 from verl.experimental.fully_async_policy.message_queue import MessageQueueClient
+from verl.experimental.fully_async_policy.scaling_metrics import (
+    DEFAULT_STEADY_WARMUP_STEPS,
+    compute_scale_config_metrics,
+    compute_scale_step_metrics,
+    compute_steady_summary,
+)
 from verl.experimental.separation.ray_trainer import SeparateRayPPOTrainer
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
 from verl.trainer.ppo import core_algos
@@ -108,6 +114,8 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         # ==================== SeparateRayPPOTrainer config ====================
         self.global_steps = 0
         self.epoch = 0
+        self._init_dump_executor()
+        self.validation_generations_logger = None
         self.max_steps_duration = 0
         self.progress_bar = None
         self.is_last_step = False
@@ -152,6 +160,14 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             + config.rollout.nnodes * config.rollout.n_gpus_per_node
         )
         self.metrics_aggregator = MetricsAggregator(total_gpus=total_gpus)
+        self.scale_config_metrics = compute_scale_config_metrics(self.config)
+        steady_warmup_steps = self.config.async_training.get(
+            "steady_warmup_steps",
+            DEFAULT_STEADY_WARMUP_STEPS,
+        )
+        self.scale_summary_warmup_steps = max(0, int(steady_warmup_steps))
+        self.scale_metric_history: list[dict[str, float]] = []
+        self.pending_rollouter_timing: dict[str, float] = {}
 
         # Reference to rollouter for parameter synchronization
         self.rollouter = None
@@ -389,11 +405,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         self.global_steps += 1
 
         self.prev_step_profile = False
-        self.curr_step_profile = (
-            self.global_steps in self.config.global_profiler.steps
-            if self.config.global_profiler.steps is not None
-            else False
-        )
+        self.curr_step_profile = False
         self.next_step_profile = False
 
         # Use queue mode, no need for traditional dataloader iterator
@@ -430,7 +442,9 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         self.reward_tensor = None
         self.reward_extra_infos_dict = {}
 
-        self._fit_start_profile()
+        steps = self.config.global_profiler.steps
+        should_profile = steps is not None and (self.current_param_version + 1) in steps
+        self._fit_start_profile(should_profiler=should_profile)
 
         with marked_timer("step", self.timing_raw):
             batch = await self._fit_generate(None)
@@ -450,7 +464,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
 
         await self._fit_validate()
         self._fit_save_checkpoint()
-        self._fit_stop_profile()
+        self._fit_stop_profile(should_profiler=should_profile)
         self._fit_collect_metrics(batch)
         self._fit_postprocess_step()
 
@@ -505,6 +519,11 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         if self.local_trigger_step != 1:
             return
 
+        steps = self.config.global_profiler.steps
+        last_profiler_step = self.current_param_version
+        if steps is not None and last_profiler_step in steps:
+            await asyncio.wrap_future(self.rollouter._stop_profiling.remote().future())
+
         with marked_timer("timing_s/param_sync", self.timing_raw):
             await self.checkpoint_manager.update_weights(global_steps=self.current_param_version)
         print(
@@ -513,19 +532,39 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             f"self.current_param_version: {self.current_param_version}"
         )
 
+        profiler_step = last_profiler_step + 1
+
+        if steps is not None and profiler_step in steps:
+            await asyncio.wrap_future(self.rollouter._start_profiling.remote().future())
+
         # Reset staleness in rollouter
         timing_raw = await asyncio.wrap_future(self.rollouter.reset_staleness.remote().future())
-        self.logger.log(
-            data=timing_raw,
-            step=self.current_param_version,
-        )
+        self.pending_rollouter_timing = timing_raw
 
-        # Log aggregated training metrics
+    def _log_pending_version_metrics(self):
+        aggregated_metrics = self.metrics_aggregator.get_aggregated_metrics()
+        if not aggregated_metrics:
+            return
+
+        version_metrics = {
+            **self.scale_config_metrics,
+            **aggregated_metrics,
+            **self.pending_rollouter_timing,
+        }
+        version_metrics.update(compute_scale_step_metrics(version_metrics))
+        self.scale_metric_history.append(dict(version_metrics))
+        version_metrics.update(
+            compute_steady_summary(
+                self.scale_metric_history,
+                warmup_steps=self.scale_summary_warmup_steps,
+            )
+        )
         self.logger.log(
-            data=self.metrics_aggregator.get_aggregated_metrics(),
+            data=version_metrics,
             step=self.current_param_version,
         )
         self.metrics_aggregator.reset()
+        self.pending_rollouter_timing = {}
 
     async def _fit_validate(self, val_before_train=False):
         if self.local_trigger_step != 1:
@@ -623,6 +662,9 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         )
 
         if self.local_trigger_step == 1:
+            # Log version-aligned metrics only after the current step has been added
+            # so sync-boundary aggregates match the parameter version being emitted.
+            self._log_pending_version_metrics()
             self.progress_bar.update(1)
 
     def _save_checkpoint(self):

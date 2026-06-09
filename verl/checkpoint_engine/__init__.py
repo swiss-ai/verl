@@ -65,11 +65,11 @@ try:
 except ImportError:
     MooncakeCheckpointEngine = None
 
-try:
-    from .cxi_checkpoint_engine import CxiCheckpointEngine
-    __all__ += ["CxiCheckpointEngine"]
-except ImportError as e:
-    CxiCheckpointEngine = None
+# try:
+#     from .cxi_checkpoint_engine import CxiCheckpointEngine
+#     __all__ += ["CxiCheckpointEngine"]
+# except ImportError as e:
+#     CxiCheckpointEngine = None
 
 try:
     from .cxi_checkpoint_engine import ShardedCxiCheckpointEngine
@@ -78,8 +78,8 @@ except ImportError as e:
     print(f"Error importing CXI checkpoint engine: {e}")
     ShardedCxiCheckpointEngine = None
 
-try:
-    from .cxi_double_door import DoubleDoorCxiCheckpointEngine
-    __all__ += ["DoubleDoorCxiCheckpointEngine"]
-except ImportError:
-    DoubleDoorCxiCheckpointEngine = None
+# try:
+#     from .cxi_double_door import DoubleDoorCxiCheckpointEngine
+#     __all__ += ["DoubleDoorCxiCheckpointEngine"]
+# except ImportError:
+#     DoubleDoorCxiCheckpointEngine = None

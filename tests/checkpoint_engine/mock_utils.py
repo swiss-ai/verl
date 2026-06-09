@@ -34,7 +34,6 @@ class MockTrainingWorker(Worker):
     def __init__(self, checkpoint_engine_config: CheckpointEngineConfig) -> None:
         Worker.__init__(self)
 
-
         # dist stuff
         initialize_global_process_group_ray(timeout_second=None)
         set_numa_affinity()
@@ -52,7 +51,7 @@ class MockTrainingWorker(Worker):
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     async def update_weights(self, global_steps: int = None, mode: str = "auto"):
         per_tensor_param = self.weights
-        await self.checkpoint_engine.send_weights(per_tensor_param)
+        await self.checkpoint_engine.send_weights(per_tensor_param, global_steps=global_steps)
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE, blocking=False)
     def execute_checkpoint_engine(self, method: str, *args, **kwargs):
