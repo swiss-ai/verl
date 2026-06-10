@@ -67,7 +67,7 @@ class MockServerAdapter(BaseRollout):
         self,
         weights: Generator[tuple[str, torch.Tensor], None, None],
         **kwargs,
-    ):
+    ):  
         async for name, weight in weights:
             weight = weight.clone()
             if self.check_allclose:
@@ -79,6 +79,7 @@ class MockServerAdapter(BaseRollout):
 
         if self.model is None:
             local_path = copy_to_local(self.model_config.path)
+            # load on cpu to get a reasonably "bad" consume loop for weights
             self.model = AutoModelForCausalLM.from_pretrained(local_path, torch_dtype=torch.bfloat16, device_map="cpu")
 
         for name, weight in self.model.state_dict().items():

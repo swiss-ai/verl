@@ -16,10 +16,12 @@ USERNAME="$(whoami)"
 # Experiment configuration
 ###############################################################################
 PROJECT_NAME=apertus-rl-tests
-WORKING_DIR="/iopsstor/scratch/cscs/${USER}/projects/verl"
+# WORKING_DIR="/iopsstor/scratch/cscs/${USER}/projects/verl"
+WORKING_DIR=/capstor/store/cscs/swissai/infra01/reasoning/users/atazza/sgl-test/verl
 HOME=/iopsstor/scratch/cscs/${USER}
 HF_HOME=/iopsstor/scratch/cscs/${USER}/huggingface
-ENVIRONMENT_PATH=/capstor/store/cscs/swissai/infra01/reasoning/raas/docker/vs:251215-patched/env.toml
+# ENVIRONMENT_PATH=/capstor/store/cscs/swissai/infra01/reasoning/raas/docker/vs:251215-patched/env.toml
+ENVIRONMENT_PATH=/users/atazza/.edf/async_rl.toml
 
 MODEL_NAME_OR_PATH=/capstor/store/cscs/swissai/infra01/reasoning/models/Apertus-1p5-8B-sft-capfilter-linear-it8816
 TOKENIZER_NAME_OR_PATH=/capstor/store/cscs/swissai/infra01/MLLM/tokenizer/apertus_emu3.5_wavtok_instruct_thinking_token_fixed

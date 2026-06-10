@@ -530,7 +530,7 @@ class ShardedCxiCheckpointEngine(CheckpointEngine):
         return trainer_kwargs, rollout_kwargs
 
     def init_process_group(self, group: SimpleCommGroup, info: RankInfo):
-        if (self.group != group and not self.rebuild_group):
+        if (self.group == None or self.rebuild_group):
             self.info = info
             self.group = group
             self.group_local_rank = self.info.local_rank
@@ -602,9 +602,11 @@ class ShardedCxiCheckpointEngine(CheckpointEngine):
     async def send_weights(self, weights: Generator[tuple[str, torch.Tensor], None, None], global_steps: int | None = None):
         """Send weights using Mooncake TransferEngine"""
         if not self.sends:
-            for name, weight in weights:
-                pass
-            logger.info(f"send_weights rank={self.group_local_rank}")
+            if (self.weight_info is None):
+                self.weight_info = {}
+                for name, weight in weights:
+                    pass
+            logger.info(f"skipping send_weights for rank={self.group_local_rank}")
             return
 
         total_bytes = 0
@@ -620,7 +622,12 @@ class ShardedCxiCheckpointEngine(CheckpointEngine):
             wl_sr_end = time.perf_counter()
             if self._debug:
                 print(f"rank: {self.group_local_rank}, weight meta time: {(wl_sr_end-wl_sr_start)*1000:.2f} ms")
-
+        # else: 
+        #     # the iterator must be consumed, otherwise everything hangs, don't know if it's a feature or a bug, but
+        #     # otherwise doesn't work
+        #     for name, weight in weights:
+        #         pass
+            
 
         # bucket_meta: dict[str, TensorMeta] = {}
         # offset = 0
@@ -774,13 +781,6 @@ class ShardedCxiCheckpointEngine(CheckpointEngine):
                 if (self.sends):
                     self.group.send(info, self.group_local_rank)
 
-                # 3 yield tensor from current buffer
-                # for name, meta in bucket["bucket_meta"].items():
-                #     dtype, shape = self.rollout_dtype, meta["shape"]
-                #     numel = prod(shape)
-                #     size = dtype.itemsize * numel
-                #     tensor = current.buffer[meta["offset"] : meta["offset"] + size].view(dtype=dtype).view(shape)
-                #     yield name, tensor
                 # 4 tell the previous rank that we read from the buffer
                 wb_start = time.perf_counter()
                 ret = self.engine.transfer_sync_write(

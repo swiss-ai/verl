@@ -147,8 +147,8 @@ if __name__ == "__main__":
     nnodes = int(os.environ["NNODES"])
 
     gpus_per_node = 4
-    num_trainer = 3 * (nnodes // 4) * gpus_per_node
-    num_rollout = (nnodes // 4) * gpus_per_node
+    num_trainer = 3 * nnodes
+    num_rollout = nnodes
     asyncio.run(
         multi_node_cxi_test(
             node_rank=node_id,
@@ -158,6 +158,6 @@ if __name__ == "__main__":
             num_rollout=num_rollout,
             num_gpus_per_node = gpus_per_node,
             device = "cuda",
-            check_allclose=False
+            check_allclose=True
         )
     )

@@ -51,7 +51,13 @@ rollout:
 actor_rollout_ref:
   hybrid_engine: false
   nccl_timeout: 1800
-  checkpoint_engine: ${oc.select:async_training.checkpoint_engine,null}
+  checkpoint_engine:
+    _target_: verl.workers.config.rollout.CheckpointEngineConfig 
+    backend: "cxi_sharded"
+    update_weights_bucket_megabytes: 3072
+    engine_kwargs:
+      cxi_sharded:
+        is_trainer: True
 
   model:
     path: swiss-ai/Apertus-8B-Instruct-2509
@@ -67,7 +73,6 @@ actor_rollout_ref:
     ppo_mini_batch_size: 128  # NOTE: train_batch_size = require_batches * ppo_mini_batch_size
     use_dynamic_bsz: true
     ppo_max_token_len_per_gpu: 32768
-
     optim:
       optimizer: _AdamW
       lr: 1e-6
@@ -109,8 +114,14 @@ actor_rollout_ref:
     name: sglang
     mode: async
     calculate_log_probs: true
+    # checkpoint_engine:
+    #   backend: nccl
     checkpoint_engine:
-      backend: nccl
+      backend: "cxi_sharded"
+      update_weights_bucket_megabytes: 3072
+      engine_kwargs:
+        cxi_sharded:
+          is_trainer: False 
     dtype: bfloat16
     multi_stage_wake_up: true
     free_cache_engine: true
@@ -138,7 +149,7 @@ trainer:
   max_critic_ckpt_to_keep: null
   project_name: apertus-rl-tests
   experiment_name: GRPO
-  logger: ["console", "wandb"]
+  logger: ["console"]
   nnodes: 1
   n_gpus_per_node: 2
   log_val_generations: 5
