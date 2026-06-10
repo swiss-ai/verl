@@ -45,7 +45,6 @@ VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-true}"
 ROLLOUT_N="${ROLLOUT_N:-8}"
 SEED="${SEED:-85}"
 USE_GROUP_FILTERING="${USE_GROUP_FILTERING:-true}"
-ENABLE_THINKING="${ENABLE_THINKING:-false}"
 FORCE_THINKING="${FORCE_THINKING:-false}"
 THINK_PREFIX_TOKEN="${THINK_PREFIX_TOKEN:-<think>}"
 WANDB_ENTITY="${WANDB_ENTITY:-apertus}"
@@ -84,11 +83,16 @@ DEPS_STAMP="${DEPS_STAMP_DIR}/apertus_reward_py312.ready"
 DEPS_LOCK="${DEPS_STAMP_DIR}/apertus_reward_py312.lock"
 
 EXTRA_PIP_PACKAGES="${EXTRA_PIP_PACKAGES:-immutabledict nltk langdetect absl-py emoji syllapy antlr4-python3-runtime==4.9.3 requests math_verify}"
+REASONING_GYM_DIR="${REASONING_GYM_DIR:-}"
 
 
 DATA_DIR="${TRAINING_DATA_DIR:-${WORKING_DIR}/data/apertus_demo_rl}"
 TRAIN_FILE="${DATA_DIR}/train.parquet"
 TEST_FILE="${DATA_DIR}/val.parquet"
+APERTUS_DIR="${APERTUS_DIR:-${WORKING_DIR}/apertus}"
+# display_answers is a stateless @function_tool, so it is loaded through
+# function_tool_path. tool_config_path is only for BaseTool subclasses.
+APERTUS_FUNCTION_TOOL_PATH="${APERTUS_FUNCTION_TOOL_PATH:-${APERTUS_DIR}/display_answer_tools.py}"
 OUTPUT_ROOT="${WORKING_DIR}/outputs/${PROJECT_NAME}"
 RUN_NAME="${RUN_NAME:-}"
 RUN_DIR="${RUN_DIR:-}"
@@ -142,15 +146,25 @@ build_overrides() {
     "data.train_files=['${TRAIN_FILE}']"
     "data.val_files=['${TEST_FILE}']"
     "data.seed=${SEED}"
-    "data.apply_chat_template_kwargs.enable_thinking=${ENABLE_THINKING}"
     "+data.force_thinking_prefix=${FORCE_THINKING}"
     "+data.thinking_prefix_token='${THINK_PREFIX_TOKEN}'"
     "actor_rollout_ref.model.path=${RESOLVED_MODEL}"
     "actor_rollout_ref.rollout.n=${ROLLOUT_N}"
+    "actor_rollout_ref.rollout.multi_turn.enable=True"
+    "actor_rollout_ref.rollout.multi_turn.format=apertus2509"
+    "actor_rollout_ref.rollout.multi_turn.max_assistant_turns=1"
+    "actor_rollout_ref.rollout.multi_turn.terminal_tool_names=[display_answers]"
+    "actor_rollout_ref.rollout.multi_turn.tool_config_path=null"
+    "actor_rollout_ref.rollout.multi_turn.function_tool_path=${APERTUS_FUNCTION_TOOL_PATH}"
+    "actor_rollout_ref.rollout.agent.default_agent_loop=tool_agent"
+    "data.tool_config_path=null"
+    "data.function_tool_path=${APERTUS_FUNCTION_TOOL_PATH}"
     "actor_rollout_ref.actor.data_loader_seed=${SEED}"
     "actor_rollout_ref.rollout.max_num_batched_tokens=8192"
     "actor_rollout_ref.rollout.max_num_seqs=256"
     "actor_rollout_ref.rollout.gpu_memory_utilization=0.8"
+    "actor_rollout_ref.rollout.skip_tokenizer_init=False"
+    "+actor_rollout_ref.rollout.engine_kwargs.sglang.grammar_backend=llguidance"
     "rollout.nnodes=${ROLLOUT_NNODES}"
     "rollout.n_gpus_per_node=${ROLLOUT_GPUS_PER_NODE}"
     "reward.sandbox_fusion.url=${SCHEDULER_URL}"
@@ -250,13 +264,16 @@ prepare_shared_python_deps() {
       exit 0
     fi
 
-    if [ ! -d "${REASONING_GYM_DIR}" ]; then
-      echo "REASONING_GYM_DIR=${REASONING_GYM_DIR} does not exist. Clone https://github.com/EduardDurech/r-gym.git and check out the translate branch there, or set REASONING_GYM_DIR." >&2
-      exit 1
-    fi
-
     python3 -m pip install --no-cache-dir --upgrade --target "${PY_DEPS_DIR}" ${EXTRA_PIP_PACKAGES}
-    python3 -m pip install --no-cache-dir --upgrade --force-reinstall --target "${PY_DEPS_DIR}" "${REASONING_GYM_DIR}"
+    if [ -n "${REASONING_GYM_DIR}" ]; then
+      if [ ! -d "${REASONING_GYM_DIR}" ]; then
+        echo "REASONING_GYM_DIR=${REASONING_GYM_DIR} does not exist. Clone https://github.com/EduardDurech/r-gym.git and check out the translate branch there, or set REASONING_GYM_DIR=\"\" to install reasoning-gym from PyPI." >&2
+        exit 1
+      fi
+      python3 -m pip install --no-cache-dir --upgrade --force-reinstall --target "${PY_DEPS_DIR}" "${REASONING_GYM_DIR}"
+    else
+      python3 -m pip install --no-cache-dir --upgrade --force-reinstall --target "${PY_DEPS_DIR}" reasoning-gym
+    fi
     python3 -c "import nltk; [nltk.download(pkg, download_dir=\"${NLTK_DATA_DIR}\", quiet=True) for pkg in (\"punkt\", \"punkt_tab\", \"stopwords\", \"averaged_perceptron_tagger_eng\")]"
     python3 -c "import sys; sys.path[:0] = [\"${PY_DEPS_DIR}\", \"${WORKING_DIR}\"]; import absl, emoji, immutabledict, langdetect, math_verify, nltk, reasoning_gym, requests, syllapy, verl; print(\"Using shared deps from\", \"${PY_DEPS_DIR}\"); print(\"Using verl from\", verl.__file__)"
     touch "${DEPS_STAMP}"
