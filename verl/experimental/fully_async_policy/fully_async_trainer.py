@@ -449,16 +449,13 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
 
         with marked_timer("step", self.timing_raw):
             batch = await self._fit_generate(None)
-            print("batch ok")
             batch = self._fit_compute_reward(batch)
             batch = self._fit_compute_log_prob(batch)
             batch = self._fit_compute_ref_log_prob(batch)
             batch = self._fit_compute_critic(batch)
             batch = self._fit_compute_advantage(batch)
             batch = self._fit_update_critic(batch)
-            print("updating actor...")
             batch = self._fit_update_actor(batch)
-            print("actor updated")
             self._fit_update_local_step()
             await self._fit_update_weights()
             self._fit_dump_data(batch)
