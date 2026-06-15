@@ -74,6 +74,11 @@ actor_rollout_ref:
     ppo_mini_batch_size: 128  # NOTE: train_batch_size = require_batches * ppo_mini_batch_size
     use_dynamic_bsz: true
     ppo_max_token_len_per_gpu: 32768
+    ulysses_sequence_parallel_size: 1
+    entropy_from_logits_with_chunking: false
+    entropy_checkpointing: false
+
+
     optim:
       optimizer: _AdamW
       lr: 1e-6
@@ -143,7 +148,7 @@ trainer:
   # NOTE: as we have DAPO group filtering, completing one epoch
   # may not correspond to going through the entire dataset.
   total_epochs: 2
-  total_training_steps: 689 # 176213 samples / 256 effective async batch size = ~689
+  total_training_steps: 689 # TODO: recompute this based on all data
   save_freq: 20
   test_freq: 10
   max_actor_ckpt_to_keep: 10
@@ -156,6 +161,7 @@ trainer:
   log_val_generations: 5
   val_before_train: true
   default_local_dir: ./outputs/${trainer.project_name}/${trainer.experiment_name}
+  rollout_data_dir: ${trainer.default_local_dir}/rollout/
   validation_data_dir: ${trainer.default_local_dir}/validation/
 
 ray_kwargs:

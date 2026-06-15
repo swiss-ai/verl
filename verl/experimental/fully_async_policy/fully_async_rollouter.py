@@ -31,6 +31,7 @@ from verl.experimental.fully_async_policy.detach_utils import (
     safe_create_task,
     should_keep_async_filter_group,
     validate_async_filter_groups_config,
+    validate_inverse_batch,
 )
 from verl.experimental.fully_async_policy.message_queue import MessageQueueClient
 from verl.experimental.separation.ray_trainer import SeparateRayPPOTrainer
@@ -369,6 +370,30 @@ class FullyAsyncLLMServerManager(LLMServerManager):
         return len(self.rollout_replicas) + len(self.alive_replicas)
 
 
+async def _generate_sequences_inverse_batch(
+    async_rollout_manager, full_batch: DataProto, n_per_round: int
+) -> DataProto:
+    """Generate one repeated prompt group in sequential inverse-batch rounds."""
+    if n_per_round == len(full_batch):
+        return await async_rollout_manager.generate_sequences_single(full_batch)
+
+    round_outputs = []
+    for start in range(0, len(full_batch), n_per_round):
+        round_batch = full_batch[start : start + n_per_round]
+        round_outputs.append(await async_rollout_manager.generate_sequences_single(round_batch))
+
+    return DataProto.concat(round_outputs)
+
+
+def _max_concurrent_prompt_groups(
+    num_replicas: int, rollout_n: int, n_per_round: int, max_required_samples: int
+) -> int:
+    """Scale prompt-group concurrency so inverse batching keeps rollout servers fed."""
+    rounds_per_prompt = max(1, rollout_n // n_per_round)
+    max_concurrent_samples = num_replicas * 16 * rounds_per_prompt
+    return min(max_concurrent_samples, max_required_samples)
+
+
 class FullyAsyncAgentLoopManager(AgentLoopManager):
     @SkipManager.annotate(role="async_rollout")
     async def generate_sequences_single(self, prompts: DataProto) -> DataProto:
@@ -437,6 +462,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,
         )
+        self._val_generation_samples: list[tuple[str, str, float]] | None = None
 
         self.ref_in_actor = False
         self.kl_ctrl_in_reward = False
@@ -544,8 +570,12 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 / (self.required_samples * self.config.async_training.trigger_parameter_sync_step)
             )
 
-            self.max_concurrent_samples = len(self.llm_server_manager.get_replicas()) * 16
-            self.max_concurrent_samples = min(self.max_concurrent_samples, self.max_required_samples)
+            self.max_concurrent_samples = _max_concurrent_prompt_groups(
+                num_replicas=len(self.llm_server_manager.get_replicas()),
+                rollout_n=int(self.config.actor_rollout_ref.rollout.n),
+                n_per_round=self.n_per_round,
+                max_required_samples=self.max_required_samples,
+            )
             self.max_queue_size = self.max_required_samples
 
             print(
@@ -613,7 +643,35 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         timing_raw = {}
         with marked_timer("rollouter/validate_time", timing_raw, color="green"):
             val_metrics: dict = self._validate()
+        # Attach sampled generations for trainer-side W&B logging.
+        samples = self._val_generation_samples
+        if samples:
+            val_metrics = dict(val_metrics)
+            val_metrics["__val_generation_samples__"] = samples
+            self._val_generation_samples = None
         return timing_raw | val_metrics
+
+    def _maybe_log_val_generations(self, inputs, outputs, scores):
+        """Sample val generations and return them via do_validate().
+
+        In fully-async mode the rollouter runs in a separate Ray process which does
+        not own the W&B run, so we cannot reliably log `val/generations` here.
+        """
+        generations_to_log = int(getattr(self.config.trainer, "log_val_generations", 0) or 0)
+        if generations_to_log <= 0:
+            self._val_generation_samples = None
+            return
+
+        import numpy as np
+
+        samples = list(zip(inputs, outputs, scores, strict=True))
+        samples.sort(key=lambda x: x[0])
+        rng = np.random.RandomState(42)
+        rng.shuffle(samples)
+        samples = samples[:generations_to_log]
+        self._val_generation_samples = [
+            (str(inp), str(out), float(score)) for (inp, out, score) in samples
+        ]
 
     async def save_checkpoint(self, local_global_step_folder: str):
         # WARNING!: Due to the asynchronous nature, there are some in-flight samples
@@ -694,6 +752,9 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         if not hasattr(self.config, "async_training"):
             raise ValueError("[FullyAsyncRollouter] Missing async_training configuration")
         assert self.config.actor_rollout_ref.rollout.calculate_log_probs, "must rollout calculate log_probs"
+        rollout_config = self.config.actor_rollout_ref.rollout
+        validate_inverse_batch(rollout_config)
+        self.n_per_round = int(rollout_config.n_per_round)
         validate_async_filter_groups_config(self.config, logger=logger)
 
     async def init_workers(self):
@@ -941,16 +1002,28 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
     async def _process_single_sample_streaming(self, rollout_sample: RolloutSample):
         """Process a single sample streamingly"""
         # Calling asynchronous generation methods
-        # Embed sample_id into prompts for skip management
+        # The prompt-group uid is also used as the sticky routing key in inverse batching,
+        # so every round for this prompt group lands on the same rollout-server replica.
         rollout_sample.full_batch.non_tensor_batch["uid"] = np.array(
             [f"uid_{rollout_sample.sample_id}"] * len(rollout_sample.full_batch), dtype=object
         )
-        ret = await self.async_rollout_manager.generate_sequences_single(rollout_sample.full_batch)
+        preserved_non_tensor_batch = {
+            key: rollout_sample.full_batch.non_tensor_batch[key]
+            for key in ("data_source", "reward_model")
+            if key in rollout_sample.full_batch.non_tensor_batch
+        }
+        ret = await _generate_sequences_inverse_batch(
+            self.async_rollout_manager,
+            rollout_sample.full_batch,
+            self.n_per_round,
+        )
         rollout_sample.full_batch = ret
-        # Re-set uid on output — agent loop worker returns a new DataProto without the input's non_tensor_batch
+        # Re-set input metadata on output — agent loop worker returns a new DataProto without the input's non_tensor_batch.
         rollout_sample.full_batch.non_tensor_batch["uid"] = np.array(
             [f"uid_{rollout_sample.sample_id}"] * len(rollout_sample.full_batch), dtype=object
         )
+        for key, value in preserved_non_tensor_batch.items():
+            rollout_sample.full_batch.non_tensor_batch[key] = value
         rollout_sample.rollout_status = await self.get_statistics()
 
         filter_groups_config = self.config.algorithm.get("filter_groups", None)

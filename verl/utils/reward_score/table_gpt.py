@@ -1,16 +1,3 @@
-# Copyright 2026 The VERL Team and individual contributors.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 """Rule-based reward function for Table-GPT rows."""
 
 from __future__ import annotations
@@ -19,7 +6,9 @@ import json
 import re
 from typing import Any
 
-from sklearn.metrics import f1_score
+from .logging_utils import get_reward_logger, log_reward_warning
+
+logger = get_reward_logger(__name__)
 
 JSON_PARSING_ERROR = "JSONParsingError"
 
@@ -70,7 +59,12 @@ def compute_score(
     answer_key = ANSWER_KEYS.get(task)
     eval_fn = _get_evaluate_fn(task)
     if answer_key is None or eval_fn is None:
-        print(f"Warning: Table-GPT task {task!r} is not supported; returning 0 reward.")
+        log_reward_warning(
+            logger,
+            "table_gpt",
+            f"unsupported task; task={task}; returning 0 reward",
+            data_source=data_source,
+        )
         return 0.0
 
     y_true = [extract_json_answer(ground_truth, answer_key)]
@@ -78,9 +72,12 @@ def compute_score(
     try:
         return float(eval_fn(y_true, y_pred))
     except Exception as exc:
-        print(
-            f"Warning: Table-GPT scoring failed for task {task!r}; "
-            f"returning 0 reward. Error: {exc}"
+        log_reward_warning(
+            logger,
+            "table_gpt",
+            f"scoring failed; task={task}; returning 0 reward",
+            data_source=data_source,
+            exc=exc,
         )
         return 0.0
 
@@ -123,44 +120,46 @@ def _f1_from_counts(tp_count: int, fp_count: int, fn_count: int) -> float:
 
 
 def evaluate_em(y_true: list[Any], y_pred: list[Any]) -> float:
-    y_true = [int(str(x).lower() == "yes") for x in y_true]
-    y_pred = [int(str(x).lower() == "yes") for x in y_pred]
-    return f1_score(y_true, y_pred, zero_division=0)
+    """EntityMatching is a per-row Yes/No label task."""
+    corrects = [
+        int(str(y_t).strip().lower() == str(y_p).strip().lower())
+        for y_t, y_p in zip(y_true, y_pred, strict=False)
+    ]
+    return sum(corrects) / len(corrects) if corrects else 0.0
 
 
 def evaluate_ed(y_true: list[Any], y_pred: list[Any]) -> float:
-    tp_count = 0
-    fp_count = 0
-    fn_count = 0
-
-    def preprocess(y: Any) -> set[Any]:
-        if y == JSON_PARSING_ERROR or y is None:
+    """ErrorDetection labels are either explicit "None" or a cell-value pair."""
+    def preprocess(y: Any) -> set[Any] | None:
+        if y == JSON_PARSING_ERROR:
+            return None
+        if y is None:
             y = []
         elif isinstance(y, str):
-            if y.lower() == "none":
+            if y.strip().lower() == "none":
                 y = []
             else:
                 y = [y]
-        return set(y)
+        return {str(item).strip() for item in y}
 
+    scores = []
     for y_t, y_p in zip(y_true, y_pred, strict=False):
         y_true_set = preprocess(y_t)
         y_pred_set = preprocess(y_p)
-        tp_set = list(y_true_set.intersection(y_pred_set))[:1]
-
-        n_p = min(len(y_true_set), 1)
-        n_tp = min(len(tp_set), 1)
-        n_fp = 0
-        for y_pred_item in y_pred_set:
-            if y_pred_item not in y_true_set:
-                n_fp += 1
-        n_fn = n_p - n_tp
-
-        tp_count += len(tp_set)
-        fp_count += n_fp
-        fn_count += n_fn
-
-    return _f1_from_counts(tp_count, fp_count, fn_count)
+        # If either is unparsable we assign 0
+        if y_true_set is None or y_pred_set is None:
+            scores.append(0.0)
+            continue
+        # If both are empty, it's a perfect match
+        if not y_true_set and not y_pred_set:
+            scores.append(1.0)
+            continue
+        # Else we compute F1 based on the overlap of the sets
+        tp_count = len(y_true_set.intersection(y_pred_set))
+        fp_count = len(y_pred_set - y_true_set)
+        fn_count = len(y_true_set - y_pred_set)
+        scores.append(_f1_from_counts(tp_count, fp_count, fn_count))
+    return sum(scores) / len(scores) if scores else 0.0
 
 
 def evaluate_cf(y_true: list[Any], y_pred: list[Any]) -> float:
@@ -226,34 +225,12 @@ def evaluate_sm(y_true: list[Any], y_pred: list[Any]) -> float:
 
 
 def evaluate_cta(y_true: list[Any], y_pred: list[Any]) -> float:
-    tp_count = 0
-    fp_count = 0
-    fn_count = 0
-
-    for y_t, y_p in zip(y_true, y_pred, strict=False):
-        if str(y_t) == "None":
-            n_p = 0
-        else:
-            n_p = 1
-
-        if str(y_p) != "None" and y_p == y_t:
-            n_tp = 1
-        else:
-            n_tp = 0
-
-        if str(y_p) == "None":
-            n_pp = 0
-        else:
-            n_pp = 1
-
-        n_fp = n_pp - n_tp
-        n_fn = n_p - n_tp
-
-        tp_count += n_tp
-        fp_count += n_fp
-        fn_count += n_fn
-
-    return _f1_from_counts(tp_count, fp_count, fn_count)
+    # ColumnTypeAnnotation treats "None" as an ordinary semantic-type label
+    corrects = [
+        int(str(y_t).strip().lower() == str(y_p).strip().lower())
+        for y_t, y_p in zip(y_true, y_pred, strict=False)
+    ]
+    return sum(corrects) / len(corrects) if corrects else 0.0
 
 
 def evaluate_mvi(y_true: list[Any], y_pred: list[Any]) -> float:

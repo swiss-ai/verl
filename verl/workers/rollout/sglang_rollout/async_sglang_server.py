@@ -170,6 +170,11 @@ class SGLangHttpServer:
         # model weights version, set by ServerAdapter when update weights.
         self.global_steps = None
 
+        self.tokenizer_manager = None
+        self.template_manager = None
+        self.scheduler_info = None
+        self._launch_lock = asyncio.Lock()
+
         # PD peer linkage populated post-launch by SGLangPDReplica.set_pd_peer.
         self._pd_decode_peers: list[ActorHandle] = []
         self._pd_bootstrap_host: Optional[str] = None
@@ -246,6 +251,12 @@ class SGLangHttpServer:
         if self._disaggregation_role != "null":
             self._prepend_cu12_lib_to_ld_library_path()
 
+        if self._master_sock is not None:
+            try:
+                self._master_sock.close()
+            finally:
+                self._master_sock = None
+
         if self.nnodes > 1:
             if self.node_rank != 0:
                 assert master_address and master_port, "non-master node should provide master address and port"
@@ -284,6 +295,7 @@ class SGLangHttpServer:
         infer_tp = self.config.tensor_model_parallel_size * self.config.data_parallel_size
         args = {
             "model_path": self.model_config.local_path,
+            "tokenizer_path": self.model_config.local_tokenizer_path,
             "dtype": self.config.dtype,
             "mem_fraction_static": self.config.gpu_memory_utilization,
             "disable_cuda_graph": self.config.enforce_eager,
@@ -379,6 +391,14 @@ class SGLangHttpServer:
             args["enable_weights_cpu_backup"] = True
             args["enable_draft_weights_cpu_backup"] = True
 
+        base_port = int(os.getenv("SGLANG_PORT", "30000"))
+        role_idx = {"null": 0, "prefill": 1, "decode": 2}.get(self._disaggregation_role, 0)
+        server_rank = (self.replica_rank * 3 + role_idx) * self.nnodes + self.node_rank
+        sglang_port = base_port + server_rank * 2
+        args["port"] = sglang_port
+        if "nccl_port" in [f.name for f in dataclasses.fields(ServerArgs)]:
+            args["nccl_port"] = sglang_port + 1
+
         # NOTE: We can't directly call SGLang's launch_server since it's not an async function.
         # https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/entrypoints/http_server.py
         sglang.srt.entrypoints.engine._set_envs_and_config = _set_envs_and_config
@@ -438,6 +458,26 @@ class SGLangHttpServer:
 
         self._server_port, self._server_task = await run_uvicorn(app, server_args, self._server_address)
         self.tokenizer_manager.server_status = ServerStatus.Up
+
+    async def _ensure_tokenizer_manager(self) -> None:
+        """Ensure SGLang tokenizer_manager exists before serving requests."""
+        if getattr(self, "tokenizer_manager", None) is not None:
+            return
+
+        async with self._launch_lock:
+            if getattr(self, "tokenizer_manager", None) is not None:
+                return
+
+            # Best-effort lazy launch. For multi-node replicas, non-zero ranks
+            # require master address/port to be provided by the caller.
+            if self.nnodes > 1 and self.node_rank != 0 and (not self._master_address or not self._master_port):
+                raise RuntimeError(
+                    "SGLangHttpServer is not launched (tokenizer_manager missing) and cannot be lazily launched "
+                    "on a non-master node without master_address/master_port."
+                )
+            await self.launch_server(master_address=self._master_address, master_port=self._master_port)
+            if getattr(self, "tokenizer_manager", None) is None:
+                raise RuntimeError("SGLangHttpServer launch_server did not create tokenizer_manager.")
 
     async def wake_up(self):
         if self.node_rank != 0:
@@ -593,6 +633,20 @@ class SGLangHttpServer:
             # video_data=video_data,
         }
 
+        # Optional custom logit processor injection via config.
+        # `custom_logit_processor` must be a serialized `CustomLogitProcessor` string
+        # (i.e. `SomeProcessor.to_str()` in sglang).
+        custom_cfg = getattr(self.config, "custom", None) or {}
+        custom_logit_processor = custom_cfg.get("custom_logit_processor")
+        if custom_logit_processor:
+            request["custom_logit_processor"] = custom_logit_processor
+            custom_params = custom_cfg.get("custom_params")
+            if custom_params:
+                # Merge into per-request sampling_params.
+                sampling_params.setdefault("custom_params", {})
+                if isinstance(sampling_params["custom_params"], dict) and isinstance(custom_params, dict):
+                    sampling_params["custom_params"].update(custom_params)
+
         if prompt_logprobs is not None:
             request["logprob_start_len"] = 0
             if prompt_logprobs > 0:
@@ -612,7 +666,7 @@ class SGLangHttpServer:
         # Add lora request
         if self.model_config.lora_rank > 0:
             generate_request.lora_path = SGLANG_LORA_NAME
-
+        await self._ensure_tokenizer_manager()
         output = await self.tokenizer_manager.generate_request(generate_request, None).__anext__()
         meta_info = output.get("meta_info", {})
         finish_reason = meta_info.get("finish_reason")
@@ -685,11 +739,13 @@ class SGLangHttpServer:
     async def abort_all_requests(self):
         if self.node_rank != 0:
             return
+        await self._ensure_tokenizer_manager()
         await self.tokenizer_manager.pause_generation(PauseGenerationReqInput(mode="abort"))
 
     async def resume_generation(self):
         if self.node_rank != 0:
             return
+        await self._ensure_tokenizer_manager()
         await self.tokenizer_manager.continue_generation(ContinueGenerationReqInput())
 
     async def start_profile(self, **kwargs):
@@ -793,6 +849,8 @@ class SGLangReplica(RolloutReplica):
                 ),
                 runtime_env={"env_vars": {f"RAY_EXPERIMENTAL_NOSET_{visible_devices_keyword}": "1"}},
                 name=name,
+                max_restarts=3,
+                max_task_retries=3,
                 max_concurrency=self.max_concurrency,
             ).remote(
                 config=self.config,

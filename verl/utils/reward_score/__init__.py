@@ -11,11 +11,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# from . import gsm8k, math, prime_math, prime_code
-
 import os
 
 from verl.utils.import_utils import deprecated
+
+
+def _code_sandbox_backend():
+    backend = os.environ.get("SANDBOX_BACKEND", "kubernetes")
+    if backend not in {"kubernetes", "codegym"}:
+        raise ValueError("SANDBOX_BACKEND must be 'kubernetes' or 'codegym'")
+    return backend
 
 
 def _code_test_cases_for_prime_code(ground_truth, extra_info):
@@ -80,11 +85,22 @@ def default_compute_score(
 
         from . import math_verify
 
-        res = math_verify.compute_score(solution_str, ground_truth)
-    elif data_source in ["mmlu", "gpqa_diamond", "gpqa", "Idavidrein/gpqa"]:
+        res = math_verify.compute_score(
+            solution_str, ground_truth, data_source=data_source
+        )
+    elif data_source in [
+        "mmlu",
+        "gpqa_diamond",
+        "gpqa",
+        "Idavidrein/gpqa",
+        "riddle_sense",
+        "lexam_mcq",
+    ]:
         from . import multiple_choice
 
-        res = multiple_choice.compute_score(solution_str, ground_truth)
+        res = multiple_choice.compute_score(
+            solution_str, ground_truth, data_source=data_source
+        )
     elif data_source in [
         "allenai/IF_multi_constraints_upto5",
         "swiss-ai/if-rl-singleturn-prompts",
@@ -95,7 +111,7 @@ def default_compute_score(
         from . import instruction_following
 
         res = instruction_following.compute_score(
-            solution_str, ground_truth, extra_info=extra_info
+            solution_str, ground_truth, extra_info=extra_info, data_source=data_source
         )
     elif data_source in [
         "humaneval",
@@ -103,50 +119,81 @@ def default_compute_score(
     ]:
         from . import prime_code
 
-        res = prime_code.compute_score(solution_str, ground_truth, continuous=True)
+        res = prime_code.compute_score(
+            solution_str, ground_truth, continuous=True, data_source=data_source
+        )
     elif data_source in [
         "taco",
         "likaixin/TACO-verified",
+        "lighteval/code_generation_lite",
         "codecontests",
         "deepmind/code_contests",
+        "code_contests",
         "apps",
         "codeforces",
     ]:
-        scheduler_url = sandbox_fusion_url or os.environ.get("SCHEDULER_URL")
-        if scheduler_url:
-            from . import codegym_sandbox
+        # Select code evaluation sandbox backend
+        sandbox_backend = _code_sandbox_backend()
+        if sandbox_backend == "kubernetes":
+            sandbox_url = sandbox_fusion_url or os.environ.get("KUBERNETES_SANDBOX_URL")
+            from . import kubernetes_sandbox as code_sandbox
+        elif sandbox_backend == "codegym":
+            sandbox_url = sandbox_fusion_url or os.environ.get("SCHEDULER_URL")
+            from . import codegym_sandbox as code_sandbox
+        else:
+            sandbox_url = None
 
-            res = codegym_sandbox.compute_score(
+        if sandbox_url:
+            res = code_sandbox.compute_score(
                 data_source=data_source,
                 solution_str=solution_str,
                 ground_truth=ground_truth,
                 extra_info=extra_info,
-                sandbox_fusion_url=scheduler_url,
+                sandbox_fusion_url=sandbox_url,
                 concurrent_semaphore=concurrent_semaphore,
                 memory_limit_mb=memory_limit_mb,
                 continuous=continuous,
             )
         else:
-            # Fallback to prime code scoring
             from . import prime_code
 
             test_cases = _code_test_cases_for_prime_code(ground_truth, extra_info)
             res = prime_code.compute_score(
-                solution_str, test_cases, continuous=continuous
+                solution_str, test_cases, continuous=continuous, data_source=data_source
             )
     elif data_source == "rgym":
         from . import rgym
 
         res = rgym.compute_score(data_source, solution_str, ground_truth, extra_info)
+    elif data_source == "qa_gym":
+        from . import qa_gym
+
+        res = qa_gym.compute_score(data_source, solution_str, ground_truth, extra_info)
     elif isinstance(data_source, str) and data_source.startswith("tablegpt/"):
         from . import table_gpt
 
         res = table_gpt.compute_score(
             data_source, solution_str, ground_truth, extra_info
         )
+    elif isinstance(data_source, str) and data_source.startswith("blindtasks"):
+        from . import blindtasks
+
+        res = blindtasks.compute_score(
+            data_source, solution_str, ground_truth, extra_info
+        )
+    elif isinstance(data_source, str) and data_source.startswith("tool_gym"):
+        from . import toolgym
+
+        res = toolgym.compute_score(
+            data_source,
+            solution_str,
+            ground_truth,
+            extra_info,
+            **kwargs,
+        )
     else:
         raise NotImplementedError(
-            f"Reward function is not implemented for {data_source=}"
+            f"Reward function is not implemented for {data_source}"
         )
 
     if isinstance(res, dict):

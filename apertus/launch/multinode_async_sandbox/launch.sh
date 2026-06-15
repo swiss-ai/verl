@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# Submit a code-gym sandbox scheduler job and, once reachable, submit the
-# multi-node VERL training job with SCHEDULER_URL injected.
+# Submit a multi-node VERL training job with either a code-gym scheduler or a
+# Kubernetes sandbox service configured for code reward evaluation.
 # 
 # Credits: https://github.com/swiss-ai/code-gym/tree/main
 
@@ -15,59 +15,80 @@ USERNAME="$(whoami)"
 ###############################################################################
 # Experiment configuration
 ###############################################################################
-PROJECT_NAME=apertus-rl-tests
-# WORKING_DIR="/iopsstor/scratch/cscs/${USER}/projects/verl"
-WORKING_DIR=/capstor/store/cscs/swissai/infra01/reasoning/users/atazza/sgl-test/verl
-HOME=/iopsstor/scratch/cscs/${USER}
-HF_HOME=/iopsstor/scratch/cscs/${USER}/huggingface
-# ENVIRONMENT_PATH=/capstor/store/cscs/swissai/infra01/reasoning/raas/docker/vs:251215-patched/env.toml
-ENVIRONMENT_PATH=/users/atazza/.edf/async_rl.toml
+PROJECT_NAME="${PROJECT_NAME:-apertus-rl-tests}"
+SCRATCH_HOME="${SCRATCH_HOME:-/iopsstor/scratch/cscs/${USER}}"
+WORKING_DIR="${WORKING_DIR:-${SCRATCH_HOME}/projects/verl}"
+HOME="${SCRATCH_HOME}"
+HF_HOME="${HF_HOME:-${SCRATCH_HOME}/huggingface}"
+ENVIRONMENT_PATH="${ENVIRONMENT_PATH:-/capstor/store/cscs/swissai/infra01/reasoning/raas/docker/vs:251215-degenstop/env.toml}"
+PY_DEPS_ROOT="${PY_DEPS_ROOT:-}"
+PY_DEPS_DIR="${PY_DEPS_DIR:-}"
 
-MODEL_NAME_OR_PATH=/capstor/store/cscs/swissai/infra01/reasoning/models/Apertus-1p5-8B-sft-capfilter-linear-it8816
-TOKENIZER_NAME_OR_PATH=/capstor/store/cscs/swissai/infra01/MLLM/tokenizer/apertus_emu3.5_wavtok_instruct_thinking_token_fixed
-CONFIG_NAME=async
-SLURM_TIME=04:00:00
-TRAIN_NNODES=4
-ROLLOUT_NNODES=2
-NNODES=$((TRAIN_NNODES + ROLLOUT_NNODES))
-TRAINING_DATA_DIR=/users/jgarcagi/iopsstor/projects/verl/apertus/data/apertus_demo_rl
-# TRAINING_DATA_DIR=/capstor/store/cscs/swissai/infra01/reasoning/data/RL-prod/apertus_demo_rl
-FORCE_THINKING=false
-THINK_PREFIX_TOKEN="<|inner_prefix|>"
-SEED=85
-ROLLOUT_N=8
-USE_GROUP_FILTERING=true
-JOB_NAME="debug"
+MODEL_NAME_OR_PATH="${MODEL_NAME_OR_PATH:-/capstor/store/cscs/swissai/infra01/reasoning/models/Apertus-1p5-8B-sft-capfilter-linear-it8816}"
+TOKENIZERS_ROOT="${TOKENIZERS_ROOT:-/capstor/store/cscs/swissai/infra01/reasoning/models/tokenizers}"
+MULTIMODAL="${MULTIMODAL:-false}"
+if [[ -z "${TOKENIZER_NAME_OR_PATH:-}" ]]; then
+  if [[ "${MULTIMODAL}" == "true" ]]; then
+    TOKENIZER_NAME_OR_PATH="${TOKENIZERS_ROOT}/apertus_emu3.5_wavtok_instruct_thinking_token_fixed"
+  else
+    TOKENIZER_NAME_OR_PATH="${TOKENIZERS_ROOT}/apertus_emu3.5_wavtok_text_only"
+  fi
+fi
+CONFIG_NAME="${CONFIG_NAME:-async}"
+SLURM_TIME="${SLURM_TIME:-04:00:00}"
+TRAIN_NNODES="${TRAIN_NNODES:-4}"
+ROLLOUT_NNODES="${ROLLOUT_NNODES:-2}"
+NNODES="${NNODES:-$((TRAIN_NNODES + ROLLOUT_NNODES))}"
+TRAINING_DATA_DIR="${TRAINING_DATA_DIR:-/capstor/store/cscs/swissai/infra01/reasoning/data/RL-prod/apertus_demo_rl}"
+FORCE_THINKING="${FORCE_THINKING:-false}"
+THINK_PREFIX_TOKEN="${THINK_PREFIX_TOKEN:-<|inner_prefix|>}"
+ENABLE_THINKING="${ENABLE_THINKING:-false}"
+SEED="${SEED:-85}"
+ROLLOUT_N="${ROLLOUT_N:-8}"
+N_PER_ROUND="${N_PER_ROUND:-${ROLLOUT_N}}"
+USE_GROUP_FILTERING="${USE_GROUP_FILTERING:-true}"
+JOB_NAME="${JOB_NAME:-debug}"
+VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-true}"
+
+WANDB_ENTITY="${WANDB_ENTITY:-apertus}"
+WANDB_BACKGROUND_SYNC="${WANDB_BACKGROUND_SYNC:-false}"
+WANDB_MODE="${WANDB_MODE:-online}"
+WANDB_SYNC_INTERVAL_SECONDS="${WANDB_SYNC_INTERVAL_SECONDS:-60}"
+WANDB_REQUIRE_SERVICE="${WANDB_REQUIRE_SERVICE:-}"
+WANDB_DISABLE_SERVICE="${WANDB_DISABLE_SERVICE:-}"
+WANDB_SYNC_UPLOAD_MODE="${WANDB_SYNC_UPLOAD_MODE:-}"
+WANDB_DIR="${WANDB_DIR:-}"
+
+ACTOR_PPO_MINI_BATCH_SIZE="${ACTOR_PPO_MINI_BATCH_SIZE:-}"
+ROLLOUT_TOTAL_ROLLOUT_STEPS="${ROLLOUT_TOTAL_ROLLOUT_STEPS:-}"
+TRAINER_TEST_FREQ="${TRAINER_TEST_FREQ:-}"
+TRAINER_SAVE_FREQ="${TRAINER_SAVE_FREQ:-}"
+ASYNC_REQUIRE_BATCHES="${ASYNC_REQUIRE_BATCHES:-}"
+ASYNC_TRIGGER_PARAMETER_SYNC_STEP="${ASYNC_TRIGGER_PARAMETER_SYNC_STEP:-}"
+ASYNC_STALENESS_THRESHOLD="${ASYNC_STALENESS_THRESHOLD:-}"
+ASYNC_STEADY_WARMUP_STEPS="${ASYNC_STEADY_WARMUP_STEPS:-}"
 
 ###############################################################################
 # Sandbox configuration
 ###############################################################################
 
 # Set REASONING_GYM_DIR="" to install reasoning-gym from PyPI.
-REASONING_GYM_DIR=/iopsstor/scratch/cscs/${USER}/projects/r-gym
-CODE_GYM_DIR=/iopsstor/scratch/cscs/${USER}/projects/code-gym
-PORT=8000
-POLL_SECS=3
-MAX_WAIT=$((60 * 10))
-GIVEN_URL="${SCHEDULER_URL:-}"  # potentially reuse running scheduler
-NO_CODE="${NO_CODE:-false}"  # exclude code tasks (no sandbox required)
-SKIP_SANDBOX_SCHEDULER="${SKIP_SANDBOX_SCHEDULER:-false}"  # don't start/probe scheduler when true
-CODEGYM_REWARD_CONTINUOUS=false # default is binary reward
-
-if [[ "${NO_CODE}" == "true" ]]; then
-  SKIP_SANDBOX_SCHEDULER="true"
-fi
+REASONING_GYM_DIR="${REASONING_GYM_DIR:-${SCRATCH_HOME}/projects/r-gym}"
+TOOL_GYM_DIR="${TOOL_GYM_DIR:-${SCRATCH_HOME}/projects/tool-gym}"
+TOOL_GYM_FUNCTION_TOOL_PATH="${TOOL_GYM_FUNCTION_TOOL_PATH:-/capstor/store/cscs/swissai/infra01/reasoning/data/RL-prod/toolgym_test_v2/apertus_function_tools.py}"
+SANDBOX_BACKEND="kubernetes"  # kubernetes, codegym, or none
+KUBERNETES_SANDBOX_URL="https://sandbox-dev.swissai.svc.cscs.ch"
+CODE_GYM_DIR="" # ${SCRATCH_HOME}/projects/code-gym}  # Not needed if using kubernetes
+PORT="${PORT:-8000}"
+POLL_SECS="${POLL_SECS:-3}"
+MAX_WAIT="${MAX_WAIT:-$((60 * 10))}"
+GIVEN_URL="${SCHEDULER_URL:-}"  # potentially reuse a running code-gym scheduler
+NO_FORMAT="${NO_FORMAT:-false}"  # disable tool-formatting (legacy plain-text rollouts)
+LONG_CONTEXT="${LONG_CONTEXT:-false}"  # enable QA-gym data and long-context config parameters
+SANDBOX_REWARD_CONTINUOUS="${SANDBOX_REWARD_CONTINUOUS:-false}" # default is binary reward
+QA_GYM_RERANKER_URL="${QA_GYM_RERANKER_URL:-https://api.swissai.svc.cscs.ch/v1/score}"
 
 log(){ echo -e "$*" >&2; }
-
-clear_inherited_pyxis_options() {
-  local name
-  while IFS='=' read -r name _; do
-    case "${name}" in
-      SLURM_SPANK__SLURM_SPANK_OPTION_pyxis_*) unset "${name}" ;;
-    esac
-  done < <(env)
-}
 
 sanitize_job_name() {
   local value="$1"
@@ -92,6 +113,9 @@ resolve_run_name_and_dir() {
     group_filtering_tag="dapo-"
   fi
   thinking_tag=""
+  if [[ "${ENABLE_THINKING}" == "true" ]]; then
+    thinking_tag="${thinking_tag}-think"
+  fi
   if [[ "${FORCE_THINKING}" == "true" ]]; then
     thinking_tag="-force${thinking_tag}"
   fi
@@ -121,21 +145,80 @@ probe_ok() {
   fi
 }
 
+check_qa_gym_reranker() {
+  if [[ -z "${QA_GYM_RERANKER_URL}" ]]; then
+    return 0
+  fi
+  if [[ -z "${CSCS_SERVING_API:-}" ]]; then
+    echo "CSCS_SERVING_API must be set to use the QA Gym reranker service." >&2
+    exit 1
+  fi
+
+  local payload
+  payload='{"model":"tomaarsen/Qwen3-Reranker-8B-seq-cls","text_1":"<|im_start|>system\n\nShould <Response_B> truthful answering <Question> base on <Response_A> truthful answer <Question>\n\n\"yes\"or\"no\".\n\n<|im_end|>\n<|im_start|>user\n\n<Question>: What is the capital of France?\n<Response_A>: Paris\n<Question>: What is the capital of France?\n<Response_B>: ","text_2":["The capital is Paris.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think><answer>\""]}'
+
+  log "  -> Checking QA Gym reranker at ${QA_GYM_RERANKER_URL}"
+  if ! curl -fsS --max-time 10 \
+    -X POST "${QA_GYM_RERANKER_URL}" \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer ${CSCS_SERVING_API}" \
+    -d "${payload}" >/dev/null; then
+    echo "QA Gym reranker is not reachable at ${QA_GYM_RERANKER_URL}" >&2
+    exit 1
+  fi
+}
+
+resolve_sandbox_backend() {
+  case "${SANDBOX_BACKEND}" in
+    codegym|kubernetes)
+      ;;
+    none)
+      ;;
+    *)
+      echo "Unsupported SANDBOX_BACKEND=${SANDBOX_BACKEND}. Use codegym, kubernetes, or none." >&2
+      exit 1
+      ;;
+  esac
+
+  if [[ "${SANDBOX_BACKEND}" == "kubernetes" ]]; then
+    if [[ -z "${KUBERNETES_SANDBOX_URL}" ]]; then
+      echo "KUBERNETES_SANDBOX_URL must be set when using SANDBOX_BACKEND=kubernetes." >&2
+      exit 1
+    fi
+    KUBERNETES_SANDBOX_URL="${KUBERNETES_SANDBOX_URL%/}"
+  elif [[ "${SANDBOX_BACKEND}" == "codegym" && -z "${CODE_GYM_DIR}" && -z "${GIVEN_URL}" ]]; then
+    echo "CODE_GYM_DIR or SCHEDULER_URL must be set when using SANDBOX_BACKEND=codegym." >&2
+    exit 1
+  fi
+}
+
 resolve_run_name_and_dir
-clear_inherited_pyxis_options
+resolve_sandbox_backend
+if [[ "${LONG_CONTEXT}" == "true" ]]; then
+  check_qa_gym_reranker
+fi
 
 # ==========================================
-# STEP 1 & 2: Scheduler logic (or skip)
+# STEP 1 & 2: Sandbox setup
 # ==========================================
-if [[ "${SKIP_SANDBOX_SCHEDULER}" == "true" ]]; then
-  log "\n[1/4 & 2/4] Sandbox scheduler disabled for this run"
+if [[ "${SANDBOX_BACKEND}" == "none" ]]; then
+  log "\n[1/4 & 2/4] Code sandbox disabled for this run"
   URL=""
+  NODE_CLEAN="n/a"
+  SCHED_ID="skipped"
+elif [[ "${SANDBOX_BACKEND}" == "kubernetes" ]]; then
+  log "\n[1/4 & 2/4] Check Kubernetes sandbox"
+  if ! curl -fsS --max-time 10 "${KUBERNETES_SANDBOX_URL}/" >/dev/null; then
+    echo "Kubernetes sandbox is not reachable at ${KUBERNETES_SANDBOX_URL}" >&2
+    exit 1
+  fi
+  URL="${KUBERNETES_SANDBOX_URL}"
   NODE_CLEAN="n/a"
   SCHED_ID="skipped"
 elif [[ -z "${GIVEN_URL}" ]]; then
   [[ -f "${SCHED_SCRIPT}" ]] || { echo "Missing ${SCHED_SCRIPT}" >&2; exit 1; }
 
-  log "\n[1/4] Submit sandbox scheduler"
+  log "\n[1/4] Submit code-gym sandbox scheduler"
   log "  -> job-name=${SCHED_JOB_NAME} time=${SLURM_TIME}"
   SCHED_SUBMIT="$(sbatch \
     --job-name="${SCHED_JOB_NAME}" \
@@ -171,9 +254,11 @@ elif [[ -z "${GIVEN_URL}" ]]; then
 
   NODE_CLEAN="$(sed -E 's/[\[\],]//g; s/ .*//g' <<<"${node}")"
   URL="http://${NODE_CLEAN}:${PORT}"
+  SCHEDULER_URL="${URL}"
 else
-  log "\n[1/4 & 2/4] Reusing scheduler ${GIVEN_URL}"
+  log "\n[1/4 & 2/4] Reusing code-gym scheduler ${GIVEN_URL}"
   URL="${GIVEN_URL%/}"
+  SCHEDULER_URL="${URL}"
   SCHED_ID="skipped"
   HOST_PORT="${URL#*://}"
   NODE_CLEAN="${HOST_PORT%:*}"
@@ -184,10 +269,10 @@ else
 fi
 
 # ==========================================
-# STEP 3: Probe TCP (Skip when scheduler disabled)
+# STEP 3: Report sandbox endpoint
 # ==========================================
-if [[ -n "${URL}" ]]; then
-  log "\n[3/4] Probe scheduler ${NODE_CLEAN}:${PORT}"
+if [[ -n "${URL}" && "${SANDBOX_BACKEND}" == "codegym" ]]; then
+  log "\n[3/4] Probe code-gym scheduler ${NODE_CLEAN}:${PORT}"
   elapsed=0
   until probe_ok "${NODE_CLEAN}" "${PORT}" "${URL}"; do
     (( elapsed += POLL_SECS ))
@@ -195,8 +280,10 @@ if [[ -n "${URL}" ]]; then
     sleep "${POLL_SECS}"
   done
   log "  -> Scheduler reachable at ${URL}"
+elif [[ -n "${URL}" ]]; then
+  log "\n[3/4] Kubernetes sandbox reachable at ${URL}"
 else
-  log "\n[3/4] No scheduler probe needed"
+  log "\n[3/4] No sandbox probe needed"
 fi
 
 # ==========================================
@@ -206,14 +293,95 @@ log "\n[4/4] Submit multi-node async VERL training"
 log "  -> job-name=${TRAIN_JOB_NAME} time=${SLURM_TIME} train=${TRAIN_NNODES} rollout=${ROLLOUT_NNODES} total=${NNODES}"
 log "  -> config=${CONFIG_NAME} model=${MODEL_NAME_OR_PATH}"
 log "  -> data=${TRAINING_DATA_DIR} seed=${SEED} rollout_n=${ROLLOUT_N}"
-log "  -> group_filtering=${USE_GROUP_FILTERING} force_thinking=${FORCE_THINKING}"
-log "  -> output=${RUN_DIR}"
-if [[ -n "${URL}" ]]; then
-  log "  -> scheduler=${URL} code-gym continuous=${CODEGYM_REWARD_CONTINUOUS}"
+log "  -> group_filtering=${USE_GROUP_FILTERING} enable_thinking=${ENABLE_THINKING} force_thinking=${FORCE_THINKING}"
+log "  -> no_format=${NO_FORMAT} long_context=${LONG_CONTEXT}"
+if [[ "${WANDB_BACKGROUND_SYNC}" == "true" ]]; then
+  log "  -> output=${RUN_DIR} wandb_mode=${WANDB_MODE} wandb_sync_interval=${WANDB_SYNC_INTERVAL_SECONDS}s"
 else
-  log "  -> scheduler=disabled code-gym continuous=${CODEGYM_REWARD_CONTINUOUS}"
+  log "  -> output=${RUN_DIR}"
+fi
+log "  -> qa_gym_reranker_url=${QA_GYM_RERANKER_URL}"
+if [[ -n "${URL}" ]]; then
+  log "  -> sandbox_backend=${SANDBOX_BACKEND} sandbox_url=${URL} continuous=${SANDBOX_REWARD_CONTINUOUS}"
+else
+  log "  -> sandbox_backend=${SANDBOX_BACKEND} sandbox_url=disabled continuous=${SANDBOX_REWARD_CONTINUOUS}"
 fi
 log "  -> reasoning-gym=${REASONING_GYM_DIR:-PyPI reasoning-gym}"
+log "  -> tool-gym=${TOOL_GYM_DIR}"
+log "  -> tool-gym function tools=${TOOL_GYM_FUNCTION_TOOL_PATH}"
+
+join_export_vars() {
+  local out=""
+  local item=""
+  for item in "$@"; do
+    if [[ -z "${out}" ]]; then
+      out="${item}"
+    else
+      out+=",${item}"
+    fi
+  done
+  printf '%s' "${out}"
+}
+
+EXPORT_VARS=(
+  "ALL"
+  "MULTIMODAL=${MULTIMODAL}"
+  "SANDBOX_BACKEND=${SANDBOX_BACKEND}"
+  "SCHEDULER_URL=${SCHEDULER_URL:-}"
+  "KUBERNETES_SANDBOX_URL=${KUBERNETES_SANDBOX_URL:-}"
+  "SANDBOX_REWARD_CONTINUOUS=${SANDBOX_REWARD_CONTINUOUS}"
+  "QA_GYM_RERANKER_URL=${QA_GYM_RERANKER_URL}"
+  "MODEL_NAME_OR_PATH=${MODEL_NAME_OR_PATH}"
+  "TOKENIZER_NAME_OR_PATH=${TOKENIZER_NAME_OR_PATH}"
+  "CONFIG_NAME=${CONFIG_NAME}"
+  "NNODES=${NNODES}"
+  "TRAIN_NNODES=${TRAIN_NNODES}"
+  "ROLLOUT_NNODES=${ROLLOUT_NNODES}"
+  "TRAINING_DATA_DIR=${TRAINING_DATA_DIR}"
+  "NO_FORMAT=${NO_FORMAT}"
+  "LONG_CONTEXT=${LONG_CONTEXT}"
+  "ENABLE_THINKING=${ENABLE_THINKING}"
+  "FORCE_THINKING=${FORCE_THINKING}"
+  "THINK_PREFIX_TOKEN=${THINK_PREFIX_TOKEN}"
+  "DEGENERATION_EARLY_STOP=${DEGENERATION_EARLY_STOP:-}"
+  "DEGENERATION_EARLY_STOP_STRIDE=${DEGENERATION_EARLY_STOP_STRIDE:-}"
+  "SEED=${SEED}"
+  "ROLLOUT_N=${ROLLOUT_N}"
+  "USE_GROUP_FILTERING=${USE_GROUP_FILTERING}"
+  "PROJECT_NAME=${PROJECT_NAME}"
+  "RUN_NAME=${RUN_NAME}"
+  "RUN_DIR=${RUN_DIR}"
+  "WANDB_BACKGROUND_SYNC=${WANDB_BACKGROUND_SYNC}"
+  "WANDB_ENTITY=${WANDB_ENTITY}"
+  "WANDB_MODE=${WANDB_MODE}"
+  "WANDB_SYNC_INTERVAL_SECONDS=${WANDB_SYNC_INTERVAL_SECONDS}"
+  "WANDB_REQUIRE_SERVICE=${WANDB_REQUIRE_SERVICE}"
+  "WANDB_DISABLE_SERVICE=${WANDB_DISABLE_SERVICE}"
+  "WANDB_SYNC_UPLOAD_MODE=${WANDB_SYNC_UPLOAD_MODE}"
+  "WANDB_DIR=${WANDB_DIR}"
+  "VAL_BEFORE_TRAIN=${VAL_BEFORE_TRAIN}"
+  "PY_DEPS_ROOT=${PY_DEPS_ROOT}"
+  "PY_DEPS_DIR=${PY_DEPS_DIR}"
+  "ACTOR_PPO_MINI_BATCH_SIZE=${ACTOR_PPO_MINI_BATCH_SIZE}"
+  "ROLLOUT_TOTAL_ROLLOUT_STEPS=${ROLLOUT_TOTAL_ROLLOUT_STEPS}"
+  "TRAINER_TEST_FREQ=${TRAINER_TEST_FREQ}"
+  "TRAINER_SAVE_FREQ=${TRAINER_SAVE_FREQ}"
+  "ASYNC_REQUIRE_BATCHES=${ASYNC_REQUIRE_BATCHES}"
+  "ASYNC_TRIGGER_PARAMETER_SYNC_STEP=${ASYNC_TRIGGER_PARAMETER_SYNC_STEP}"
+  "ASYNC_STALENESS_THRESHOLD=${ASYNC_STALENESS_THRESHOLD}"
+  "ASYNC_STEADY_WARMUP_STEPS=${ASYNC_STEADY_WARMUP_STEPS}"
+  "WORKING_DIR=${WORKING_DIR}"
+  "HOME=${HOME}"
+  "HF_HOME=${HF_HOME}"
+  "ENVIRONMENT_PATH=${ENVIRONMENT_PATH}"
+  "REASONING_GYM_DIR=${REASONING_GYM_DIR}"
+  "TOOL_GYM_DIR=${TOOL_GYM_DIR}"
+  "TOOL_GYM_FUNCTION_TOOL_PATH=${TOOL_GYM_FUNCTION_TOOL_PATH}"
+  "JOB_NAME=${JOB_NAME}"
+  "N_PER_ROUND=${N_PER_ROUND}"
+)
+
+EXPORT_SPEC="$(join_export_vars "${EXPORT_VARS[@]}")"
 
 TRAIN_SUBMIT="$(sbatch \
   --job-name="${TRAIN_JOB_NAME}" \
@@ -221,7 +389,7 @@ TRAIN_SUBMIT="$(sbatch \
   --time="${SLURM_TIME}" \
   --output="${RUN_DIR}/multinode_async_sandbox_%j.out" \
   --error="${RUN_DIR}/multinode_async_sandbox_%j.err" \
-  --export=ALL,SCHEDULER_URL="${URL}",CODEGYM_REWARD_CONTINUOUS="${CODEGYM_REWARD_CONTINUOUS}",MODEL_NAME_OR_PATH="${MODEL_NAME_OR_PATH}",TOKENIZER_NAME_OR_PATH="${TOKENIZER_NAME_OR_PATH}",CONFIG_NAME="${CONFIG_NAME}",NNODES="${NNODES}",TRAIN_NNODES="${TRAIN_NNODES}",ROLLOUT_NNODES="${ROLLOUT_NNODES}",TRAINING_DATA_DIR="${TRAINING_DATA_DIR}",NO_CODE="${NO_CODE}",FORCE_THINKING="${FORCE_THINKING}",THINK_PREFIX_TOKEN="${THINK_PREFIX_TOKEN}",SEED="${SEED}",ROLLOUT_N="${ROLLOUT_N}",USE_GROUP_FILTERING="${USE_GROUP_FILTERING}",PROJECT_NAME="${PROJECT_NAME}",RUN_NAME="${RUN_NAME}",RUN_DIR="${RUN_DIR}",WORKING_DIR="${WORKING_DIR}",HOME="${HOME}",HF_HOME="${HF_HOME}",ENVIRONMENT_PATH="${ENVIRONMENT_PATH}",REASONING_GYM_DIR="${REASONING_GYM_DIR}",JOB_NAME="${JOB_NAME}" \
+  --export="${EXPORT_SPEC}" \
   "${TRAIN_SCRIPT}" "$@")"
 TRAIN_ID="$(awk '{print $NF}' <<<"${TRAIN_SUBMIT}")"
 [[ "${TRAIN_ID}" =~ ^[0-9]+$ ]] || { echo "Failed to parse training job id: ${TRAIN_SUBMIT}" >&2; exit 1; }

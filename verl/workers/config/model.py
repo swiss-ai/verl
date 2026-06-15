@@ -18,7 +18,7 @@ from omegaconf import MISSING
 from transformers import AutoConfig
 
 from verl.base_config import BaseConfig
-from verl.utils import hf_processor, hf_tokenizer
+from verl.utils import hf_tokenizer_and_processor
 from verl.utils.fs import copy_to_local
 from verl.utils.import_utils import import_external_libs
 from verl.utils.model import get_generation_config, update_model_config
@@ -98,6 +98,9 @@ class HFModelConfig(BaseConfig):
     # whether to load tokenizer. This is useful when we only want to load model config
     load_tokenizer: bool = True
 
+    lazy_tokenizer: bool = False
+    load_processor: bool = True
+
     hf_config: Any = None
     generation_config: Any = None
     tokenizer: Any = None
@@ -158,8 +161,12 @@ class HFModelConfig(BaseConfig):
         # construct tokenizer
         if self.load_tokenizer:
             self.local_tokenizer_path = copy_to_local(self.tokenizer_path, use_shm=self.use_shm)
-            self.tokenizer = hf_tokenizer(self.local_tokenizer_path, trust_remote_code=self.trust_remote_code)
-            self.processor = hf_processor(self.local_tokenizer_path, trust_remote_code=self.trust_remote_code)
+            if not self.lazy_tokenizer:
+                self.tokenizer, self.processor = hf_tokenizer_and_processor(
+                    self.local_tokenizer_path,
+                    trust_remote_code=self.trust_remote_code,
+                    load_processor=self.load_processor,
+                )
 
         # For base models (e.g. Qwen3.5-2b-Base), the processor may not have a chat_template
         # while the tokenizer does. Sync it so that processor.apply_chat_template() works.
@@ -205,6 +212,13 @@ class HFModelConfig(BaseConfig):
         override_config_kwargs.update(override_config)
         update_model_config(self.hf_config, override_config_kwargs=override_config_kwargs)
 
+        if getattr(self.hf_config, "pad_token_id", None) is None:
+            eos = getattr(self.hf_config, "eos_token_id", None)
+            if isinstance(eos, list) and eos:
+                eos = eos[0]
+            if eos is not None:
+                self.hf_config.pad_token_id = int(eos)
+
         self.share_embeddings_and_output_weights = getattr(self.hf_config, "tie_word_embeddings", False)
 
         # get model architectures
@@ -244,4 +258,22 @@ class HFModelConfig(BaseConfig):
                         )
 
     def get_processor(self):
+        self._ensure_tokenizer_loaded()
         return self.processor if self.processor is not None else self.tokenizer
+
+    def get_tokenizer(self):
+        self._ensure_tokenizer_loaded()
+        return self.tokenizer
+
+    def _ensure_tokenizer_loaded(self):
+        if not self.load_tokenizer:
+            return
+        if self.tokenizer is not None:
+            return
+        if self.local_tokenizer_path is None:
+            self.local_tokenizer_path = copy_to_local(self.tokenizer_path, use_shm=self.use_shm)
+        self.tokenizer, self.processor = hf_tokenizer_and_processor(
+            self.local_tokenizer_path,
+            trust_remote_code=self.trust_remote_code,
+            load_processor=self.load_processor,
+        )

@@ -23,9 +23,14 @@ from dataclasses import dataclass
 from typing import Any
 
 import datasets
-
-from table_gpt_data import TABLE_GPT_DATASET_ID, load_table_gpt_mix
 from verl.utils.reward_score.gsm8k import extract_solution as extract_gsm8k_solution
+
+from utils.LEXam_mcq import normalize_lexam_mcq_sample
+from utils.qa_gym import load_qa_gym_rl_pairs_jsonl
+from utils.rgym import strip_rgym_format_instructions
+from utils.riddle_sense import normalize_riddle_sense_sample
+from utils.table_gpt import TABLE_GPT_DATASET_ID, load_table_gpt_mix
+
 
 LOCAL_SAVE_DIR = "./data/apertus_demo_rl"
 DATASETS_CACHE_DIR = "./data/apertus_demo_rl/.hf_datasets_cache"
@@ -38,33 +43,11 @@ CODE_FINAL_ANSWER_INSTRUCTION = (
     "block containing the complete solution."
 )
 
-DISPLAY_ANSWERS_EBNF = """%llguidance {}
-start: (text_or_thinking)? tool_calls
-text_or_thinking: TEXT | (<|inner_prefix|> TEXT <|inner_suffix|>)
-
-tool_calls: <|tools_prefix|> %json {
-    "type": "array",
-    "minItems": 1,
-    "items": {
-        "type": "object",
-        "properties": {
-            "display_answers": {
-                "type": "object",
-                "properties": {
-                    "answers": {
-                        "type": "array",
-                        "items": {"type": "string"}
-                    }
-                },
-                "required": ["answers"]
-            }
-        },
-        "required": ["display_answers"]
-    }
-} <|tools_suffix|>
-
-TEXT: /(.|\\n)+/
-"""
+# DISPLAY_ANSWERS_EBNF = r"""%llguidance {}
+# start: (TEXT | tool_block)*
+# tool_block: <|tools_prefix|> %json { "type": "array", "minItems": 1, "items": { "type": "object" } } <|tools_suffix|>
+# TEXT: /(?:(?!<\|tools_prefix\|>)(.|\n))+/
+# """
 
 
 @dataclass(frozen=True)
@@ -170,6 +153,32 @@ TRAIN_DATASETS = [
         tool_selection=("display_answers",),
     ),
     DatasetConfig(
+        name="riddle_sense",
+        dataset_id="/capstor/store/cscs/swissai/infra01/reasoning/data/RL-prod/riddle_sense/train.parquet",
+        split="train",
+        adapter="riddle_sense",
+        data_source="riddle_sense",
+        question_key="question",
+        choices_key="choices",
+        answer_key="answerKey",
+        enable_thinking=False,
+        tool_selection=("display_answers",),
+    ),
+    DatasetConfig(
+        name="lexam_mcq",
+        dataset_id="LEXam-Benchmark/LEXam",
+        subset="mcq_4_choices",
+        split="test",
+        adapter="lexam_mcq",
+        data_source="lexam_mcq",
+        question_key="question",
+        choices_key="choices",
+        answer_key="gold",
+        subject_key="area",
+        enable_thinking=False,
+        tool_selection=("display_answers",),
+    ),
+    DatasetConfig(
         name="table_gpt",
         dataset_id=TABLE_GPT_DATASET_ID,
         split="mixed",
@@ -177,7 +186,25 @@ TRAIN_DATASETS = [
         data_source="table_gpt",
         prompt_key="prompt",
         answer_key="completion",
-        tool_selection=("display_answers",),    # TODO: if verification is ok, can choose to only activate on some samples
+    ),
+    DatasetConfig(
+        name="qa_gym",
+        dataset_id="/capstor/store/cscs/swissai/infra01/reasoning/data/RL-prod/qa_gym/eval10_hybrid_multihop_rl_pairs.jsonl",
+        split="train",
+        adapter="qa_gym",
+        data_source="qa_gym",
+        question_key="question",
+        sample_size=None,
+        tool_selection=("display_answers",),
+    ),
+    DatasetConfig(
+        name="vrl",
+        dataset_id="/capstor/store/cscs/swissai/infra01/reasoning/data/RL-prod/vrl/train.parquet",
+        split="train",
+        adapter="vrl",
+        data_source="blindtasks_rl",
+        prompt_key="prompt",
+        tool_selection=("display_answers",),
     ),
     DatasetConfig(
         name="code_contests",
@@ -196,9 +223,27 @@ TRAIN_DATASETS = [
         adapter="open_r1_codeforces",
         data_source="codeforces",
     ),
+    DatasetConfig(
+        name="toolgym",
+        dataset_id="/capstor/store/cscs/swissai/infra01/reasoning/data/RL-prod/toolgym_test_v2/dataset/train.parquet",
+        split="train",
+        adapter="tools",
+        data_source="tool_gym",
+        enable_thinking=True,
+        # tool_selection is done in the adapter
+    ),
 ]
 
 EVAL_DATASETS = [
+    DatasetConfig(
+        name="rgym",
+        dataset_id="/capstor/store/cscs/swissai/infra01/reasoning/data/RL-prod/rgym/val_mini.parquet",
+        split="val_mini",
+        adapter="rgym",
+        data_source="rgym",
+        prompt_key="prompt",
+        sample_size=200,
+    ),
     DatasetConfig(
         name="gsm8k",
         dataset_id="openai/gsm8k",
@@ -309,6 +354,15 @@ EVAL_DATASETS = [
         prompt_key="prompt",
         sample_size=100,
     ),
+    DatasetConfig(
+        name="toolgym",
+        dataset_id="/capstor/store/cscs/swissai/infra01/reasoning/data/RL-prod/toolgym_test_v2/dataset/val.parquet",
+        split="train",
+        adapter="tools",
+        data_source="tool_gym",
+        enable_thinking=False,
+        # tool_selection is done in the adapter
+    ),
 ]
 
 
@@ -379,21 +433,47 @@ def normalize_messages(messages: Any) -> list[dict[str, str]]:
     return normalized
 
 
+def maybe_strip_rgym_format_instructions(
+    prompt: list[dict[str, str]], config: DatasetConfig, language: str | None = None
+) -> list[dict[str, str]]:
+    """Strips out the output format instructions if "display_answers" tool is selected"""
+    if "display_answers" not in config.tool_selection:
+        return prompt
+
+    normalized = []
+    for message in prompt:
+        content, _ = strip_rgym_format_instructions(message["content"], language)
+        normalized.append({**message, "content": content})
+    return normalized
+
+
 def prompt_controls(config: DatasetConfig) -> dict[str, Any]:
     controls = {
         "tool_selection": list(config.tool_selection),
         "apply_chat_template_kwargs": {"enable_thinking": config.enable_thinking},
     }
-    if "display_answers" in config.tool_selection:
-        controls["sampling_params"] = {"ebnf": DISPLAY_ANSWERS_EBNF}
+    # if "display_answers" in config.tool_selection:
+    #     controls["sampling_params"] = {"ebnf": DISPLAY_ANSWERS_EBNF}
+    # controls["sampling_params"] = {"ebnf": DISPLAY_ANSWERS_EBNF}
     return controls
+
+
+def agent_name(config: DatasetConfig) -> str:
+    return agent_name_for_tools(config.tool_selection)
+
+
+def agent_name_for_tools(tool_selection: Any) -> str:
+    if tool_selection:
+        return "tool_agent"
+    return "single_turn_agent"
 
 
 def source_controls(example: dict[str, Any]) -> dict[str, Any]:
     extra_info = parse_json_maybe(example.get("extra_info"), default={})
     if not isinstance(extra_info, dict):
         return {}
-    keys = ("tool_selection", "apply_chat_template_kwargs", "sampling_params")
+    # keys = ("tool_selection", "apply_chat_template_kwargs", "sampling_params")
+    keys = ("tool_selection", "apply_chat_template_kwargs")
     return {key: extra_info[key] for key in keys if key in extra_info}
 
 
@@ -415,6 +495,7 @@ def make_row(
 ) -> dict[str, Any]:
     row = {
         "data_source": config.data_source,
+        # "agent_name": agent_name(config),
         "prompt": prompt,
         "ability": ability,
         "reward_model": {"style": "rule", "ground_truth": ground_truth},
@@ -433,14 +514,43 @@ def make_row(
     return row
 
 
+@register_adapter("qa_gym")
+def adapt_qa_gym(
+    example: dict[str, Any], idx: int, split: str, config: DatasetConfig
+) -> dict[str, Any]:
+    prompt = normalize_text(get_value(example, config.prompt_key))
+    question = normalize_text(get_value(example, config.question_key)) or prompt
+    answer = normalize_text(get_value(example, config.answer_key))
+    extra_info = {
+        "question": question,
+        "qa_id": normalize_text(get_value(example, "id")),
+    }
+    return make_row(
+        config=config,
+        split=split,
+        index=idx,
+        prompt=make_prompt(prompt),
+        ability="long_context_qa",
+        ground_truth=answer,
+        extra_info=extra_info,
+    )
+
+
 @register_adapter("rgym")
 def adapt_rgym(
     example: dict[str, Any], idx: int, split: str, config: DatasetConfig
 ) -> dict[str, Any]:
     row = dict(example)
-    row["prompt"] = normalize_messages(get_value(example, config.prompt_key))
+    prompt = normalize_messages(get_value(example, config.prompt_key))
+    extra_info = dict(
+        parse_json_maybe(get_value(example, "extra_info"), default={}) or {}
+    )
+    prompt = maybe_strip_rgym_format_instructions(
+        prompt, config, normalize_text(extra_info.get("language")) or None
+    )
+    row["prompt"] = prompt
     row["data_source"] = config.data_source
-    extra_info = dict(parse_json_maybe(get_value(example, "extra_info"), default={}) or {})
+    # row["agent_name"] = agent_name(config)
     extra_info.update(prompt_controls(config))
     extra_info["source_dataset"] = normalize_text(get_value(example, "data_source"))
     row["extra_info"] = extra_info
@@ -462,6 +572,7 @@ def adapt_table_gpt(
         metadata = {}
     return {
         "data_source": f"tablegpt/{task}",
+        # "agent_name": agent_name(config),
         "prompt": make_prompt(normalize_text(get_value(example, config.prompt_key))),
         "ability": task,
         "reward_model": {"style": "rule", "ground_truth": ground_truth},
@@ -478,6 +589,54 @@ def adapt_table_gpt(
             **prompt_controls(config),
         },
     }
+
+
+@register_adapter("vrl")
+def adapt_vrl(
+    example: dict[str, Any], idx: int, split: str, config: DatasetConfig
+) -> dict[str, Any]:
+    reward_model = parse_json_maybe(get_value(example, "reward_model"), default={})
+    if not isinstance(reward_model, dict):
+        reward_model = {}
+    ground_truth = reward_model.get(
+        "ground_truth", get_value(example, config.answer_key)
+    )
+    if not isinstance(ground_truth, str):
+        ground_truth = json_dumps(ground_truth)
+
+    extra_info = parse_json_maybe(get_value(example, "extra_info"), default={})
+    if not isinstance(extra_info, dict):
+        extra_info = {}
+    row = make_row(
+        config=config,
+        split=split,
+        index=idx,
+        prompt=normalize_messages(get_value(example, config.prompt_key)),
+        ability=normalize_text(get_value(example, "ability")) or "vision.blindtasks",
+        ground_truth=ground_truth,
+        extra_info=dict(extra_info),
+    )
+    row["reward_model"]["style"] = reward_model.get("style", "rule")
+    return row
+
+
+@register_adapter("tools")
+def adapt_tools(
+    example: dict[str, Any], idx: int, split: str, config: DatasetConfig
+) -> dict[str, Any]:
+    row = dict(example)
+    extra_info = dict(row.get("extra_info") or {})
+    extra_info["index"] = idx
+    reward_model = dict(row.get("reward_model") or {})
+    ground_truth = reward_model.get("ground_truth")
+    if not isinstance(ground_truth, str):
+        reward_model["ground_truth"] = json_dumps(ground_truth)
+    row["data_source"] = normalize_text(row.get("data_source")) or config.data_source
+    row["reward_model"] = reward_model
+    row["extra_info"] = extra_info
+    # row["agent_name"] = agent_name_for_tools(extra_info.get("tool_selection"))
+    row.pop("tools", None)
+    return row
 
 
 @register_adapter("math")
@@ -576,7 +735,7 @@ def adapt_taco(
 def adapt_apps(
     example: dict[str, Any], idx: int, split: str, config: DatasetConfig
 ) -> dict[str, Any]:
-    return make_code_row(example, idx, split, config, "lighteval/code_generation_lite")
+    return make_code_row(example, idx, split, config, "likaixin/TACO-verified")
 
 
 @register_adapter("code_contests")
@@ -604,7 +763,7 @@ def adapt_code_contests(
             "language": "python",
             "input_output": json_dumps(test_cases),
             "prime_code_input_output": json_dumps(test_cases),
-            "sandbox_data_source": "lighteval/code_generation_lite",
+            "sandbox_data_source": "likaixin/TACO-verified",
             "num_used_tests": len(test_cases["inputs"]),
         },
     )
@@ -636,7 +795,7 @@ def adapt_codeforces(
             "language": "python",
             "input_output": ground_truth,
             "prime_code_input_output": ground_truth,
-            "sandbox_data_source": "lighteval/code_generation_lite",
+            "sandbox_data_source": "likaixin/TACO-verified",
         },
     )
 
@@ -746,6 +905,63 @@ def adapt_multiple_choice(
         ability="knowledge",
         ground_truth=answer_letter,
         extra_info=extra_info,
+    )
+
+
+@register_adapter("riddle_sense")
+def adapt_riddle_sense(
+    example: dict[str, Any], idx: int, split: str, config: DatasetConfig
+) -> dict[str, Any]:
+    normalized = normalize_riddle_sense_sample(example)
+    choices, answer_letter = maybe_shuffle_choices(
+        normalized["choices"], normalized["answer_index"], config, idx
+    )
+    return make_row(
+        config=config,
+        split=split,
+        index=idx,
+        prompt=make_prompt(
+            format_multiple_choice_prompt(normalized["question"], choices)
+        ),
+        ability="knowledge",
+        ground_truth=answer_letter,
+        extra_info={
+            "question": normalized["question"],
+            "choices": choices,
+            "answer_index": answer_letter,
+            "answer_text": normalized["answer_text"],
+            **normalized["metadata"],
+        },
+    )
+
+
+@register_adapter("lexam_mcq")
+def adapt_lexam_mcq(
+    example: dict[str, Any], idx: int, split: str, config: DatasetConfig
+) -> dict[str, Any]:
+    normalized = normalize_lexam_mcq_sample(example)
+    choices, answer_letter = maybe_shuffle_choices(
+        normalized["choices"], normalized["answer_index"], config, idx
+    )
+    metadata = dict(normalized["metadata"])
+    if config.subject_key and config.subject_key in metadata:
+        metadata["subject"] = normalize_text(metadata[config.subject_key])
+    return make_row(
+        config=config,
+        split=split,
+        index=idx,
+        prompt=make_prompt(
+            format_multiple_choice_prompt(normalized["question"], choices)
+        ),
+        ability="knowledge",
+        ground_truth=answer_letter,
+        extra_info={
+            "question": normalized["question"],
+            "choices": choices,
+            "answer_index": answer_letter,
+            "answer_text": normalized["answer_text"],
+            **metadata,
+        },
     )
 
 
@@ -982,12 +1198,25 @@ def load_raw_dataset(config: DatasetConfig) -> datasets.Dataset:
             config.dataset_id,
             cache_dir=os.path.expanduser(DATASETS_CACHE_DIR),
         )
+    elif config.adapter == "qa_gym":
+        raw_dataset = load_qa_gym_rl_pairs_jsonl(config.dataset_id)
     elif config.dataset_id.endswith(".parquet"):
         raw_dataset = datasets.load_dataset(
             "parquet",
             data_files={config.split: config.dataset_id},
             split=config.split,
             cache_dir=os.path.expanduser(DATASETS_CACHE_DIR),
+        )
+    elif config.dataset_id.endswith((".json", ".jsonl")):
+        raw_dataset = datasets.load_dataset(
+            "json",
+            data_files={config.split: config.dataset_id},
+            split=config.split,
+            cache_dir=os.path.expanduser(DATASETS_CACHE_DIR),
+        )
+    elif os.path.isdir(config.dataset_id):
+        raw_dataset = datasets.load_from_disk(
+            config.dataset_id,
         )
     else:
         raw_dataset = datasets.load_dataset(
@@ -1023,6 +1252,7 @@ def preprocess_example(
     example = dict(example)
     row = adapter(example, idx, config.split, config)
     row["extra_info"].update(source_controls(example))
+    # row["agent_name"] = agent_name_for_tools(row["extra_info"].get("tool_selection"))
     return row
 
 
@@ -1046,7 +1276,9 @@ def cast_output_features(dataset: datasets.Dataset) -> datasets.Dataset:
     features = datasets.Features(normalize_feature_types(dataset.features))
     if "extra_info" not in features or "tool_selection" not in features["extra_info"]:
         return dataset.cast(features)
-    features["extra_info"]["tool_selection"] = datasets.Sequence(datasets.Value("string"))
+    features["extra_info"]["tool_selection"] = datasets.Sequence(
+        datasets.Value("string")
+    )
     return dataset.cast(features)
 
 
