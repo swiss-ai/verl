@@ -73,9 +73,9 @@ ASYNC_STEADY_WARMUP_STEPS="${ASYNC_STEADY_WARMUP_STEPS:-}"
 ###############################################################################
 
 # Set REASONING_GYM_DIR="" to install reasoning-gym from PyPI.
-REASONING_GYM_DIR="${REASONING_GYM_DIR:-${SCRATCH_HOME}/projects/r-gym}"
-TOOL_GYM_DIR="${TOOL_GYM_DIR:-${SCRATCH_HOME}/projects/tool-gym}"
-TOOL_GYM_FUNCTION_TOOL_PATH="${TOOL_GYM_FUNCTION_TOOL_PATH:-/capstor/store/cscs/swissai/infra01/reasoning/data/RL-prod/toolgym_test_v2/apertus_function_tools.py}"
+REASONING_GYM_DIR=""
+TOOL_GYM_DIR=""
+TOOL_GYM_FUNCTION_TOOL_PATH="${TOOL_GYM_FUNCTION_TOOL_PATH:-/capstor/store/cscs/swissai/infra01/reasoning/data/RL-prod/toolgym_test_v3/apertus_function_tools_v3.py}"
 SANDBOX_BACKEND="kubernetes"  # kubernetes, codegym, or none
 KUBERNETES_SANDBOX_URL="https://sandbox-dev.swissai.svc.cscs.ch"
 CODE_GYM_DIR="" # ${SCRATCH_HOME}/projects/code-gym}  # Not needed if using kubernetes

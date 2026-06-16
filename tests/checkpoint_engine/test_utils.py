@@ -39,6 +39,7 @@ class TrainingWorkerTest(TrainingWorker):
         if torch.distributed.get_rank() == 0:
             engine_kwargs["is_master"] = True
         self.checkpoint_engine = CheckpointEngineRegistry.new(backend, bucket_size=bucket_size, **engine_kwargs)
+        
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     async def update_weights(self, global_steps: int = None, mode: str = "auto"):
@@ -142,7 +143,7 @@ class CheckpointEngineWorkerTest(CheckpointEngineWorker):
 def create_trainer_worker_group(
     resource_pool: RayResourcePool, model_config: HFModelConfig, checkpoint_engine_config: CheckpointEngineConfig
 ) -> RayWorkerGroup:
-    engine_config = FSDPEngineConfig(forward_only=True, fsdp_size=resource_pool.world_size, strategy="fsdp")
+    engine_config = FSDPEngineConfig(forward_only=True, fsdp_size=resource_pool.world_size, strategy="fsdp2")
     trainer_config = TrainingWorkerConfig(
         model_type="language_model",
         model_config=model_config,

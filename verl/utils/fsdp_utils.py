@@ -548,9 +548,11 @@ def _select_fsdp2_wrap_targets(model, fsdp_transformer_layer_cls_to_wrap):
     for name, module in model.named_modules():
         leaf_name = name.rsplit(".", 1)[-1] if "." in name else name
         if (
-            module.__class__.__name__ in fsdp_transformer_layer_cls_to_wrap
-            or (isinstance(module, nn.Embedding) and not _tie)
-            or (leaf_name in _wrap_by_name and hasattr(module, "weight"))
+            (
+                module.__class__.__name__ in fsdp_transformer_layer_cls_to_wrap
+                or (isinstance(module, nn.Embedding) and not _tie)
+                or (leaf_name in _wrap_by_name and hasattr(module, "weight"))
+            ) and (name != "lm_head") # do not wrap lm_head in fsdp for compatibility with fused kernels
         ):
             modules.append(module)
     return modules

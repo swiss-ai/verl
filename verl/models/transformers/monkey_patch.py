@@ -20,7 +20,7 @@ from types import SimpleNamespace
 from typing import Optional
 
 import torch
-from transformers.modeling_flash_attention_utils import _flash_attention_forward
+from verl.models.transformers._modeling_fattn_utils import _flash_attention_forward
 from transformers.modeling_utils import PreTrainedModel
 
 from verl.utils.import_utils import is_trl_available
@@ -525,6 +525,13 @@ def apply_monkey_patch(
         if ulysses_sp_size > 1:
             patch_vlm_for_ulysses_input_slicing(Qwen3_5TextModel)
             patch_vlm_for_ulysses_input_slicing(Qwen3_5MoeTextModel)
+
+    elif model.config.model_type in ["apertus"]:
+        import transformers.models.apertus.modeling_apertus as apertus
+        print(f"Apertus monkey patch for model: {model.__class__.__name__}")
+        apertus.ApertusRMSNorm.forward = torch.compile(apertus.ApertusRMSNorm.forward, dynamic=True, fullgraph=True)
+        apertus.apply_rotary_pos_emb = torch.compile(apertus.apply_rotary_pos_emb, dynamic=True, fullgraph=True)
+        apertus.ApertusRotaryEmbedding.forward = torch.compile(apertus.ApertusRotaryEmbedding.forward, dynamic=True, fullgraph=True)
 
     if use_remove_padding or ulysses_sp_size > 1:
         if hasattr(module, "_flash_attention_forward"):  # transformers <= 4.47.1 or legacy models

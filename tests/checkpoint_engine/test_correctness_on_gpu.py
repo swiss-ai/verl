@@ -42,7 +42,7 @@ async def test_nccl_checkpoint_engine(
     num_gpus_per_node=_ngpus,
     bucket_size_mb=128,
     check_allclose=True,
-    model_path="~/models/Qwen/Qwen3-8B-Base",
+    model_path="swiss-ai/Apertus-8B-Instruct-2509",
 ):
     model_path = os.path.expanduser(model_path)
     ray.init(

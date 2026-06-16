@@ -13,12 +13,14 @@
 set -xeuo pipefail
 
 clear_inherited_pyxis_options() {
+  set +x
   local name
   while IFS='=' read -r name _; do
     case "${name}" in
       SLURM_SPANK__SLURM_SPANK_OPTION_pyxis_*) unset "${name}" ;;
     esac
   done < <(env)
+  set -x
 }
 
 clear_inherited_pyxis_options

@@ -18,13 +18,30 @@ from typing import Optional, Union
 import torch
 from transformers.cache_utils import Cache
 from transformers.modeling_outputs import CausalLMOutputWithPast
-
+from torch.distributed.tensor import DTensor
 
 @dataclass
 class CausalLMOutputForPPO(CausalLMOutputWithPast):
     log_probs: Optional[torch.FloatTensor] = None
     entropy: Optional[torch.FloatTensor] = None
 
+def _prepare_fa_kwargs_from_position_ids(position_ids):
+    # invoke tensor.item() once for forward pass instead of once for every attention call
+    tensor_kwargs = {"dtype": torch.int32, "device": position_ids.device}
+    position_ids = position_ids.view(-1)
+    indices_q = (position_ids == 0).nonzero().view(-1)
+
+    cu_seq_lens_q = torch.cat(
+        (
+            indices_q.to(**tensor_kwargs),
+            torch.tensor(position_ids.size(), **tensor_kwargs),
+        )
+    )
+    cu_seq_lens_k = cu_seq_lens_q
+    max_length_q = cu_seq_lens_q.diff().max()
+    max_length_q = max_length_q.item()
+    max_length_k = max_length_q
+    return (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k)
 
 def forward_base_model(
     self,
@@ -50,6 +67,7 @@ def forward_base_model(
     output_hidden_states = (
         output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
     )
+    (cu_seq_lens_q, cu_seq_lens_k), (max_length_q, max_length_k) = _prepare_fa_kwargs_from_position_ids(position_ids = position_ids)
 
     # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
     outputs = self.model(
@@ -63,6 +81,10 @@ def forward_base_model(
         output_hidden_states=output_hidden_states,
         return_dict=return_dict,
         cache_position=cache_position,
+        cu_seq_lens_q=cu_seq_lens_q,
+        cu_seq_lens_k=cu_seq_lens_k,
+        max_length_q=max_length_q,
+        max_length_k=max_length_k
     )
 
     return outputs
