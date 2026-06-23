@@ -36,18 +36,19 @@ if [[ -z "${TOKENIZER_NAME_OR_PATH:-}" ]]; then
 fi
 CONFIG_NAME="${CONFIG_NAME:-async}"
 SLURM_TIME=12:00:00
-TRAIN_NNODES=24
-ROLLOUT_NNODES=8
+TRAIN_NNODES=16
+ROLLOUT_NNODES=16
 NNODES="${NNODES:-$((TRAIN_NNODES + ROLLOUT_NNODES))}"
 TRAINING_DATA_DIR=/capstor/store/cscs/swissai/infra01/reasoning/data/RL-prod/apertus_1p5_incogitans
 FORCE_THINKING=false
 THINK_PREFIX_TOKEN="<|inner_prefix|>"
 ENABLE_THINKING=false
 SEED=85
-ROLLOUT_N=12
+ROLLOUT_N=8
 N_PER_ROUND="${N_PER_ROUND:-${ROLLOUT_N}}"
 USE_GROUP_FILTERING=true
 JOB_NAME=1p5_8b_incogitans
+RESUME_RUN_NAME=""
 VAL_BEFORE_TRAIN=true
 
 WANDB_ENTITY="${WANDB_ENTITY:-apertus}"
@@ -124,12 +125,18 @@ resolve_run_name_and_dir() {
     JOB_NAME="async__${CONFIG_NAME}_${group_filtering_tag}${model_tag}_${TRAIN_NNODES}tn-${ROLLOUT_NNODES}rn__s${SEED}${thinking_tag}"
   fi
   JOB_NAME="$(sanitize_job_name "${JOB_NAME}")"
+  if [[ -n "${RESUME_RUN_NAME}" ]]; then
+    RUN_NAME="${RESUME_RUN_NAME}"
+  else
   RUN_NAME="${JOB_NAME}__$(date +%Y%m%d-%H%M%S)"
+  fi
   RUN_DIR="${WORKING_DIR}/outputs/${PROJECT_NAME}/${RUN_NAME}"
   SCHED_JOB_NAME="${JOB_NAME}_sched"
   TRAIN_JOB_NAME="${JOB_NAME}_train"
 
+  if [[ -z "${RESUME_RUN_NAME}" ]]; then
   mkdir -p "${RUN_DIR}"
+  fi
 }
 
 probe_ok() {
@@ -300,6 +307,9 @@ if [[ "${WANDB_BACKGROUND_SYNC}" == "true" ]]; then
 else
   log "  -> output=${RUN_DIR}"
 fi
+if [[ -n "${RESUME_RUN_NAME}" ]]; then
+  log "  -> resume_run_name=${RESUME_RUN_NAME}"
+fi
 log "  -> qa_gym_reranker_url=${QA_GYM_RERANKER_URL}"
 if [[ -n "${URL}" ]]; then
   log "  -> sandbox_backend=${SANDBOX_BACKEND} sandbox_url=${URL} continuous=${SANDBOX_REWARD_CONTINUOUS}"
@@ -351,6 +361,7 @@ EXPORT_VARS=(
   "PROJECT_NAME=${PROJECT_NAME}"
   "RUN_NAME=${RUN_NAME}"
   "RUN_DIR=${RUN_DIR}"
+  "RESUME_RUN_NAME=${RESUME_RUN_NAME}"
   "WANDB_BACKGROUND_SYNC=${WANDB_BACKGROUND_SYNC}"
   "WANDB_ENTITY=${WANDB_ENTITY}"
   "WANDB_MODE=${WANDB_MODE}"
