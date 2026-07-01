@@ -1740,13 +1740,6 @@ class RayPPOTrainer:
                         if selected_trajectories < target_batch_size:
                             batch.meta_info["ppo_global_mini_batch_size"] = selected_trajectories
 
-                        reward_tensor = batch.batch["token_level_scores"]
-                        reward_extra_infos_dict = {
-                            key: batch.non_tensor_batch[key]
-                            for key in batch.meta_info.get("reward_extra_keys", [])
-                            if key in batch.non_tensor_batch
-                        }
-
                     # Keep rollout replicas awake while filter-groups may request
                     # another generation batch. Sleeping inside the resampling
                     # loop offloads SGLang's weights and KV cache before the next
@@ -1759,6 +1752,14 @@ class RayPPOTrainer:
                     # but might affect the loss calculation (due to the change of mini-batching).
                     if self.config.trainer.balance_batch:
                         self._balance_batch(batch, metrics=metrics)
+
+                    # Extract the reward tensor and extra infos after batch balancing
+                    reward_tensor = batch.batch["token_level_scores"]
+                    reward_extra_infos_dict = {
+                        key: batch.non_tensor_batch[key]
+                        for key in batch.meta_info.get("reward_extra_keys", [])
+                        if key in batch.non_tensor_batch
+                    }
 
                     generation_sample_metrics = compute_generation_sample_metrics(
                         batch,
