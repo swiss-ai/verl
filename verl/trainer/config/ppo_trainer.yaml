@@ -73,6 +73,27 @@ algorithm:
   # Whether to normalize advantages by std (specific to GRPO)
   norm_adv_by_std_in_grpo: True
 
+  # Group filtering / dynamic sampling configuration.
+  # When enabled, sync training samples rollout batches until enough prompts
+  # pass the filter, subject to max_num_gen_batches.
+  filter_groups:
+    _target_: verl.trainer.config.FilterGroupsConfig
+
+    # Whether to enable group filtering
+    enable: False
+
+    # Metric to filter on, e.g. "acc", "seq_reward", or "seq_final_reward"
+    metric: null
+
+    # Strict lower bound for the group metric mean. On binary rewards, keep 0.0 for DAPO-style filtering (aka dynamic sampling)
+    min: 0.0
+
+    # Strict upper bound for the group metric mean. On binary rewards, keep 1.0 for DAPO-style filtering (aka dynamic sampling)
+    max: 1.0
+
+    # Maximum generated rollout batches per training step. Non-positive means unlimited
+    max_num_gen_batches: 0
+
   # Whether to enable in-reward KL penalty
   use_kl_in_reward: False
 

@@ -41,14 +41,19 @@ from verl.trainer.config import AlgoConfig
 from verl.trainer.distillation.losses import is_distillation_enabled
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
+from verl.trainer.ppo.filter_groups import (
+    filter_groups,
+    select_first_groups,
+    validate_filter_groups_config,
+)
 from verl.trainer.ppo.metric_utils import (
+    aggregate_generation_sample_metrics,
     compute_data_metrics,
+    compute_generation_sample_metrics,
     compute_throughout_metrics,
     compute_timing_metrics,
     compute_variance_proxy_metrics,
     process_validation_metrics,
-    compute_generation_sample_metrics,
-    aggregate_generation_sample_metrics,
 )
 from verl.trainer.ppo.reward import extract_reward
 from verl.trainer.ppo.utils import (
@@ -462,7 +467,9 @@ class RayPPOTrainer:
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
 
     @staticmethod
-    def _write_generations(inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path, global_steps, extra_fields=None):
+    def _write_generations(
+        inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path, global_steps, extra_fields=None
+    ):
         """Write generation samples as JSONL (runs in background thread)."""
         os.makedirs(dump_path, exist_ok=True)
         filename = os.path.join(dump_path, f"{global_steps}.jsonl")
@@ -635,6 +642,38 @@ class RayPPOTrainer:
         assert self.reward_loop_manager is not None, "RewardLoopManager is None"
         batch_reward = self.reward_loop_manager.compute_rm_score(batch)
         return batch_reward
+
+    @staticmethod
+    def _accumulate_filter_groups_metrics(metrics: dict, filter_metrics: dict[str, float]) -> None:
+        for key, value in filter_metrics.items():
+            if key.startswith("filter_groups/count/"):
+                metrics[key] = metrics.get(key, 0) + value
+            elif not np.isnan(value):
+                weight_key = f"{key}__weight"
+                weight = filter_metrics["filter_groups/count/generated_prompts"]
+                if "post_filter" in key:
+                    weight = filter_metrics["filter_groups/count/kept_prompts"]
+                metrics[key] = metrics.get(key, 0.0) + value * weight
+                metrics[weight_key] = metrics.get(weight_key, 0) + weight
+
+    @staticmethod
+    def _finalize_filter_groups_metrics(
+        metrics: dict, attempted_batches: int, selected_trajectories: int, target_batch_size: int
+    ) -> None:
+        for key in list(metrics.keys()):
+            if key.endswith("__weight"):
+                continue
+            weight_key = f"{key}__weight"
+            if weight_key in metrics:
+                metrics[key] = metrics[key] / metrics[weight_key] if metrics[weight_key] > 0 else float("nan")
+                metrics.pop(weight_key)
+        for key in list(metrics.keys()):
+            if key.endswith("__weight"):
+                metrics.pop(key)
+
+        metrics["filter_groups/count/gen_batches"] = attempted_batches
+        metrics["filter_groups/count/final_trajectories"] = selected_trajectories
+        metrics["filter_groups/ratio/final_to_target"] = selected_trajectories / target_batch_size
 
     def _validate(self, merged: bool = False):
         data_source_lst = []
@@ -1425,8 +1464,10 @@ class RayPPOTrainer:
             if is_distillation_enabled(self.config.get("distillation"))
             else False
         )
-        ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
-        ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
+        ppo_mini_batch_size = batch.meta_info.get("ppo_global_mini_batch_size", None)
+        if ppo_mini_batch_size is None:
+            ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
+            ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
         ppo_epochs = self.config.actor_rollout_ref.actor.ppo_epochs
         seed = self.config.actor_rollout_ref.actor.data_loader_seed
         shuffle = self.config.actor_rollout_ref.actor.shuffle
@@ -1454,8 +1495,10 @@ class RayPPOTrainer:
         batch_td = batch.to_tensordict()
         # step 2: convert from padding to no-padding
         batch_td = left_right_2_no_padding(batch_td)
-        ppo_mini_batch_size = self.config.critic.ppo_mini_batch_size
-        ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
+        ppo_mini_batch_size = batch.meta_info.get("ppo_global_mini_batch_size", None)
+        if ppo_mini_batch_size is None:
+            ppo_mini_batch_size = self.config.critic.ppo_mini_batch_size
+            ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
         ppo_epochs = self.config.critic.ppo_epochs
         seed = self.config.critic.data_loader_seed
         shuffle = self.config.critic.shuffle
@@ -1537,6 +1580,9 @@ class RayPPOTrainer:
         )
         next_step_profile = False
 
+        validate_filter_groups_config(self.config)
+        extra_train_batch_iter = iter(self.train_dataloader)
+
         for epoch in range(current_epoch, self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
                 if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
@@ -1550,73 +1596,163 @@ class RayPPOTrainer:
                         if self.config.global_profiler.profile_continuous_steps
                         else curr_step_profile
                     )
-                batch: DataProto = DataProto.from_single_dict(batch_dict)
-                batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
-
-                # add uid to batch
-                batch.non_tensor_batch["uid"] = np.array(
-                    [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
-                )
-
-                gen_batch = self._get_gen_batch(batch)
-
-                # pass global_steps to trace
-                gen_batch.meta_info["global_steps"] = self.global_steps
-                rollout_n = self.config.actor_rollout_ref.rollout.n
-                gen_batch_output = gen_batch.repeat(repeat_times=rollout_n, interleave=True)
-
-                if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
-                    # NOTE: REMAX needs one sampled rollout plus one greedy baseline per prompt.
-                    # Keep them in a single agent-loop/vLLM request to avoid sending a second
-                    # rollout after replicas have been put to sleep, which can leave async vLLM
-                    # engines in an invalid state for multi-turn agent workloads.
-                    gen_batch_output.non_tensor_batch["__do_sample__"] = np.ones(len(gen_batch_output), dtype=bool)
-                    gen_baseline_batch = gen_batch.slice(0, None)
-                    gen_baseline_batch.non_tensor_batch["__do_sample__"] = np.zeros(len(gen_baseline_batch), dtype=bool)
-                    combined_gen_batch = DataProto.concat([gen_batch_output, gen_baseline_batch])
-                    num_sampled_prompts = len(gen_batch_output)
-                else:
-                    combined_gen_batch = gen_batch_output
-                    num_sampled_prompts = len(gen_batch_output)
 
                 is_last_step = self.global_steps >= self.total_training_steps
                 with marked_timer("step", timing_raw):
-                    # generate a batch
-                    with marked_timer("gen", timing_raw, color="red"):
-                        if curr_step_profile:
-                            self.llm_server_manager.start_profile()
-                        combined_gen_output = self.async_rollout_manager.generate_sequences(combined_gen_batch)
-                        self.checkpoint_manager.sleep_replicas()
-                        if curr_step_profile:
-                            self.llm_server_manager.stop_profile()
+                    filter_groups_config = self.config.algorithm.get("filter_groups", None)
+                    enable_filter_groups = filter_groups_config is not None and filter_groups_config.enable
+                    target_num_prompts = len(DataProto.from_single_dict(batch_dict))
+                    target_batch_size = target_num_prompts * self.config.actor_rollout_ref.rollout.n
+                    max_num_gen_batches = (
+                        filter_groups_config.get("max_num_gen_batches", 0) if enable_filter_groups else 1
+                    )
+                    accepted_batches = []
+                    attempted_batches = 0
+                    next_batch_dict = batch_dict
 
-                        timing_raw.update(combined_gen_output.meta_info["timing"])
-                        combined_gen_output.meta_info.pop("timing", None)
+                    while True:
+                        attempted_batches += 1
 
-                    gen_batch_output = combined_gen_output.slice(0, num_sampled_prompts)
-                    if "__do_sample__" in gen_batch_output.non_tensor_batch:
-                        gen_batch_output.pop(non_tensor_batch_keys=["__do_sample__"])
+                        batch: DataProto = DataProto.from_single_dict(next_batch_dict)
+                        batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
 
-                    if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
-                        gen_baseline_output = combined_gen_output.slice(num_sampled_prompts, None)
-                        if "__do_sample__" in gen_baseline_output.non_tensor_batch:
-                            gen_baseline_output.pop(non_tensor_batch_keys=["__do_sample__"])
+                        # add uid to batch
+                        batch.non_tensor_batch["uid"] = np.array(
+                            [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
+                        )
 
-                        if self.use_rm and "rm_scores" not in gen_baseline_output.batch.keys():
-                            baseline_reward = self._compute_reward_colocate(gen_baseline_output)
-                            gen_baseline_output = gen_baseline_output.union(baseline_reward)
+                        gen_batch = self._get_gen_batch(batch)
 
-                        reward_baseline_tensor = gen_baseline_output.batch["rm_scores"].sum(dim=-1)
-                        batch.batch["reward_baselines"] = reward_baseline_tensor
+                        # pass global_steps to trace
+                        gen_batch.meta_info["global_steps"] = self.global_steps
+                        rollout_n = self.config.actor_rollout_ref.rollout.n
+                        gen_batch_output = gen_batch.repeat(repeat_times=rollout_n, interleave=True)
 
-                        del gen_baseline_output
-                    del combined_gen_batch, combined_gen_output
-                    # repeat to align with repeated responses in rollout
-                    batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
-                    batch = batch.union(gen_batch_output)
+                        if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
+                            # NOTE: REMAX needs one sampled rollout plus one greedy baseline per prompt.
+                            # Keep them in a single agent-loop/vLLM request to avoid sending a second
+                            # rollout after replicas have been put to sleep, which can leave async vLLM
+                            # engines in an invalid state for multi-turn agent workloads.
+                            gen_batch_output.non_tensor_batch["__do_sample__"] = np.ones(
+                                len(gen_batch_output), dtype=bool
+                            )
+                            gen_baseline_batch = gen_batch.slice(0, None)
+                            gen_baseline_batch.non_tensor_batch["__do_sample__"] = np.zeros(
+                                len(gen_baseline_batch), dtype=bool
+                            )
+                            combined_gen_batch = DataProto.concat([gen_batch_output, gen_baseline_batch])
+                            num_sampled_prompts = len(gen_batch_output)
+                        else:
+                            combined_gen_batch = gen_batch_output
+                            num_sampled_prompts = len(gen_batch_output)
 
-                    if "response_mask" not in batch.batch.keys():
-                        batch.batch["response_mask"] = compute_response_mask(batch)
+                        # generate a batch
+                        with marked_timer("gen", timing_raw, color="red"):
+                            if curr_step_profile:
+                                self.llm_server_manager.start_profile()
+                            combined_gen_output = self.async_rollout_manager.generate_sequences(combined_gen_batch)
+                            if curr_step_profile:
+                                self.llm_server_manager.stop_profile()
+
+                            for key, value in combined_gen_output.meta_info["timing"].items():
+                                timing_raw[key] = timing_raw.get(key, 0) + value
+                            combined_gen_output.meta_info.pop("timing", None)
+
+                        gen_batch_output = combined_gen_output.slice(0, num_sampled_prompts)
+                        if "__do_sample__" in gen_batch_output.non_tensor_batch:
+                            gen_batch_output.pop(non_tensor_batch_keys=["__do_sample__"])
+
+                        if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
+                            gen_baseline_output = combined_gen_output.slice(num_sampled_prompts, None)
+                            if "__do_sample__" in gen_baseline_output.non_tensor_batch:
+                                gen_baseline_output.pop(non_tensor_batch_keys=["__do_sample__"])
+
+                            if self.use_rm and "rm_scores" not in gen_baseline_output.batch.keys():
+                                baseline_reward = self._compute_reward_colocate(gen_baseline_output)
+                                gen_baseline_output = gen_baseline_output.union(baseline_reward)
+
+                            reward_baseline_tensor = gen_baseline_output.batch["rm_scores"].sum(dim=-1)
+                            batch.batch["reward_baselines"] = reward_baseline_tensor
+
+                            del gen_baseline_output
+                        del combined_gen_batch, combined_gen_output
+
+                        # repeat to align with repeated responses in rollout
+                        batch = batch.repeat(repeat_times=rollout_n, interleave=True)
+                        batch = batch.union(gen_batch_output)
+
+                        if "response_mask" not in batch.batch.keys():
+                            batch.batch["response_mask"] = compute_response_mask(batch)
+
+                        with marked_timer("reward", timing_raw, color="yellow"):
+                            # compute reward model score
+                            if self.use_rm and "rm_scores" not in batch.batch.keys():
+                                batch_reward = self._compute_reward_colocate(batch)
+                                batch = batch.union(batch_reward)
+
+                            # extract reward_tensor and reward_extra_infos_dict for training
+                            reward_tensor, reward_extra_infos_dict = extract_reward(batch)
+
+                        batch.batch["token_level_scores"] = reward_tensor
+                        if reward_extra_infos_dict:
+                            batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
+
+                        if not enable_filter_groups:
+                            break
+
+                        kept_batch, filter_metrics = filter_groups(batch, filter_groups_config)
+                        self._accumulate_filter_groups_metrics(metrics, filter_metrics)
+                        if kept_batch is not None:
+                            accepted_batches.append(kept_batch)
+
+                        if sum(len(accepted_batch) for accepted_batch in accepted_batches) >= target_batch_size:
+                            break
+                        if max_num_gen_batches > 0 and attempted_batches >= max_num_gen_batches:
+                            break
+
+                        try:
+                            next_batch_dict = next(extra_train_batch_iter)
+                        except StopIteration:
+                            extra_train_batch_iter = iter(self.train_dataloader)
+                            next_batch_dict = next(extra_train_batch_iter)
+
+                    if enable_filter_groups:
+                        if not accepted_batches:
+                            raise ValueError(
+                                "algorithm.filter_groups filtered every sampled group. "
+                                "Increase algorithm.filter_groups.max_num_gen_batches or relax min/max thresholds."
+                            )
+
+                        batch = DataProto.concat(accepted_batches)
+                        batch, selected_trajectories = select_first_groups(batch, max_groups=target_num_prompts)
+                        if batch is None:
+                            raise ValueError(
+                                "algorithm.filter_groups did not keep enough prompt groups to form a training batch "
+                                f"after {attempted_batches} generated batch(es)."
+                            )
+
+                        self._finalize_filter_groups_metrics(
+                            metrics,
+                            attempted_batches=attempted_batches,
+                            selected_trajectories=selected_trajectories,
+                            target_batch_size=target_batch_size,
+                        )
+                        if selected_trajectories < target_batch_size:
+                            batch.meta_info["ppo_global_mini_batch_size"] = selected_trajectories
+
+                        reward_tensor = batch.batch["token_level_scores"]
+                        reward_extra_infos_dict = {
+                            key: batch.non_tensor_batch[key]
+                            for key in batch.meta_info.get("reward_extra_keys", [])
+                            if key in batch.non_tensor_batch
+                        }
+
+                    # Keep rollout replicas awake while filter-groups may request
+                    # another generation batch. Sleeping inside the resampling
+                    # loop offloads SGLang's weights and KV cache before the next
+                    # request, leaving its Triton kernels with CPU tensors.
+                    self.checkpoint_manager.sleep_replicas()
+
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,
                     # which won't affect the advantage calculation (since it's based on uid),
@@ -1646,14 +1782,6 @@ class RayPPOTrainer:
                             continue
                         images_seqlens_all.extend(multi_modal_input["images_seqlens"].tolist())
                     batch.meta_info["images_seqlens"] = images_seqlens_all
-                    with marked_timer("reward", timing_raw, color="yellow"):
-                        # compute reward model score
-                        if self.use_rm and "rm_scores" not in batch.batch.keys():
-                            batch_reward = self._compute_reward_colocate(batch)
-                            batch = batch.union(batch_reward)
-
-                        # extract reward_tensor and reward_extra_infos_dict for training
-                        reward_tensor, reward_extra_infos_dict = extract_reward(batch)
 
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
