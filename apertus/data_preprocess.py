@@ -14,27 +14,27 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import random
 import re
+import shutil
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
+from pathlib import Path
 from typing import Any
 
 import datasets
-from verl.utils.reward_score.gsm8k import extract_solution as extract_gsm8k_solution
-
+from omegaconf import OmegaConf
 from utils.LEXam_mcq import normalize_lexam_mcq_sample
 from utils.qa_gym import load_qa_gym_rl_pairs_jsonl
 from utils.rgym import strip_rgym_format_instructions
 from utils.riddle_sense import normalize_riddle_sense_sample
-from utils.table_gpt import TABLE_GPT_DATASET_ID, load_table_gpt_mix
+from utils.table_gpt import load_table_gpt_mix
 
+from verl.utils.reward_score.gsm8k import extract_solution as extract_gsm8k_solution
 
-LOCAL_SAVE_DIR = "/capstor/store/cscs/swissai/infra01/reasoning/data/RL-prod/apertus_1p5_incogitans/"
-DATASETS_CACHE_DIR = "./data/apertus_1p5_incogitans/.hf_datasets_cache"
-SEED = 85
 CODE_CONTESTS_MAX_GENERATED_TESTS = 50
 PREPROCESS_NUM_PROC = 48
 
@@ -43,11 +43,33 @@ CODE_FINAL_ANSWER_INSTRUCTION = (
     "block containing the complete solution."
 )
 
+# NOTE: prompt templates and `display_answers` tool should not be used together
+PROMPT_TEMPLATES = {
+    "math": """Solve the following math problem step by step.
+The last line of your response should be the answer to the problem in the form
+Answer: $ANSWER
+where $ANSWER is the answer to the problem.
+
+{question}
+
+Remember to put your answer on its own line after \"Answer:\".""",
+    "mcqa": """{question}
+
+Give your final answer as \"Answer: $letter\"."""
+}
+
 # DISPLAY_ANSWERS_EBNF = r"""%llguidance {}
 # start: (TEXT | tool_block)*
 # tool_block: <|tools_prefix|> %json { "type": "array", "minItems": 1, "items": { "type": "object" } } <|tools_suffix|>
 # TEXT: /(?:(?!<\|tools_prefix\|>)(.|\n))+/
 # """
+
+
+@dataclass(frozen=True)
+class PreprocessConfig:
+    output_dir: str
+    datasets_cache_dir: str
+    seed: int
 
 
 @dataclass(frozen=True)
@@ -69,313 +91,81 @@ class DatasetConfig:
     shuffle_choices: bool = False
     enable_thinking: float = 0.0  # 0.0 means never enable, 1.0 means always enable
     tool_selection: tuple[str, ...] = ()
+    prompt_template: str | None = None
 
 
-TRAIN_DATASETS = [
-    DatasetConfig(
-        name="big_math_rl_verified",
-        dataset_id="SynthLabsAI/Big-Math-RL-Verified",
-        split="train",
-        adapter="math",
-        data_source="SynthLabsAI/Big-Math-RL-Verified",
-        question_key="problem",
-        answer_key="answer",
-        subject_key="domain",
-        sample_size=50_000,
-        enable_thinking=0.0,
-        tool_selection=("display_answers",),
-    ),
-    DatasetConfig(
-        name="deepmath103k",
-        dataset_id="zwhe99/DeepMath-103K",
-        split="train",
-        adapter="math",
-        data_source="zwhe99/DeepMath-103K",
-        question_key="question",
-        answer_key="final_answer",
-        solution_key="r1_solution_1",
-        subject_key="topic",
-        sample_size=50_000,
-        enable_thinking=0.0,
-        tool_selection=("display_answers",),
-    ),
-    DatasetConfig(
-        name="if_rl_singleturn",
-        dataset_id="swiss-ai/if-rl-singleturn-prompts",
-        split="train",
-        adapter="if_data",
-        data_source="swiss-ai/if-rl-singleturn-prompts",
-        prompt_key="messages",
-        answer_key="ground_truth",
-        subject_key="constraint_type",
-        sample_size=60_000,
-    ),
-    DatasetConfig(
-        name="if_rl_singleturn_hard",
-        dataset_id="swiss-ai/if-rl-singleturn-hard-prompts",
-        split="train",
-        adapter="if_data",
-        data_source="swiss-ai/if-rl-singleturn-hard-prompts",
-        prompt_key="messages",
-        answer_key="ground_truth",
-        subject_key="constraint_type",
-        sample_size=20_000,
-    ),
-    DatasetConfig(
-        name="taco_verified",
-        dataset_id="likaixin/TACO-verified",
-        split="train",
-        adapter="taco",
-        data_source="taco",
-        question_key="question",
-        answer_key="input_output",
-        solution_key="solutions",
-        subject_key="source",
-    ),
-    DatasetConfig(
-        name="apps",
-        dataset_id="ReactiveAI/codeparrot-apps-reupload",
-        split="train",
-        adapter="apps",
-        data_source="apps",
-        question_key="question",
-        answer_key="input_output",
-        solution_key="solutions",
-    ),
-    DatasetConfig(
-        name="rgym",
-        dataset_id="/capstor/store/cscs/swissai/infra01/reasoning/data/RL-prod/rgym/train.parquet",
-        split="train",
-        adapter="rgym",
-        data_source="rgym",
-        prompt_key="prompt",
-        sample_size=50_000,
-        tool_selection=("display_answers",),
-    ),
-    DatasetConfig(
-        name="riddle_sense",
-        dataset_id="/capstor/store/cscs/swissai/infra01/reasoning/data/RL-prod/riddle_sense/train.parquet",
-        split="train",
-        adapter="riddle_sense",
-        data_source="riddle_sense",
-        question_key="question",
-        choices_key="choices",
-        answer_key="answerKey",
-        enable_thinking=0.0,
-        tool_selection=("display_answers",),
-    ),
-    DatasetConfig(
-        name="lexam_mcq",
-        dataset_id="LEXam-Benchmark/LEXam",
-        subset="mcq_4_choices",
-        split="test",
-        adapter="lexam_mcq",
-        data_source="lexam_mcq",
-        question_key="question",
-        choices_key="choices",
-        answer_key="gold",
-        subject_key="area",
-        enable_thinking=0.0,
-        tool_selection=("display_answers",),
-    ),
-    DatasetConfig(
-        name="table_gpt",
-        dataset_id=TABLE_GPT_DATASET_ID,
-        split="mixed",
-        adapter="table_gpt",
-        data_source="table_gpt",
-        prompt_key="prompt",
-        answer_key="completion",
-    ),
-    # DatasetConfig(
-    #     name="qa_gym",
-    #     dataset_id="/capstor/store/cscs/swissai/infra01/reasoning/data/RL-prod/qa_gym/eval10_hybrid_multihop_rl_pairs.jsonl",
-    #     split="train",
-    #     adapter="qa_gym",
-    #     data_source="qa_gym",
-    #     question_key="question",
-    #     sample_size=None,
-    #     tool_selection=("display_answers",),
-    # ),
-    DatasetConfig(
-        name="vrl",
-        dataset_id="/capstor/store/cscs/swissai/infra01/reasoning/data/RL-prod/vrl/train.parquet",
-        split="train",
-        adapter="vrl",
-        data_source="blindtasks_rl",
-        prompt_key="prompt",
-        tool_selection=("display_answers",),
-    ),
-    DatasetConfig(
-        name="code_contests",
-        dataset_id="deepmind/code_contests",
-        split="train",
-        adapter="code_contests",
-        data_source="codecontests",
-        question_key="description",
-        solution_key="solutions",
-    ),
-    DatasetConfig(
-        name="open_r1_codeforces",
-        dataset_id="open-r1/codeforces",
-        subset="verifiable",
-        split="train",
-        adapter="open_r1_codeforces",
-        data_source="codeforces",
-    ),
-    DatasetConfig(
-        name="toolgym",
-        dataset_id="/capstor/store/cscs/swissai/infra01/reasoning/data/RL-prod/toolgym_test_v3/dataset/train.parquet",
-        split="train",
-        adapter="tools",
-        data_source="tool_gym",
-        enable_thinking=0.0,
-        # tool_selection is done in the adapter
-    ),
-]
-
-EVAL_DATASETS = [
-    DatasetConfig(
-        name="rgym",
-        dataset_id="/capstor/store/cscs/swissai/infra01/reasoning/data/RL-prod/rgym/val_mini.parquet",
-        split="val_mini",
-        adapter="rgym",
-        data_source="rgym",
-        prompt_key="prompt",
-        sample_size=200,
-    ),
-    DatasetConfig(
-        name="gsm8k",
-        dataset_id="openai/gsm8k",
-        subset="main",
-        split="test",
-        adapter="gsm8k",
-        data_source="openai/gsm8k",
-        question_key="question",
-        answer_key="answer",
-        sample_size=100,
-        enable_thinking=0.0,
-        tool_selection=("display_answers",),
-    ),
-    DatasetConfig(
-        name="math500",
-        dataset_id="HuggingFaceH4/MATH-500",
-        split="test",
-        adapter="math",
-        data_source="HuggingFaceH4/MATH-500",
-        question_key="problem",
-        answer_key="answer",
-        subject_key="subject",
-        solution_key="solution",
-        sample_size=50,
-        enable_thinking=0.0,
-        tool_selection=("display_answers",),
-    ),
-    DatasetConfig(
-        name="aime2024",
-        dataset_id="HuggingFaceH4/aime_2024",
-        split="train",
-        adapter="math",
-        data_source="aime2024",
-        question_key="problem",
-        answer_key="answer",
-        solution_key="solution",
-        enable_thinking=0.0,
-        tool_selection=("display_answers",),
-    ),
-    DatasetConfig(
-        name="aime2025",
-        dataset_id="math-ai/aime25",
-        split="test",
-        adapter="math",
-        data_source="aime2025",
-        question_key="problem",
-        answer_key="answer",
-        enable_thinking=0.0,
-        tool_selection=("display_answers",),
-    ),
-    DatasetConfig(
-        name="gpqa_diamond",
-        dataset_id="Idavidrein/gpqa",
-        subset="gpqa_diamond",
-        split="train",
-        adapter="gpqa",
-        data_source="gpqa_diamond",
-        question_key="Question",
-        answer_key="Correct Answer",
-        shuffle_choices=True,
-        sample_size=100,
-        enable_thinking=0.0,
-        tool_selection=("display_answers",),
-    ),
-    DatasetConfig(
-        name="mmlu",
-        dataset_id="cais/mmlu",
-        subset="all",
-        split="test",
-        adapter="multiple_choice",
-        data_source="mmlu",
-        question_key="question",
-        choices_key="choices",
-        answer_key="answer",
-        subject_key="subject",
-        sample_size=100,
-        enable_thinking=0.0,
-        tool_selection=("display_answers",),
-    ),
-    DatasetConfig(
-        name="openai_humaneval",
-        dataset_id="openai/openai_humaneval",
-        subset="openai_humaneval",
-        split="test",
-        adapter="humaneval",
-        data_source="humaneval",
-        question_key="prompt",
-        answer_key="test",
-        solution_key="canonical_solution",
-        prompt_key="entry_point",
-        sample_size=100,
-    ),
-    DatasetConfig(
-        name="ifeval",
-        dataset_id="google/IFEval",
-        split="train",
-        adapter="if_eval",
-        data_source="google/IFEval",
-        prompt_key="prompt",
-        sample_size=100,
-    ),
-    DatasetConfig(
-        name="ifbench",
-        dataset_id="allenai/IFBench_test",
-        split="train",
-        adapter="if_eval",
-        data_source="allenai/IFBench_test",
-        prompt_key="prompt",
-        sample_size=100,
-    ),
-    DatasetConfig(
-        name="toolgym",
-        dataset_id="/capstor/store/cscs/swissai/infra01/reasoning/data/RL-prod/toolgym_test_v3/dataset/val.parquet",
-        split="train",
-        adapter="tools",
-        data_source="tool_gym",
-        enable_thinking=0.0,
-        # tool_selection is done in the adapter
-    ),
-]
+DEFAULT_CONFIG_PATH = Path(__file__).parent / "data_config" / "rlvr_data.yaml"
 
 
-ADAPTERS: dict[
-    str, Callable[[dict[str, Any], int, str, DatasetConfig], dict[str, Any]]
-] = {}
+ADAPTERS: dict[str, Callable[..., dict[str, Any]]] = {}
+ADAPTERS_USING_SEED: set[str] = set()
 
 
-def register_adapter(name: str):
+def parse_dataset_config(value: Any, section: str, index: int) -> DatasetConfig:
+    if not isinstance(value, dict):
+        raise TypeError(f"{section}[{index}] must be a mapping")
+    valid_fields = {field.name for field in fields(DatasetConfig)}
+    unknown_fields = set(value) - valid_fields
+    if unknown_fields:
+        unknown = ", ".join(sorted(unknown_fields))
+        raise ValueError(f"Unknown fields in {section}[{index}]: {unknown}")
+    value = dict(value)
+    if "tool_selection" in value:
+        value["tool_selection"] = tuple(value["tool_selection"] or ())
+    try:
+        return DatasetConfig(**value)
+    except TypeError as error:
+        raise ValueError(f"Invalid dataset config at {section}[{index}]: {error}") from error
+
+
+def load_config(
+    path: str | os.PathLike[str],
+) -> tuple[PreprocessConfig, list[DatasetConfig], list[DatasetConfig]]:
+    config = OmegaConf.to_container(OmegaConf.load(path), resolve=True)
+    if not isinstance(config, dict):
+        raise TypeError("Dataset configuration must be a mapping")
+    allowed_sections = {"preprocessing", "train_datasets", "eval_datasets"}
+    unknown_sections = set(config) - allowed_sections
+    if unknown_sections:
+        unknown = ", ".join(sorted(unknown_sections))
+        raise ValueError(f"Unknown configuration sections: {unknown}")
+
+    preprocessing = config.get("preprocessing")
+    if not isinstance(preprocessing, dict):
+        raise TypeError("preprocessing must be a mapping")
+    valid_fields = {field.name for field in fields(PreprocessConfig)}
+    unknown_fields = set(preprocessing) - valid_fields
+    if unknown_fields:
+        unknown = ", ".join(sorted(unknown_fields))
+        raise ValueError(f"Unknown preprocessing fields: {unknown}")
+    try:
+        preprocess_config = PreprocessConfig(**preprocessing)
+    except TypeError as error:
+        raise ValueError(f"Invalid preprocessing configuration: {error}") from error
+
+    parsed = []
+    for section in ("train_datasets", "eval_datasets"):
+        entries = config.get(section, [])
+        if not isinstance(entries, list):
+            raise TypeError(f"{section} must be a list")
+        configs = [
+            parse_dataset_config(value, section, index)
+            for index, value in enumerate(entries)
+        ]
+        names = [config.name for config in configs]
+        if len(names) != len(set(names)):
+            raise ValueError(f"Dataset names in {section} must be unique")
+        parsed.append(configs)
+    return preprocess_config, parsed[0], parsed[1]
+
+
+def register_adapter(name: str, *, uses_seed: bool = False):
     def decorator(
-        func: Callable[[dict[str, Any], int, str, DatasetConfig], dict[str, Any]],
+        func: Callable[..., dict[str, Any]],
     ):
         ADAPTERS[name] = func
+        if uses_seed:
+            ADAPTERS_USING_SEED.add(name)
         return func
 
     return decorator
@@ -431,6 +221,15 @@ def normalize_messages(messages: Any) -> list[dict[str, str]]:
     if not normalized or normalized[0].get("role") != "system":
         normalized.insert(0, {"role": "system", "content": ""})
     return normalized
+
+
+def apply_prompt_template(content: str, template: str | None, field: str) -> str:
+    if template is None:
+        return content
+    placeholder = "{" + field + "}"
+    if placeholder not in template:
+        raise ValueError(f"Prompt template is missing the {placeholder!r} placeholder")
+    return template.replace(placeholder, content)
 
 
 def maybe_strip_rgym_format_instructions(
@@ -669,7 +468,10 @@ def adapt_math(
         config=config,
         split=split,
         index=idx,
-        prompt=make_prompt(question, system_prompt(example, config)),
+        prompt=make_prompt(
+            apply_prompt_template(question, config.prompt_template, "question"),
+            system_prompt(example, config),
+        ),
         ability="math",
         ground_truth=answer,
         extra_info=extra_info,
@@ -892,9 +694,9 @@ def adapt_if_eval(
     )
 
 
-@register_adapter("multiple_choice")
+@register_adapter("multiple_choice", uses_seed=True)
 def adapt_multiple_choice(
-    example: dict[str, Any], idx: int, split: str, config: DatasetConfig
+    example: dict[str, Any], idx: int, split: str, config: DatasetConfig, seed: int
 ) -> dict[str, Any]:
     question = normalize_text(get_value(example, config.question_key))
     choices, answer_letter = maybe_shuffle_choices(
@@ -902,6 +704,7 @@ def adapt_multiple_choice(
         normalize_answer_index(get_value(example, config.answer_key)),
         config,
         idx,
+        seed,
     )
     extra_info = {
         "question": question,
@@ -914,20 +717,30 @@ def adapt_multiple_choice(
         config=config,
         split=split,
         index=idx,
-        prompt=make_prompt(format_multiple_choice_prompt(question, choices)),
+        prompt=make_prompt(
+            apply_prompt_template(
+                format_multiple_choice_prompt(question, choices),
+                config.prompt_template,
+                "question",
+            )
+        ),
         ability="knowledge",
         ground_truth=answer_letter,
         extra_info=extra_info,
     )
 
 
-@register_adapter("riddle_sense")
+@register_adapter("riddle_sense", uses_seed=True)
 def adapt_riddle_sense(
-    example: dict[str, Any], idx: int, split: str, config: DatasetConfig
+    example: dict[str, Any], idx: int, split: str, config: DatasetConfig, seed: int
 ) -> dict[str, Any]:
     normalized = normalize_riddle_sense_sample(example)
     choices, answer_letter = maybe_shuffle_choices(
-        normalized["choices"], normalized["answer_index"], config, idx
+        normalized["choices"],
+        normalized["answer_index"],
+        config,
+        idx,
+        seed,
     )
     return make_row(
         config=config,
@@ -948,13 +761,17 @@ def adapt_riddle_sense(
     )
 
 
-@register_adapter("lexam_mcq")
+@register_adapter("lexam_mcq", uses_seed=True)
 def adapt_lexam_mcq(
-    example: dict[str, Any], idx: int, split: str, config: DatasetConfig
+    example: dict[str, Any], idx: int, split: str, config: DatasetConfig, seed: int
 ) -> dict[str, Any]:
     normalized = normalize_lexam_mcq_sample(example)
     choices, answer_letter = maybe_shuffle_choices(
-        normalized["choices"], normalized["answer_index"], config, idx
+        normalized["choices"],
+        normalized["answer_index"],
+        config,
+        idx,
+        seed,
     )
     metadata = dict(normalized["metadata"])
     if config.subject_key and config.subject_key in metadata:
@@ -978,9 +795,9 @@ def adapt_lexam_mcq(
     )
 
 
-@register_adapter("gpqa")
+@register_adapter("gpqa", uses_seed=True)
 def adapt_gpqa(
-    example: dict[str, Any], idx: int, split: str, config: DatasetConfig
+    example: dict[str, Any], idx: int, split: str, config: DatasetConfig, seed: int
 ) -> dict[str, Any]:
     question = normalize_text(get_value(example, config.question_key))
     choices = [
@@ -990,13 +807,23 @@ def adapt_gpqa(
         normalize_text(get_value(example, "Incorrect Answer 3")),
     ]
     choices, answer_letter = maybe_shuffle_choices(
-        [choice for choice in choices if choice], 0, config, idx
+        [choice for choice in choices if choice],
+        0,
+        config,
+        idx,
+        seed,
     )
     return make_row(
         config=config,
         split=split,
         index=idx,
-        prompt=make_prompt(format_multiple_choice_prompt(question, choices)),
+        prompt=make_prompt(
+            apply_prompt_template(
+                format_multiple_choice_prompt(question, choices),
+                config.prompt_template,
+                "question",
+            )
+        ),
         ability="knowledge",
         ground_truth=answer_letter,
         extra_info={"question": question, "choices": choices},
@@ -1190,11 +1017,15 @@ def normalize_answer_index(answer: Any) -> int:
 
 
 def maybe_shuffle_choices(
-    choices: list[Any], answer_index: int, config: DatasetConfig, idx: int
+    choices: list[Any],
+    answer_index: int,
+    config: DatasetConfig,
+    idx: int,
+    seed: int,
 ) -> tuple[list[str], str]:
     indexed_choices = list(enumerate(normalize_text(choice) for choice in choices))
     if config.shuffle_choices:
-        random.Random(f"{SEED}:{config.name}:{idx}").shuffle(indexed_choices)
+        random.Random(f"{seed}:{config.name}:{idx}").shuffle(indexed_choices)
     new_choices = [choice for _, choice in indexed_choices]
     new_answer_index = next(
         new_idx
@@ -1204,12 +1035,14 @@ def maybe_shuffle_choices(
     return new_choices, chr(ord("A") + new_answer_index)
 
 
-def load_raw_dataset(config: DatasetConfig) -> datasets.Dataset:
+def load_raw_dataset(
+    config: DatasetConfig, preprocess_config: PreprocessConfig
+) -> datasets.Dataset:
     load_kwargs = {"name": config.subset} if config.subset else {}
     if config.adapter == "table_gpt":
         raw_dataset = load_table_gpt_mix(
             config.dataset_id,
-            cache_dir=os.path.expanduser(DATASETS_CACHE_DIR),
+            cache_dir=os.path.expanduser(preprocess_config.datasets_cache_dir),
         )
     elif config.adapter == "qa_gym":
         raw_dataset = load_qa_gym_rl_pairs_jsonl(config.dataset_id)
@@ -1218,14 +1051,14 @@ def load_raw_dataset(config: DatasetConfig) -> datasets.Dataset:
             "parquet",
             data_files={config.split: config.dataset_id},
             split=config.split,
-            cache_dir=os.path.expanduser(DATASETS_CACHE_DIR),
+            cache_dir=os.path.expanduser(preprocess_config.datasets_cache_dir),
         )
     elif config.dataset_id.endswith((".json", ".jsonl")):
         raw_dataset = datasets.load_dataset(
             "json",
             data_files={config.split: config.dataset_id},
             split=config.split,
-            cache_dir=os.path.expanduser(DATASETS_CACHE_DIR),
+            cache_dir=os.path.expanduser(preprocess_config.datasets_cache_dir),
         )
     elif os.path.isdir(config.dataset_id):
         raw_dataset = datasets.load_from_disk(
@@ -1235,7 +1068,7 @@ def load_raw_dataset(config: DatasetConfig) -> datasets.Dataset:
         raw_dataset = datasets.load_dataset(
             config.dataset_id,
             split=config.split,
-            cache_dir=os.path.expanduser(DATASETS_CACHE_DIR),
+            cache_dir=os.path.expanduser(preprocess_config.datasets_cache_dir),
             **load_kwargs,
         )
     print(f"Loaded {len(raw_dataset)} rows for {config.name}.", flush=True)
@@ -1253,17 +1086,26 @@ def load_raw_dataset(config: DatasetConfig) -> datasets.Dataset:
 
     if config.sample_size is not None:
         sample_size = min(config.sample_size, len(raw_dataset))
-        raw_dataset = raw_dataset.shuffle(seed=SEED).select(range(sample_size))
+        raw_dataset = raw_dataset.shuffle(seed=preprocess_config.seed).select(
+            range(sample_size)
+        )
         print(f"Sampled {len(raw_dataset)} rows for {config.name}.", flush=True)
     return raw_dataset
 
 
 def preprocess_example(
-    example: dict[str, Any], idx: int, config: DatasetConfig
+    example: dict[str, Any],
+    idx: int,
+    config: DatasetConfig,
+    seed: int,
 ) -> dict[str, Any]:
     adapter = ADAPTERS[config.adapter]
     example = dict(example)
-    row = adapter(example, idx, config.split, config)
+    args = (example, idx, config.split, config)
+    if config.adapter in ADAPTERS_USING_SEED:
+        row = adapter(*args, seed=seed)
+    else:
+        row = adapter(*args)
     row["extra_info"].update(source_controls(example))
     # row["agent_name"] = agent_name_for_tools(row["extra_info"].get("tool_selection"))
     return row
@@ -1295,15 +1137,17 @@ def cast_output_features(dataset: datasets.Dataset) -> datasets.Dataset:
     return dataset.cast(features)
 
 
-def preprocess_dataset(config: DatasetConfig) -> datasets.Dataset:
+def preprocess_dataset(
+    config: DatasetConfig, preprocess_config: PreprocessConfig
+) -> datasets.Dataset:
     if config.adapter not in ADAPTERS:
         raise KeyError(f"No adapter registered for {config.adapter!r}")
     print(f"Loading {config.name} from {config.dataset_id}...", flush=True)
-    raw_dataset = load_raw_dataset(config)
+    raw_dataset = load_raw_dataset(config, preprocess_config)
     dataset = raw_dataset.map(
         preprocess_example,
         with_indices=True,
-        fn_kwargs={"config": config},
+        fn_kwargs={"config": config, "seed": preprocess_config.seed},
         remove_columns=raw_dataset.column_names,
         num_proc=PREPROCESS_NUM_PROC,
         desc=f"Preprocessing {config.name}",
@@ -1333,9 +1177,12 @@ def save_json_example(dataset: datasets.Dataset, path: str) -> None:
 
 
 def write_outputs(
-    train_dataset: datasets.Dataset, eval_datasets: dict[str, datasets.Dataset]
+    train_dataset: datasets.Dataset,
+    eval_datasets: dict[str, datasets.Dataset],
+    output_dir: str,
+    config_path: str | os.PathLike[str],
 ) -> None:
-    output_dir = os.path.expanduser(LOCAL_SAVE_DIR)
+    output_dir = os.path.expanduser(output_dir)
     eval_dir = os.path.join(output_dir, "eval")
     os.makedirs(eval_dir, exist_ok=True)
 
@@ -1347,6 +1194,9 @@ def write_outputs(
 
     save_json_example(train_dataset, os.path.join(output_dir, "train_example.json"))
     save_json_example(val_dataset, os.path.join(output_dir, "val_example.json"))
+    config_copy = Path(output_dir, Path(config_path).name)
+    if Path(config_path).resolve() != config_copy.resolve():
+        shutil.copyfile(config_path, config_copy)
     print(
         f"Wrote {len(train_dataset)} train and {len(val_dataset)} validation rows "
         f"to {output_dir}.",
@@ -1354,14 +1204,33 @@ def write_outputs(
     )
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Prepare verl-compatible train/eval verifiable data")
+    parser.add_argument(
+        "--config",
+        default=str(DEFAULT_CONFIG_PATH),
+        help="YAML file defining preprocessing, train_datasets, and eval_datasets",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
+    args = parse_args()
+    preprocess_config, train_configs, eval_configs = load_config(args.config)
     train_dataset = concatenate_named(
-        (config.name, preprocess_dataset(config)) for config in TRAIN_DATASETS
+        (config.name, preprocess_dataset(config, preprocess_config))
+        for config in train_configs
     )
     eval_datasets = {
-        config.name: preprocess_dataset(config) for config in EVAL_DATASETS
+        config.name: preprocess_dataset(config, preprocess_config)
+        for config in eval_configs
     }
-    write_outputs(train_dataset, eval_datasets)
+    write_outputs(
+        train_dataset,
+        eval_datasets,
+        preprocess_config.output_dir,
+        args.config,
+    )
 
 
 if __name__ == "__main__":
