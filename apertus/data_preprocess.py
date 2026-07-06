@@ -38,26 +38,6 @@ from verl.utils.reward_score.gsm8k import extract_solution as extract_gsm8k_solu
 CODE_CONTESTS_MAX_GENERATED_TESTS = 50
 PREPROCESS_NUM_PROC = 48
 
-CODE_FINAL_ANSWER_INSTRUCTION = (
-    "You may reason before answering. End your response with a Python 3 code "
-    "block containing the complete solution."
-)
-
-# NOTE: prompt templates and `display_answers` tool should not be used together
-PROMPT_TEMPLATES = {
-    "math": """Solve the following math problem step by step.
-The last line of your response should be the answer to the problem in the form
-Answer: $ANSWER
-where $ANSWER is the answer to the problem.
-
-{question}
-
-Remember to put your answer on its own line after \"Answer:\".""",
-    "mcqa": """{question}
-
-Give your final answer as \"Answer: $letter\"."""
-}
-
 # DISPLAY_ANSWERS_EBNF = r"""%llguidance {}
 # start: (TEXT | tool_block)*
 # tool_block: <|tools_prefix|> %json { "type": "array", "minItems": 1, "items": { "type": "object" } } <|tools_suffix|>
@@ -492,7 +472,10 @@ def adapt_gsm8k(
         config=config,
         split=split,
         index=idx,
-        prompt=make_prompt(question, system_prompt(example, config)),
+        prompt=make_prompt(
+            apply_prompt_template(question, config.prompt_template, "question"),
+            system_prompt(example, config),
+        ),
         ability="math",
         ground_truth=answer,
         extra_info={"question": question, "answer": raw_answer},
@@ -532,7 +515,9 @@ def make_code_row(
         config=config,
         split=split,
         index=idx,
-        prompt=make_prompt(format_code_prompt(question, starter_code)),
+        prompt=make_prompt(
+            format_code_prompt(question, starter_code, config.prompt_template)
+        ),
         ability="code",
         ground_truth=reference_solution,
         extra_info=extra_info,
@@ -566,7 +551,7 @@ def adapt_code_contests(
         config=config,
         split=split,
         index=idx,
-        prompt=make_prompt(format_code_prompt(question, "")),
+        prompt=make_prompt(format_code_prompt(question, "", config.prompt_template)),
         ability="code",
         ground_truth=reference_solution,
         extra_info={
@@ -595,7 +580,7 @@ def adapt_codeforces(
         config=config,
         split=split,
         index=idx,
-        prompt=make_prompt(format_code_prompt(question, "")),
+        prompt=make_prompt(format_code_prompt(question, "", config.prompt_template)),
         ability="code",
         ground_truth=ground_truth,
         extra_info={
@@ -632,7 +617,9 @@ def adapt_humaneval(
         config=config,
         split=split,
         index=idx,
-        prompt=make_prompt(format_code_prompt(code_prompt, "")),
+        prompt=make_prompt(
+            format_code_prompt(code_prompt, "", config.prompt_template)
+        ),
         ability="code",
         ground_truth=json_dumps(ground_truth),
         extra_info={
@@ -838,10 +825,12 @@ def format_multiple_choice_prompt(question: str, choices: list[Any]) -> str:
     return f"{question}\n\n{options}"
 
 
-def format_code_prompt(question: str, starter_code: str) -> str:
+def format_code_prompt(
+    question: str, starter_code: str, prompt_template: str | None
+) -> str:
     if starter_code:
         question = f"{question}\n\n```python\n{starter_code}\n```"
-    return f"{question}\n\n{CODE_FINAL_ANSWER_INSTRUCTION}"
+    return apply_prompt_template(question, prompt_template, "question")
 
 
 def format_codeforces_prompt(example: dict[str, Any]) -> str:

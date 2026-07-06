@@ -1,0 +1,109 @@
+# Dataset configuration used by data_preprocess.py. Fields omitted from a
+# dataset entry use the defaults defined by DatasetConfig.
+preprocessing:
+  output_dir: /users/msantelmo/scratch/SSFT/data/evals-full_nothink_nodisplay/
+  datasets_cache_dir: ./data/evals-full_nothink_nodisplay/.hf_datasets_cache
+  seed: 85
+
+train_datasets: []
+
+
+eval_datasets:
+  - name: gsm8k
+    dataset_id: openai/gsm8k
+    subset: main
+    split: test
+    adapter: gsm8k
+    data_source: openai/gsm8k
+    question_key: question
+    prompt_template: |-
+      {question}
+
+      You may reason before answering. Give your final answer in \boxed{}.
+
+  - name: math500
+    dataset_id: HuggingFaceH4/MATH-500
+    split: test
+    adapter: math
+    data_source: HuggingFaceH4/MATH-500
+    subject_key: subject
+    solution_key: solution
+    prompt_template: |-
+      {question}
+
+      You may reason before answering. Give your final answer in \boxed{}.
+
+  - name: aime2024
+    dataset_id: HuggingFaceH4/aime_2024
+    split: train
+    adapter: math
+    data_source: aime2024
+    solution_key: solution
+    prompt_template: |-
+      {question}
+
+      You may reason before answering. Give your final answer in \boxed{}.
+
+  - name: aime2025
+    dataset_id: math-ai/aime25
+    split: test
+    adapter: math
+    data_source: aime2025
+    prompt_template: |-
+      {question}
+
+      You may reason before answering. Give your final answer in \boxed{}.
+
+  - name: gpqa_diamond
+    dataset_id: Idavidrein/gpqa
+    subset: gpqa_diamond
+    split: train
+    adapter: gpqa
+    data_source: gpqa_diamond
+    question_key: Question
+    answer_key: Correct Answer
+    shuffle_choices: true
+    prompt_template: |-
+      {question}
+
+      You may reason before answering. Give your final answer as "Answer: $letter".
+
+  - name: mmlu
+    dataset_id: cais/mmlu
+    subset: all
+    split: test
+    adapter: multiple_choice
+    data_source: mmlu
+    question_key: question
+    subject_key: subject
+    prompt_template: |-
+      {question}
+
+      You may reason before answering. Give your final answer as "Answer: $letter".
+
+  - name: openai_humaneval
+    dataset_id: openai/openai_humaneval
+    subset: openai_humaneval
+    split: test
+    adapter: humaneval
+    data_source: humaneval
+    question_key: prompt
+    answer_key: test
+    solution_key: canonical_solution
+    prompt_key: entry_point
+    prompt_template: |-
+      {question}
+
+      You may reason before answering. End your response with a Python 3 code block containing the complete solution.
+
+  - name: ifeval
+    dataset_id: google/IFEval
+    split: train
+    adapter: if_eval
+    data_source: google/IFEval
+
+  - name: ifbench
+    dataset_id: allenai/IFBench_test
+    split: train
+    adapter: if_eval
+    data_source: allenai/IFBench_test
