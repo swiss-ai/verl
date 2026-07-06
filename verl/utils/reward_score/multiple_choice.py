@@ -12,23 +12,52 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import re
 from typing import Any
 
-from math_verify.grader import verify
-from math_verify.parser import StringExtractionConfig, parse
-
-from .logging_utils import get_reward_logger, log_reward_error
-
-logger = get_reward_logger(__name__)
-
-CHOICE_LETTERS = tuple("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
-CHOICE_EXTRACTION_TARGETS = (StringExtractionConfig(strings=CHOICE_LETTERS),)
+_ANSWER_PATTERN = re.compile(
+    r"\b(?:FINAL\s+)?ANSWER(?:\s+IS)?\s*[:\-]?\s*([A-Z])\b",
+    flags=re.IGNORECASE,
+)
 
 
-def _as_text(value: Any) -> str:
+def _normalize_text(value: Any) -> str:
     if value is None:
         return ""
     return str(value).strip()
+
+
+def _completion_text(solution_str: str) -> str:
+    text = _normalize_text(solution_str)
+    for marker in ("<|assistant_start|>", "<|im_start|>assistant", "assistant\n"):
+        if marker in text:
+            text = text.rsplit(marker, 1)[-1]
+    for marker in ("<|assistant_end|>", "<|im_end|>"):
+        if marker in text:
+            text = text.split(marker, 1)[0]
+    return re.sub(r"(?:<pad>|\s)+$", "", text, flags=re.IGNORECASE).strip()
+
+
+def extract_choice_letter(solution_str: str) -> str | None:
+    """Extract an answer following the MCQA prompt contract.
+
+    Prefer the last explicit ``Answer: C`` declaration so a later correction
+    wins. Also accept a bare final answer line and completions beginning with
+    an option-style answer such as ``C. option text``.
+    """
+    text = _completion_text(solution_str).upper()
+
+    explicit_answers = _ANSWER_PATTERN.findall(text)
+    if explicit_answers:
+        return explicit_answers[-1]
+
+    final_line = text.rsplit("\n", 1)[-1]
+    bare_answer = re.fullmatch(r"\s*([A-Z])\s*[\).]?\s*", final_line)
+    if bare_answer:
+        return bare_answer.group(1)
+
+    option_start = re.match(r"^\s*([A-Z])\s*[\).:\-]\s+\S", text)
+    return option_start.group(1) if option_start else None
 
 
 def compute_score(
@@ -38,31 +67,9 @@ def compute_score(
     score: float = 1.0,
     data_source: str | None = None,
 ) -> float:
-    try:
-        # NOTE: math_verify.parse/verify default to signal-based timeouts (signal.alarm),
-        # which fails when compute_score runs in a threadpool (Ray reward workers).
-        # Multiple-choice extraction is regex-only, so we can safely disable timeouts.
-        extracted_gold = parse(
-            _as_text(ground_truth), CHOICE_EXTRACTION_TARGETS, parsing_timeout=None
-        )
-        extracted_pred = parse(
-            _as_text(solution_str), CHOICE_EXTRACTION_TARGETS, parsing_timeout=None
-        )
-    except Exception as exc:
-        log_reward_error(
-            logger,
-            "multiple_choice",
-            "string extraction failed",
-            data_source=data_source,
-            exc=exc,
-        )
+    del data_source
+    predicted = extract_choice_letter(solution_str)
+    gold = _normalize_text(ground_truth).upper()
+    if predicted is None or re.fullmatch(r"[A-Z]", gold) is None:
         return format_score
-
-    if not extracted_gold or not extracted_pred:
-        return format_score
-    return max(
-        score
-        if any(verify(gold, pred, timeout_seconds=None) for gold in extracted_gold)
-        else 0.0
-        for pred in extracted_pred
-    )
+    return score if predicted == gold else 0.0
