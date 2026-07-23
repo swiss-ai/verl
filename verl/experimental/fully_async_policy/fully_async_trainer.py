@@ -19,6 +19,7 @@ import time
 from datetime import datetime
 from typing import Any
 
+import numpy as np
 import ray
 from omegaconf import OmegaConf, open_dict
 from tqdm import tqdm
@@ -45,6 +46,7 @@ from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
+from verl.utils.output_format import output_format_enabled
 from verl.utils.tracking import Tracking
 
 logger = logging.getLogger(__name__)
@@ -821,6 +823,39 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
 
         return self.current_param_version
 
+    def _fit_collect_metrics(self, batch):
+        super()._fit_collect_metrics(batch)
+        if not output_format_enabled(self.config):
+            return
+
+        metric_specs = {
+            "task_score": "mean",
+            "raw_task_score": "mean",
+            "task_success": "rate",
+            "acc": "mean",
+            "optimization_reward": "mean",
+            "format_valid": "rate",
+            "format_bonus": "mean",
+            "degeneration_stopped": "rate",
+            "verifier_skipped": "rate",
+        }
+        sources = batch.non_tensor_batch.get("data_source")
+        for key, suffix in metric_specs.items():
+            values = batch.non_tensor_batch.get(key)
+            if values is None:
+                continue
+            values = np.asarray(values, dtype=np.float64).reshape(-1)
+            self.metrics[f"train/post_filter/{key}/{suffix}"] = float(values.mean())
+            if sources is None:
+                continue
+            source_values = np.asarray(sources, dtype=object).reshape(-1)
+            for source in np.unique(source_values):
+                mask = source_values == source
+                source_name = str(source).replace("/", "_").replace(" ", "_")
+                self.metrics[f"train/post_filter/by_source/{source_name}/{key}/{suffix}"] = float(
+                    values[mask].mean()
+                )
+
     def _collect_metrics_from_samples(self, batch, metrics):
         """
         Collect metrics from samples
@@ -836,5 +871,5 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
                 }
             )
             for key, value in batch.meta_info.items():
-                if key.startswith("fully_async") or key.startswith("timing_s"):
+                if key.startswith("fully_async") or key.startswith("timing_s") or key.startswith("rollout/"):
                     metrics[key] = value

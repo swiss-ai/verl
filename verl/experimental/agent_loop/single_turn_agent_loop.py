@@ -40,7 +40,9 @@ class SingleTurnAgentLoop(AgentLoopBase):
 
     @rollout_trace_op
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
-        messages = list(kwargs["raw_prompt"])
+        messages = self.prepare_messages(
+            kwargs["raw_prompt"], validate=bool(kwargs.get("validate", False))
+        )
 
         # 1. extract multimodal inputs from messages
         multi_modal_data = await self.process_multi_modal_info(messages)
@@ -70,6 +72,7 @@ class SingleTurnAgentLoop(AgentLoopBase):
                 audio_data=audios,
                 mm_processor_kwargs=mm_processor_kwargs,
             )
+        output.extra_fields["stop_reason"] = output.stop_reason
         if metrics.get("num_preempted") is None:
             metrics["num_preempted"] = output.num_preempted if output.num_preempted is not None else -1
         response_mask = [1] * len(output.token_ids)

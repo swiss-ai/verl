@@ -6,6 +6,18 @@ defaults:
   - ppo_trainer
   - _self_
 
+output_format:
+  enabled: false
+  parser: markdown
+  prompt: null
+  prompt_role: system
+  success_threshold: 0.7
+  format_penalty: 0.1
+  format_bonus: 0.05
+  archive:
+    enabled: true
+    path: ${trainer.default_local_dir}/prefilter_rollouts.jsonl
+
 algorithm:
   adv_estimator: rloo_vectorized
   norm_adv_by_std_in_grpo: false
@@ -137,7 +149,7 @@ trainer:
   # may not correspond to going through the entire dataset.
   total_epochs: 100 # not a relevant value, just set a large number for now
   total_training_steps: 10000 # not a relevant value, just set a large number for now
-  save_freq: 20
+  save_freq: 30
   test_freq: 10
   max_actor_ckpt_to_keep: 10
   max_critic_ckpt_to_keep: null

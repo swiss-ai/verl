@@ -68,6 +68,22 @@ ASYNC_TRIGGER_PARAMETER_SYNC_STEP="${ASYNC_TRIGGER_PARAMETER_SYNC_STEP:-}"
 ASYNC_STALENESS_THRESHOLD="${ASYNC_STALENESS_THRESHOLD:-}"
 ASYNC_STEADY_WARMUP_STEPS="${ASYNC_STEADY_WARMUP_STEPS:-}"
 
+OUTPUT_FORMAT=true
+OUTPUT_FORMAT_PARSER="${OUTPUT_FORMAT_PARSER:-xml_think}"
+OUTPUT_FORMAT_PROMPT_ROLE="${OUTPUT_FORMAT_PROMPT_ROLE:-system}"
+TASK_SUCCESS_THRESHOLD="${TASK_SUCCESS_THRESHOLD:-0.7}"
+FORMAT_PENALTY=0.2 # "${FORMAT_PENALTY:-0.1}"
+FORMAT_BONUS=0.05 # "${FORMAT_BONUS:-0.05}"
+ARCHIVE_ALL_ROLLOUTS="true"
+DEGENERATION_EARLY_STOP="true"
+DEGENERATION_EARLY_STOP_STRIDE="${DEGENERATION_EARLY_STOP_STRIDE:-128}"
+
+case "$(tr '[:upper:]' '[:lower:]' <<<"${OUTPUT_FORMAT}")" in
+  1|true|yes|y|on)
+    DEGENERATION_EARLY_STOP=true
+    ;;
+esac
+
 ###############################################################################
 # Sandbox configuration
 ###############################################################################
@@ -98,7 +114,6 @@ sanitize_job_name() {
 resolve_run_name_and_dir() {
   local expected_nnodes
   local group_filtering_tag
-  local model_tag
   local thinking_tag
 
   expected_nnodes=$((TRAIN_NNODES + ROLLOUT_NNODES))
@@ -107,7 +122,6 @@ resolve_run_name_and_dir() {
     exit 1
   fi
 
-  model_tag="$(sanitize_job_name "$(basename "${MODEL_NAME_OR_PATH}")")"
   group_filtering_tag=""
   if [[ "${USE_GROUP_FILTERING}" == "true" ]]; then
     group_filtering_tag="dapo-"
@@ -121,15 +135,23 @@ resolve_run_name_and_dir() {
   fi
 
   if [[ -z "${JOB_NAME}" ]]; then
-    JOB_NAME="async__${CONFIG_NAME}_${group_filtering_tag}${model_tag}_${TRAIN_NNODES}tn-${ROLLOUT_NNODES}rn__s${SEED}${thinking_tag}"
+    JOB_NAME="async__${CONFIG_NAME}_${group_filtering_tag}${MODEL_TAG}_${TRAIN_NNODES}tn-${ROLLOUT_NNODES}rn__s${SEED}${thinking_tag}"
   fi
   JOB_NAME="$(sanitize_job_name "${JOB_NAME}")"
+  if [[ -n "${RUN_NAME}" ]]; then
+    RUN_DIR="${WORKING_DIR}/outputs/${PROJECT_NAME}/${RUN_NAME}"
+    if [[ ! -d "${RUN_DIR}" ]] || ! compgen -G "${RUN_DIR}/global_step_*" >/dev/null; then
+      echo "RUN_NAME=${RUN_NAME} does not identify a resumable run under ${RUN_DIR}." >&2
+      exit 1
+    fi
+    log "Reusing RUN_NAME=${RUN_NAME}; trainer.resume_mode=auto will load its latest checkpoint."
+  else
   RUN_NAME="${JOB_NAME}__$(date +%Y%m%d-%H%M%S)"
   RUN_DIR="${WORKING_DIR}/outputs/${PROJECT_NAME}/${RUN_NAME}"
+    mkdir -p "${RUN_DIR}"
+  fi
   SCHED_JOB_NAME="${JOB_NAME}_sched"
   TRAIN_JOB_NAME="${JOB_NAME}_train"
-
-  mkdir -p "${RUN_DIR}"
 }
 
 probe_ok() {
@@ -295,6 +317,7 @@ log "  -> config=${CONFIG_NAME} model=${MODEL_NAME_OR_PATH}"
 log "  -> data=${TRAINING_DATA_DIR} seed=${SEED} rollout_n=${ROLLOUT_N}"
 log "  -> group_filtering=${USE_GROUP_FILTERING} enable_thinking=${ENABLE_THINKING} force_thinking=${FORCE_THINKING}"
 log "  -> no_format=${NO_FORMAT} long_context=${LONG_CONTEXT}"
+log "  -> output_format=${OUTPUT_FORMAT} parser=${OUTPUT_FORMAT_PARSER} prompt_role=${OUTPUT_FORMAT_PROMPT_ROLE} success_threshold=${TASK_SUCCESS_THRESHOLD} format_penalty=${FORMAT_PENALTY} format_bonus=${FORMAT_BONUS} archive_all=${ARCHIVE_ALL_ROLLOUTS} degeneration_stop=${DEGENERATION_EARLY_STOP}"
 if [[ "${WANDB_BACKGROUND_SYNC}" == "true" ]]; then
   log "  -> output=${RUN_DIR} wandb_mode=${WANDB_MODE} wandb_sync_interval=${WANDB_SYNC_INTERVAL_SECONDS}s"
 else
@@ -345,6 +368,13 @@ EXPORT_VARS=(
   "THINK_PREFIX_TOKEN=${THINK_PREFIX_TOKEN}"
   "DEGENERATION_EARLY_STOP=${DEGENERATION_EARLY_STOP:-}"
   "DEGENERATION_EARLY_STOP_STRIDE=${DEGENERATION_EARLY_STOP_STRIDE:-}"
+  "OUTPUT_FORMAT=${OUTPUT_FORMAT}"
+  "OUTPUT_FORMAT_PARSER=${OUTPUT_FORMAT_PARSER}"
+  "OUTPUT_FORMAT_PROMPT_ROLE=${OUTPUT_FORMAT_PROMPT_ROLE}"
+  "TASK_SUCCESS_THRESHOLD=${TASK_SUCCESS_THRESHOLD}"
+  "FORMAT_PENALTY=${FORMAT_PENALTY}"
+  "FORMAT_BONUS=${FORMAT_BONUS}"
+  "ARCHIVE_ALL_ROLLOUTS=${ARCHIVE_ALL_ROLLOUTS}"
   "SEED=${SEED}"
   "ROLLOUT_N=${ROLLOUT_N}"
   "USE_GROUP_FILTERING=${USE_GROUP_FILTERING}"

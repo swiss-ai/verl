@@ -54,6 +54,12 @@ from verl.utils.chat_template import apply_chat_template, initialize_system_prom
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.dataset.rl_dataset import RLHFDataset, get_dataset_class
 from verl.utils.model import compute_position_id_with_mask
+from verl.utils.output_format import (
+    output_format_enabled,
+    output_formatting_config,
+    validate_output_format_agent_config,
+)
+from verl.utils.output_formatting import add_formatting_instruction
 from verl.utils.profiler import simple_timer
 from verl.utils.ray_utils import auto_await, get_event_loop
 from verl.utils.rollout_trace import (
@@ -255,6 +261,8 @@ class AgentLoopBase(ABC):
         self.apply_chat_template_kwargs = self.data_config.get(
             "apply_chat_template_kwargs", {}
         )
+        self.output_format_enabled = output_format_enabled(self.config)
+        self.output_formatting = output_formatting_config(self.config)
         self.force_thinking_prefix = bool(
             self.data_config.get("force_thinking_prefix", False)
         )
@@ -272,6 +280,14 @@ class AgentLoopBase(ABC):
             processing_class, **self.apply_chat_template_kwargs
         )
         self.loop = get_event_loop()
+
+    def prepare_messages(
+        self, messages: list[dict[str, Any]], *, validate: bool = False
+    ) -> list[dict[str, Any]]:
+        """Copy messages and inject the output-format instruction for training only."""
+        if not self.output_format_enabled or validate:
+            return [dict(message) for message in messages]
+        return add_formatting_instruction(messages, self.output_formatting)
 
     def _get_mm_processor_kwargs(
         self, audio_data: Optional[list[Any]] = None
@@ -394,9 +410,7 @@ class AgentLoopBase(ABC):
 
         if remove_system_prompt:
             prompt_ids = prompt_ids[len(self.system_prompt) :]
-        sample_enable_thinking = (apply_chat_template_kwargs or {}).get(
-            "enable_thinking"
-        ) is True
+        sample_enable_thinking = template_kwargs.get("enable_thinking") is True
         if self.force_thinking_prefix and sample_enable_thinking:
             prompt_ids = prompt_ids + self.thinking_prefix_token_ids
 
@@ -479,6 +493,11 @@ class AgentLoopWorker:
         self.llm_client = llm_client
         self.teacher_client = teacher_client
         self.reward_loop_worker_handles = reward_loop_worker_handles
+
+        validate_output_format_agent_config(
+            config, no_format=_env_flag("NO_FORMAT")
+        )
+        self.output_formatting = output_formatting_config(config)
 
         rollout_config, model_config = (
             config.actor_rollout_ref.rollout,
@@ -722,7 +741,10 @@ class AgentLoopWorker:
                 data_config=DictConfigWrap(self.config.data),
                 tools=ToolListWrap(self.tools),
             )
-            output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
+            run_kwargs = {**kwargs, "validate": trajectory["validate"]}
+            output: AgentLoopOutput = await agent_loop.run(
+                sampling_params, **run_kwargs
+            )
             return await self._agent_loop_postprocess(
                 output, trajectory["validate"], **kwargs
             )
@@ -755,7 +777,14 @@ class AgentLoopWorker:
     ) -> _InternalAgentLoopOutput:
         """Perform post-processing operations on the output of each individual agent loop."""
         output.extra_fields["raw_prompt"] = kwargs["raw_prompt"]
-        self._set_response_text_fields(output, kwargs.get("extra_info"))
+        output.extra_fields["validate"] = bool(validate)
+        if output_format_enabled(self.config):
+            output.extra_fields["rendered_prompt"] = self.tokenizer.decode(
+                output.prompt_ids, skip_special_tokens=False
+            )
+        self._set_response_text_fields(
+            output, kwargs.get("extra_info"), validate=validate
+        )
 
         # Some AgentLoop may have already computed the reward score, e.g SWE-agent.
 
@@ -926,9 +955,38 @@ class AgentLoopWorker:
         tool_selection = extra_info.get("tool_selection")
         return isinstance(tool_selection, (list, tuple, set)) and "display_answers" in tool_selection
 
-    def _set_response_text_fields(self, output: AgentLoopOutput, extra_info: Any = None) -> None:
+    def _set_response_text_fields(
+        self,
+        output: AgentLoopOutput,
+        extra_info: Any = None,
+        *,
+        validate: bool = False,
+    ) -> None:
         response_text = self.tokenizer.decode(output.response_ids, skip_special_tokens=True)
-        if self.reasoning_parser is None:
+        if output_format_enabled(self.config):
+            if validate:
+                output.extra_fields.update(
+                    {
+                        "raw_response_text": response_text,
+                        "response_text": [response_text],
+                    }
+                )
+                return
+            parsed = self.output_formatting.formatter.parse(response_text)
+            output.extra_fields.update(
+                {
+                    "raw_response_text": response_text,
+                    "reasoning_text": parsed.reasoning or "",
+                    "final_response_text": parsed.final_response,
+                    "response_text": [parsed.verifier_response],
+                    "format_valid": parsed.format_valid,
+                    "parser_outcome": parsed.outcome,
+                    "output_format_parser": self.output_formatting.parser,
+                    "output_format_prompt_role": self.output_formatting.prompt_role,
+                }
+            )
+            return
+        elif self.reasoning_parser is None:
             output.extra_fields["response_text"] = [response_text]
         else:
             parsed = self.reasoning_parser.parse(response_text)

@@ -16,6 +16,7 @@ import asyncio
 import logging
 import os
 import time
+from collections import defaultdict
 from pprint import pformat
 from typing import Any, Optional
 
@@ -30,6 +31,7 @@ from verl.experimental.fully_async_policy.detach_utils import (
     prepare_single_generation_data,
     safe_create_task,
     should_keep_async_filter_group,
+    should_keep_output_format_group,
     validate_async_filter_groups_config,
     validate_inverse_batch,
 )
@@ -40,7 +42,15 @@ from verl.single_controller.ray import RayResourcePool, RayWorkerGroup, Resource
 from verl.trainer.ppo.utils import need_reward_model
 from verl.utils import normalize_token_ids
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
+from verl.utils.generation_metadata import is_degeneration_stopped, merge_agentic_forced_tokens
+from verl.utils.output_format import (
+    output_format_config,
+    output_format_enabled,
+    validate_output_format_agent_config,
+    validate_output_format_reward_config,
+)
 from verl.utils.profiler import marked_timer
+from verl.utils.rollout_archive import JsonlArchive, json_safe
 from verl.utils.rollout_trace import rollout_trace_op
 from verl.utils.skip import SkipManager
 from verl.utils.tracking import ValidationGenerationsLogger
@@ -98,6 +108,7 @@ class FullyAsyncLLMServerClient(LLMServerClient):
             num_preempted=0,
         )
         min_global_steps, max_global_steps = None, None
+        agentic_forced_tokens = []
 
         while True:
             # 1. generate tokens
@@ -128,6 +139,10 @@ class FullyAsyncLLMServerClient(LLMServerClient):
             if output.num_preempted is not None:
                 final_output.num_preempted += output.num_preempted
             final_output.stop_reason = output.stop_reason
+            agentic_forced_tokens = merge_agentic_forced_tokens(
+                agentic_forced_tokens,
+                output.extra_fields.get("agentic_forced_tokens"),
+            )
 
             # update model weights version
             global_steps = output.extra_fields.get("global_steps", None)
@@ -151,6 +166,8 @@ class FullyAsyncLLMServerClient(LLMServerClient):
         final_output.extra_fields["global_steps"] = global_steps
         final_output.extra_fields["min_global_steps"] = min_global_steps
         final_output.extra_fields["max_global_steps"] = max_global_steps
+        final_output.extra_fields["agentic_forced_tokens"] = agentic_forced_tokens
+        final_output.extra_fields["degeneration_stopped"] = is_degeneration_stopped(agentic_forced_tokens)
         return final_output
 
 
@@ -528,6 +545,17 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         self.filtered_group_samples = 0
         self.filtered_group_trajectories = 0
         self.processed_sample_count = 0
+        self._output_format_metric_totals = defaultdict(float)
+        self._output_format_source_metric_totals: dict[str, defaultdict[str, float]] = {}
+        self._prefilter_archive = None
+        if output_format_enabled(config):
+            archive_config = output_format_config(config).get("archive", {}) or {}
+            if archive_config.get("enabled", True):
+                self._prefilter_archive = JsonlArchive(
+                    archive_config.get(
+                        "path", os.path.join(config.trainer.default_local_dir, "prefilter_rollouts.jsonl")
+                    )
+                )
         # we start from step 1
         self.global_steps = 1
         self.idle_start_time = time.time()
@@ -627,6 +655,8 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 f"idle_ratio: {timing_raw['fully_async/rollouter/idle_ratio']:.4f}"
             )
             self.step_start_time = time.time()
+            self._output_format_metric_totals.clear()
+            self._output_format_source_metric_totals.clear()
 
         return timing_raw
 
@@ -751,6 +781,11 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         # Validate asynchronous training configuration
         if not hasattr(self.config, "async_training"):
             raise ValueError("[FullyAsyncRollouter] Missing async_training configuration")
+        no_format = os.environ.get("NO_FORMAT", "").strip().lower() in {
+            "1", "true", "yes", "y", "on",
+        }
+        validate_output_format_agent_config(self.config, no_format=no_format)
+        validate_output_format_reward_config(self.config)
         assert self.config.actor_rollout_ref.rollout.calculate_log_probs, "must rollout calculate log_probs"
         rollout_config = self.config.actor_rollout_ref.rollout
         validate_inverse_batch(rollout_config)
@@ -1018,18 +1053,26 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             self.n_per_round,
         )
         rollout_sample.full_batch = ret
-        # Re-set input metadata on output — agent loop worker returns a new DataProto without the input's non_tensor_batch.
+        # Re-set input metadata on output — agent loop worker returns a new
+        # DataProto without the input's non_tensor_batch.
         rollout_sample.full_batch.non_tensor_batch["uid"] = np.array(
             [f"uid_{rollout_sample.sample_id}"] * len(rollout_sample.full_batch), dtype=object
         )
         for key, value in preserved_non_tensor_batch.items():
             rollout_sample.full_batch.non_tensor_batch[key] = value
+        self._record_output_format_prefilter_metrics(rollout_sample.full_batch)
         rollout_sample.rollout_status = await self.get_statistics()
 
         filter_groups_config = self.config.algorithm.get("filter_groups", None)
-        if filter_groups_config is not None and filter_groups_config.enable and not should_keep_async_filter_group(
-            rollout_sample.full_batch, filter_groups_config
-        ):
+        filter_groups_enabled = filter_groups_config is not None and filter_groups_config.enable
+        if not filter_groups_enabled:
+            keep_group = True
+        elif output_format_enabled(self.config):
+            keep_group = should_keep_output_format_group(rollout_sample.full_batch)
+        else:
+            keep_group = should_keep_async_filter_group(rollout_sample.full_batch, filter_groups_config)
+        self._archive_output_format_prefilter_group(rollout_sample, kept=keep_group)
+        if not keep_group:
             self.filtered_group_samples += 1
             self.filtered_group_trajectories += len(rollout_sample.full_batch)
             # This dropped sample has been counted already, decrement stalaness_samples
@@ -1221,8 +1264,123 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             "static/max_queue_size": self.max_queue_size,
             "static/max_concurrent_samples": self.max_concurrent_samples,
         }
+        stats.update(self._output_format_prefilter_metrics())
 
         return stats
+
+    @staticmethod
+    def _metric_source_name(value: Any) -> str:
+        return str(value).replace("/", "_").replace(" ", "_")
+
+    @staticmethod
+    def _batch_value(batch: DataProto, key: str, index: int, default: Any = None) -> Any:
+        values = batch.non_tensor_batch.get(key)
+        if values is None:
+            return default
+        try:
+            return values[index]
+        except (IndexError, KeyError, TypeError):
+            return default
+
+    def _record_output_format_prefilter_metrics(self, batch: DataProto) -> None:
+        if not output_format_enabled(self.config):
+            return
+        metric_keys = (
+            "task_score",
+            "raw_task_score",
+            "task_success",
+            "acc",
+            "optimization_reward",
+            "format_valid",
+            "format_bonus",
+            "degeneration_stopped",
+            "verifier_skipped",
+        )
+        for index in range(len(batch)):
+            source = self._metric_source_name(self._batch_value(batch, "data_source", index, "unknown"))
+            source_totals = self._output_format_source_metric_totals.setdefault(source, defaultdict(float))
+            self._output_format_metric_totals["count"] += 1
+            source_totals["count"] += 1
+            for key in metric_keys:
+                value = float(self._batch_value(batch, key, index, 0.0) or 0.0)
+                self._output_format_metric_totals[key] += value
+                source_totals[key] += value
+
+    @staticmethod
+    def _format_output_format_metric_totals(totals: dict[str, float], prefix: str) -> dict[str, float]:
+        count = totals.get("count", 0.0)
+        if count <= 0:
+            return {}
+        return {
+            f"{prefix}/task_score/mean": totals["task_score"] / count,
+            f"{prefix}/raw_task_score/mean": totals["raw_task_score"] / count,
+            f"{prefix}/task_success/rate": totals["task_success"] / count,
+            f"{prefix}/acc/mean": totals["acc"] / count,
+            f"{prefix}/optimization_reward/mean": totals["optimization_reward"] / count,
+            f"{prefix}/format_valid/rate": totals["format_valid"] / count,
+            f"{prefix}/format_bonus/mean": totals["format_bonus"] / count,
+            f"{prefix}/degeneration_stopped/rate": totals["degeneration_stopped"] / count,
+            f"{prefix}/verifier_skipped/rate": totals["verifier_skipped"] / count,
+        }
+
+    def _output_format_prefilter_metrics(self) -> dict[str, float]:
+        metrics = self._format_output_format_metric_totals(
+            self._output_format_metric_totals, "rollout/pre_filter"
+        )
+        for source, totals in self._output_format_source_metric_totals.items():
+            metrics.update(
+                self._format_output_format_metric_totals(totals, f"rollout/pre_filter/by_source/{source}")
+            )
+        return metrics
+
+    def _archive_output_format_prefilter_group(self, rollout_sample: RolloutSample, *, kept: bool) -> None:
+        if self._prefilter_archive is None:
+            return
+        batch = rollout_sample.full_batch
+        records = []
+        for index in range(len(batch)):
+            reward_model = self._batch_value(batch, "reward_model", index, {}) or {}
+            records.append(
+                {
+                    "group_id": rollout_sample.sample_id,
+                    "epoch": rollout_sample.epoch,
+                    "trajectory_index": index,
+                    "kept_by_group_filter": kept,
+                    "filter_outcome": "kept" if kept else "filtered",
+                    "data_source": self._batch_value(batch, "data_source", index, "unknown"),
+                    "ground_truth": reward_model.get("ground_truth") if isinstance(reward_model, dict) else None,
+                    "original_messages": self._batch_value(batch, "raw_prompt", index),
+                    "rendered_prompt": self._batch_value(batch, "rendered_prompt", index),
+                    "raw_output": self._batch_value(batch, "raw_response_text", index),
+                    "reasoning_text": self._batch_value(batch, "reasoning_text", index, ""),
+                    "final_response_text": self._batch_value(batch, "final_response_text", index, ""),
+                    "verifier_response_text": self._batch_value(batch, "response_text", index, [""]),
+                    "output_format_parser": self._batch_value(batch, "output_format_parser", index),
+                    "output_format_prompt_role": self._batch_value(batch, "output_format_prompt_role", index),
+                    "parser_outcome": self._batch_value(batch, "parser_outcome", index),
+                    "format_valid": self._batch_value(batch, "format_valid", index, False),
+                    "score": self._batch_value(batch, "score", index, 0.0),
+                    "task_score": self._batch_value(batch, "task_score", index, 0.0),
+                    "raw_task_score": self._batch_value(batch, "raw_task_score", index, 0.0),
+                    "task_success": self._batch_value(batch, "task_success", index, 0.0),
+                    "acc": self._batch_value(batch, "acc", index, 0.0),
+                    "format_penalty": self._batch_value(batch, "format_penalty", index, 0.0),
+                    "format_bonus": self._batch_value(batch, "format_bonus", index, 0.0),
+                    "optimization_reward": self._batch_value(batch, "optimization_reward", index, 0.0),
+                    "degeneration_stopped": self._batch_value(batch, "degeneration_stopped", index, False),
+                    "verifier_skipped": self._batch_value(batch, "verifier_skipped", index, False),
+                    "overlong_reward": self._batch_value(batch, "overlong_reward", index),
+                    "overlong": self._batch_value(batch, "overlong", index),
+                    "agentic_forced_tokens": self._batch_value(batch, "agentic_forced_tokens", index, []),
+                    "stop_reason": self._batch_value(batch, "stop_reason", index),
+                    "response_length": self._batch_value(batch, "response_len", index),
+                    "model_version_start": self._batch_value(batch, "min_global_steps", index),
+                    "model_version_end": self._batch_value(batch, "max_global_steps", index),
+                    "uid": self._batch_value(batch, "uid", index),
+                    "request_id": self._batch_value(batch, "request_id", index),
+                }
+            )
+        self._prefilter_archive.append(json_safe(records))
 
     # -------------------------------------------------------------------------
     # Elastic worker group injection

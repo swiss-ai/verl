@@ -22,6 +22,7 @@ import torch
 
 from verl import DataProto
 from verl.trainer.ppo.ray_trainer import compute_response_mask
+from verl.utils.output_format import output_format_enabled
 
 
 @dataclass
@@ -112,6 +113,12 @@ def validate_async_filter_groups_config(config, logger=None):
             "algorithm.filter_groups.metric must be set when filter_groups.enable=True"
         )
 
+    if output_format_enabled(config) and metric_name != "task_success":
+        raise ValueError(
+            "output_format.enabled=true with group filtering requires "
+            "algorithm.filter_groups.metric=task_success"
+        )
+
     if metric_name == "seq_final_reward" and config.algorithm.use_kl_in_reward:
         raise ValueError(
             "algorithm.filter_groups.metric='seq_final_reward' is not supported in fully async mode when "
@@ -164,6 +171,31 @@ def should_keep_async_filter_group(batch: DataProto, filter_groups_config) -> bo
     )
 
 
+def should_keep_output_format_group(batch: DataProto) -> bool:
+    """Filter using binary task success and output-format contrast."""
+    required_keys = ("task_success", "format_valid")
+    missing_keys = [key for key in required_keys if key not in batch.non_tensor_batch]
+    if missing_keys:
+        raise ValueError(
+            "output-format group filtering requires reward extras: "
+            + ", ".join(missing_keys)
+        )
+
+    task_success = np.asarray(batch.non_tensor_batch["task_success"], dtype=np.float64).reshape(-1)
+    format_valid = np.asarray(batch.non_tensor_batch["format_valid"], dtype=bool).reshape(-1)
+    if len(task_success) != len(batch) or len(format_valid) != len(batch):
+        raise ValueError("output-format filter metrics must contain one value per trajectory")
+    if not np.all(np.isclose(task_success, 0.0) | np.isclose(task_success, 1.0)):
+        raise ValueError("output-format task_success values must be binary")
+
+    successful = np.isclose(task_success, 1.0)
+    if not np.any(successful):
+        return False
+    if not np.all(successful):
+        return True
+    return bool(np.any(format_valid) and not np.all(format_valid))
+
+
 def addition_process(output: DataProto):
     """collect metirics"""
     metrics = output.meta_info.pop("metrics")  # List[Dict[str, str]]
@@ -208,9 +240,10 @@ def assemble_batch_from_rollout_samples(
 
     rollout_samples_batch = []
     rollout_status = rollout_samples[0].rollout_status
-    # Add a prefix to all rollout_status keys
+    # Preserve user-facing rollout metrics; namespace internal rollouter state.
     rollout_status = {
-        f"fully_async/{key}": value for key, value in rollout_status.items()
+        key if key.startswith("rollout/") else f"fully_async/{key}": value
+        for key, value in rollout_status.items()
     }
 
     for rs in rollout_samples:

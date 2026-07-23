@@ -44,6 +44,7 @@ from sglang.srt.managers.tokenizer_manager import ServerStatus
 
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import get_visible_devices_keyword
+from verl.utils.generation_metadata import is_degeneration_stopped, normalize_agentic_forced_tokens
 from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
 from verl.utils.profiler import DistProfiler, build_sglang_profiler_args
 from verl.workers.config import HFModelConfig, RolloutConfig
@@ -710,6 +711,9 @@ class SGLangHttpServer:
                 )
 
         extra_fields = {"global_steps": self.global_steps}
+        forced_tokens = normalize_agentic_forced_tokens(meta_info.get("agentic_forced_tokens"))
+        extra_fields["agentic_forced_tokens"] = forced_tokens
+        extra_fields["degeneration_stopped"] = is_degeneration_stopped(forced_tokens)
         if prompt_logprobs is not None:
             _extract_prompt_logprobs_sglang(
                 meta_info=meta_info,

@@ -47,6 +47,13 @@ THINK_PREFIX_TOKEN="${THINK_PREFIX_TOKEN:-<|inner_prefix|>}"
 ENABLE_THINKING="${ENABLE_THINKING:-false}"
 DEGENERATION_EARLY_STOP="${DEGENERATION_EARLY_STOP:-false}"
 DEGENERATION_EARLY_STOP_STRIDE="${DEGENERATION_EARLY_STOP_STRIDE:-128}"
+OUTPUT_FORMAT="${OUTPUT_FORMAT:-false}"
+OUTPUT_FORMAT_PARSER="${OUTPUT_FORMAT_PARSER:-markdown}"
+OUTPUT_FORMAT_PROMPT_ROLE="${OUTPUT_FORMAT_PROMPT_ROLE:-system}"
+TASK_SUCCESS_THRESHOLD="${TASK_SUCCESS_THRESHOLD:-0.7}"
+FORMAT_PENALTY="${FORMAT_PENALTY:-0.1}"
+FORMAT_BONUS="${FORMAT_BONUS:-0.05}"
+ARCHIVE_ALL_ROLLOUTS="${ARCHIVE_ALL_ROLLOUTS:-true}"
 WANDB_ENTITY="${WANDB_ENTITY:-apertus}"
 WANDB_BACKGROUND_SYNC="${WANDB_BACKGROUND_SYNC:-false}"
 WANDB_MODE="${WANDB_MODE:-offline}"
@@ -205,6 +212,10 @@ is_truthy() {
   esac
 }
 
+if is_truthy "${OUTPUT_FORMAT}"; then
+  DEGENERATION_EARLY_STOP=true
+fi
+
 build_overrides() {
   local reward_sandbox_url=""
   local excluded_abilities=()
@@ -239,8 +250,6 @@ build_overrides() {
     "actor_rollout_ref.actor.data_loader_seed=${SEED}"
     "actor_rollout_ref.actor.calculate_entropy=true"
     "actor_rollout_ref.rollout.skip_tokenizer_init=False"
-    "+actor_rollout_ref.rollout.engine_kwargs.sglang.grammar_backend=llguidance"
-    "actor_rollout_ref.rollout.reasoning_format=apertus2509"
     "rollout.nnodes=${ROLLOUT_NNODES}"
     "rollout.n_gpus_per_node=${ROLLOUT_GPUS_PER_NODE}"
     "reward.sandbox_fusion.memory_limit_mb=${DEFAULT_MEMORY_LIMIT_MB}"
@@ -287,6 +296,25 @@ build_overrides() {
     )
   fi
 
+  if is_truthy "${OUTPUT_FORMAT}"; then
+    overrides+=(
+      "output_format.enabled=true"
+      "output_format.parser=${OUTPUT_FORMAT_PARSER}"
+      "output_format.prompt_role=${OUTPUT_FORMAT_PROMPT_ROLE}"
+      "output_format.success_threshold=${TASK_SUCCESS_THRESHOLD}"
+      "output_format.format_penalty=${FORMAT_PENALTY}"
+      "output_format.format_bonus=${FORMAT_BONUS}"
+      "output_format.archive.enabled=${ARCHIVE_ALL_ROLLOUTS}"
+      "actor_rollout_ref.rollout.reasoning_format=null"
+      "reward.reward_manager.name=output_format"
+    )
+  else
+    overrides+=(
+      "+actor_rollout_ref.rollout.engine_kwargs.sglang.grammar_backend=llguidance"
+      "actor_rollout_ref.rollout.reasoning_format=apertus2509"
+    )
+  fi
+
   if is_truthy "${WANDB_BACKGROUND_SYNC}"; then
     WANDB_MODE="${WANDB_MODE:-offline}"
     WANDB_SYNC_UPLOAD_MODE="${WANDB_SYNC_UPLOAD_MODE:-online}"
@@ -319,7 +347,16 @@ build_overrides() {
     fi
   fi
 
-  if is_truthy "${NO_FORMAT}"; then
+  if is_truthy "${OUTPUT_FORMAT}"; then
+    overrides+=(
+      "actor_rollout_ref.rollout.multi_turn.enable=false"
+      "actor_rollout_ref.rollout.agent.default_agent_loop=single_turn_agent"
+      "data.function_tool_path=null"
+      "actor_rollout_ref.rollout.multi_turn.tool_config_path=null"
+      "actor_rollout_ref.rollout.multi_turn.function_tool_path=null"
+      "actor_rollout_ref.rollout.multi_turn.terminal_tool_names=[]"
+    )
+  elif is_truthy "${NO_FORMAT}"; then
     overrides+=(
       "actor_rollout_ref.rollout.multi_turn.enable=false"
       "actor_rollout_ref.rollout.agent.default_agent_loop=single_turn_agent"
@@ -424,9 +461,13 @@ build_overrides() {
   fi
 
   if [ "${USE_GROUP_FILTERING}" = "true" ]; then
+    local filter_metric="acc"
+    if is_truthy "${OUTPUT_FORMAT}"; then
+      filter_metric="task_success"
+    fi
     overrides+=(
       "algorithm.filter_groups.enable=true"
-      "algorithm.filter_groups.metric=acc"
+      "algorithm.filter_groups.metric=${filter_metric}"
       "algorithm.filter_groups.min=0.0"
       "algorithm.filter_groups.max=1.0"
     )
@@ -626,7 +667,7 @@ from tokenizers import Tokenizer
 
 p = '${RESOLVED_TOKENIZER:-${TOKENIZER_NAME_OR_PATH}}'
 eos = None
-for fn in ('special_tokens_map.json', 'tokenizer_config.json'):
+for fn in ('tokenizer_config.json', 'special_tokens_map.json'):
     fp = os.path.join(p, fn)
     if not os.path.exists(fp):
         continue

@@ -32,6 +32,7 @@ from verl.experimental.agent_loop.tool_parser import FunctionCall, ToolParser
 from verl.experimental.agent_loop.utils import build_gpt_oss_tool_response_text
 from verl.tools.function_tool import FunctionTool, normalize_function_tool_return
 from verl.tools.schemas import ToolResponse
+from verl.utils.generation_metadata import is_degeneration_stopped, merge_agentic_forced_tokens
 from verl.utils.profiler import simple_timer
 from verl.utils.rollout_trace import rollout_trace_op
 from verl.workers.rollout.replica import TokenOutput
@@ -139,7 +140,9 @@ class ToolAgentLoop(AgentLoopBase):
 
     @rollout_trace_op
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
-        messages = list(kwargs["raw_prompt"])
+        messages = self.prepare_messages(
+            kwargs["raw_prompt"], validate=bool(kwargs.get("validate", False))
+        )
 
         # extract multimodal inputs from messages
         multi_modal_data = await self.process_multi_modal_info(messages)
@@ -281,6 +284,7 @@ class ToolAgentLoop(AgentLoopBase):
                 audio_data=agent_data.audio_data,
                 mm_processor_kwargs=agent_data.mm_processor_kwargs,
             )
+        output.extra_fields["stop_reason"] = output.stop_reason
         # first time to set num_preempted
         if agent_data.metrics.get("num_preempted") is None:
             agent_data.metrics["num_preempted"] = (
@@ -304,6 +308,13 @@ class ToolAgentLoop(AgentLoopBase):
                     agent_data.extra_fields[key] = int(
                         agent_data.extra_fields[key]
                     ) + int(output.extra_fields[key])
+            forced_tokens = merge_agentic_forced_tokens(
+                agent_data.extra_fields.get("agentic_forced_tokens"),
+                output.extra_fields.get("agentic_forced_tokens"),
+            )
+            agent_data.extra_fields["agentic_forced_tokens"] = forced_tokens
+            agent_data.extra_fields["degeneration_stopped"] = is_degeneration_stopped(forced_tokens)
+            agent_data.extra_fields["stop_reason"] = output.stop_reason
 
         if not is_apertus:
             agent_data.assistant_turns += 1
