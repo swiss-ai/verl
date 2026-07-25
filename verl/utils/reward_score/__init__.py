@@ -131,6 +131,8 @@ def default_compute_score(
         "code_contests",
         "apps",
         "codeforces",
+        "acecode",
+        "TIGER-Lab/AceCode-87K",
     ]:
         # Select code evaluation sandbox backend
         sandbox_backend = _code_sandbox_backend()

@@ -538,6 +538,30 @@ def adapt_apps(
     return make_code_row(example, idx, split, config, "likaixin/TACO-verified")
 
 
+@register_adapter("acecode")
+def adapt_acecode(
+    example: dict[str, Any], idx: int, split: str, config: DatasetConfig
+) -> dict[str, Any]:
+    question = normalize_text(get_value(example, config.question_key))
+    test_cases = normalize_acecode_test_cases(get_value(example, config.answer_key))
+    return make_row(
+        config=config,
+        split=split,
+        index=idx,
+        prompt=make_prompt(format_code_prompt(question, "", config.prompt_template)),
+        ability="code",
+        ground_truth=json_dumps(test_cases),
+        extra_info={
+            "question": question,
+            "problem_id": normalize_text(get_value(example, "id")),
+            "source": normalize_text(get_value(example, "source")),
+            "language": "python",
+            "test_cases": test_cases,
+            "num_used_tests": len(test_cases),
+        },
+    )
+
+
 @register_adapter("code_contests")
 def adapt_code_contests(
     example: dict[str, Any], idx: int, split: str, config: DatasetConfig
@@ -892,6 +916,22 @@ def normalize_prime_code_test_cases(test_cases: Any) -> dict[str, Any]:
     else:
         normalized["inputs"] = [serialize_standard_io(case) for case in inputs]
         normalized["outputs"] = [serialize_standard_io(case) for case in outputs]
+    return normalized
+
+
+def normalize_acecode_test_cases(test_cases: Any) -> list[str]:
+    test_cases = parse_json_maybe(test_cases, default=[])
+    if not isinstance(test_cases, list):
+        raise ValueError(
+            f"Expected a list of AceCode test cases, got {type(test_cases)}"
+        )
+    normalized = [
+        normalize_text(test_case)
+        for test_case in test_cases
+        if normalize_text(test_case)
+    ]
+    if not normalized:
+        raise ValueError("AceCode example has no usable test cases")
     return normalized
 
 

@@ -24,17 +24,18 @@ ENVIRONMENT_PATH="${ENVIRONMENT_PATH:-/capstor/store/cscs/swissai/infra01/reason
 PY_DEPS_ROOT="${PY_DEPS_ROOT:-}"
 PY_DEPS_DIR="${PY_DEPS_DIR:-}"
 
-# MODEL_NAME_OR_PATH="/iopsstor/scratch/cscs/msantelmo/checkpoints/Apertus-8B-Instruct-2509"
-# MODEL_NAME_OR_PATH="/iopsstor/scratch/cscs/msantelmo/checkpoints/sft_0/Apertus-8B-2509__sft_0_lr5e-5-ratio03__global_step_11776"
-# TOKENIZER_NAME_OR_PATH="/iopsstor/scratch/cscs/msantelmo/tokenizers/apertus_2509_text_only_aligned_v3"
 
-# MODEL_NAME_OR_PATH=/iopsstor/scratch/cscs/msantelmo/checkpoints/sft_0/apertus-1p5_8b_seq_len_256k_7000__sft_0_lr5e-5-ratio03__global_step_11264
-# TOKENIZER_NAME_OR_PATH=/iopsstor/scratch/cscs/msantelmo/tokenizers/apertus_emu3.5_wavtok_instruct_thinking_token_fixed
-# MODEL_TAG=apertus-1p5_8b_256k__sft0_11264
+TOKENIZER_NAME_OR_PATH=/iopsstor/scratch/cscs/msantelmo/tokenizers/qwen2.5-7b-instruct-thinking
 
-MODEL_NAME_OR_PATH=/iopsstor/scratch/cscs/msantelmo/checkpoints/sft_0/Qwen2.5-7B__sft_0_lr1e-5-ratio03__global_step_8192
-TOKENIZER_NAME_OR_PATH=/iopsstor/scratch/cscs/msantelmo/checkpoints/Qwen2.5-7B-Instruct
-MODEL_TAG=Qwen2.5-7B__sft_0_8192-xml-think
+# MODEL_NAME_OR_PATH=/iopsstor/scratch/cscs/msantelmo/checkpoints/sft_1/Qwen2.5-7B__sft1__teacher-baseline__lr1e-5-ratio03__global_step_12288
+# MODEL_TAG=Qwen2.5-7B__sft1__teacher-baseline_xml-think
+
+# MODEL_NAME_OR_PATH=/iopsstor/scratch/cscs/msantelmo/checkpoints/sft_1/Qwen2.5-7B__sft1__self-teacher-baseline__lr5e-6-ratio03__global_step_10240
+# MODEL_TAG=Qwen2.5-7B__sft1__self-teacher-baseline_xml-think
+
+MODEL_NAME_OR_PATH=/iopsstor/scratch/cscs/msantelmo/checkpoints/sft_1/Qwen2.5-7B__sft1__self-cap-filter-fill__lr5e-6-ratio03__global_step_10240
+MODEL_TAG=Qwen2.5-7B__sft1__self-cap-filter-fill_xml-think
+
 
 MULTIMODAL="${MULTIMODAL:-false}"
 
@@ -43,7 +44,7 @@ SLURM_TIME="${SLURM_TIME:-12:00:00}"
 TRAIN_NNODES="${TRAIN_NNODES:-16}"
 ROLLOUT_NNODES="${ROLLOUT_NNODES:-16}"
 NNODES="${NNODES:-$((TRAIN_NNODES + ROLLOUT_NNODES))}"
-TRAINING_DATA_DIR="/iopsstor/scratch/cscs/msantelmo/SSFT/data/rl"
+TRAINING_DATA_DIR="/iopsstor/scratch/cscs/msantelmo/SSFT/data/rl_1"
 ENABLE_THINKING="true"
 FORCE_THINKING="false"
 THINK_PREFIX_TOKEN="${THINK_PREFIX_TOKEN:-<think>}"
@@ -74,7 +75,7 @@ ASYNC_TRIGGER_PARAMETER_SYNC_STEP="${ASYNC_TRIGGER_PARAMETER_SYNC_STEP:-}"
 ASYNC_STALENESS_THRESHOLD="${ASYNC_STALENESS_THRESHOLD:-}"
 ASYNC_STEADY_WARMUP_STEPS="${ASYNC_STEADY_WARMUP_STEPS:-}"
 
-OUTPUT_FORMAT=true
+OUTPUT_FORMAT=${OUTPUT_FORMAT:-true}
 OUTPUT_FORMAT_PARSER="${OUTPUT_FORMAT_PARSER:-xml_think}"
 OUTPUT_FORMAT_PROMPT_ROLE="${OUTPUT_FORMAT_PROMPT_ROLE:-system}"
 TASK_SUCCESS_THRESHOLD="${TASK_SUCCESS_THRESHOLD:-0.7}"
@@ -141,7 +142,7 @@ resolve_run_name_and_dir() {
   fi
 
   if [[ -z "${JOB_NAME}" ]]; then
-    JOB_NAME="async__${CONFIG_NAME}_${group_filtering_tag}${MODEL_TAG}_${TRAIN_NNODES}tn-${ROLLOUT_NNODES}rn__s${SEED}${thinking_tag}"
+    JOB_NAME="rl-1__${CONFIG_NAME}_${group_filtering_tag}${MODEL_TAG}_${TRAIN_NNODES}tn-${ROLLOUT_NNODES}rn__s${SEED}${thinking_tag}"
   fi
   JOB_NAME="$(sanitize_job_name "${JOB_NAME}")"
   if [[ -n "${RUN_NAME}" ]]; then
