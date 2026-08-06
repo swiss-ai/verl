@@ -14,6 +14,7 @@
 
 import asyncio
 import logging
+import math
 import os
 import time
 from collections import defaultdict
@@ -28,10 +29,14 @@ from omegaconf import DictConfig
 from verl.experimental.agent_loop.agent_loop import AgentLoopManager
 from verl.experimental.fully_async_policy.detach_utils import (
     RolloutSample,
+    adaptive_group_has_success,
+    adaptive_group_size_enabled,
     prepare_single_generation_data,
     safe_create_task,
     should_keep_async_filter_group,
     should_keep_output_format_group,
+    speculative_prompt_concurrency_enabled,
+    validate_adaptive_group_size_config,
     validate_async_filter_groups_config,
     validate_inverse_batch,
 )
@@ -388,24 +393,48 @@ class FullyAsyncLLMServerManager(LLMServerManager):
 
 
 async def _generate_sequences_inverse_batch(
-    async_rollout_manager, full_batch: DataProto, n_per_round: int
+    async_rollout_manager,
+    full_batch: DataProto,
+    n_per_round: int,
+    *,
+    sampling_round: int | None = None,
+    scheduled_version: int | None = None,
 ) -> DataProto:
     """Generate one repeated prompt group in sequential inverse-batch rounds."""
-    if n_per_round == len(full_batch):
+    if n_per_round == len(full_batch) and sampling_round is None:
         return await async_rollout_manager.generate_sequences_single(full_batch)
 
     round_outputs = []
-    for start in range(0, len(full_batch), n_per_round):
+    for chunk_index, start in enumerate(range(0, len(full_batch), n_per_round), start=1):
         round_batch = full_batch[start : start + n_per_round]
-        round_outputs.append(await async_rollout_manager.generate_sequences_single(round_batch))
+        output = await async_rollout_manager.generate_sequences_single(round_batch)
+        if sampling_round is not None:
+            output.non_tensor_batch["sampling_round"] = np.full(len(output), sampling_round, dtype=np.int32)
+            output.non_tensor_batch["inverse_chunk"] = np.full(len(output), chunk_index, dtype=np.int32)
+            output.non_tensor_batch["round_scheduled_version"] = np.full(
+                len(output), scheduled_version if scheduled_version is not None else -1, dtype=np.int64
+            )
+        round_outputs.append(output)
 
     return DataProto.concat(round_outputs)
 
 
 def _max_concurrent_prompt_groups(
-    num_replicas: int, rollout_n: int, n_per_round: int, max_required_samples: int
+    num_replicas: int,
+    rollout_n: int,
+    n_per_round: int,
+    max_required_samples: int,
+    *,
+    speculative_enabled: bool = False,
+    target_inflight_trajectories_per_replica: int = 40,
 ) -> int:
     """Scale prompt-group concurrency so inverse batching keeps rollout servers fed."""
+    if speculative_enabled:
+        trajectory_target_prompts = math.ceil(
+            num_replicas * target_inflight_trajectories_per_replica / n_per_round
+        )
+        return max(max_required_samples, trajectory_target_prompts)
+
     rounds_per_prompt = max(1, rollout_n // n_per_round)
     max_concurrent_samples = num_replicas * 16 * rounds_per_prompt
     return min(max_concurrent_samples, max_required_samples)
@@ -535,6 +564,14 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         self.required_samples = config.actor_rollout_ref.actor.ppo_mini_batch_size * self.require_batches
         self.max_required_samples = None
         self.max_concurrent_samples = None
+        adaptive_config = config.actor_rollout_ref.rollout.get("adaptive_group_size", {})
+        speculative_config = adaptive_config.get("speculative_prompt_concurrency", {})
+        self.speculative_prompt_concurrency_enabled = speculative_prompt_concurrency_enabled(config)
+        self.target_inflight_trajectories_per_replica = int(
+            speculative_config.get("target_inflight_trajectories_per_replica", 40)
+        )
+        self.acceptance_window_open = True
+        self.num_rollout_replicas = 0
         # queue size
         self.max_queue_size = None
 
@@ -544,6 +581,22 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         self.dropped_stale_samples = 0
         self.filtered_group_samples = 0
         self.filtered_group_trajectories = 0
+        self.total_generated_trajectories = 0
+        self.adaptive_rounds_attempted = 0
+        self.adaptive_trajectories_attempted = 0
+        self.adaptive_successful_groups = 0
+        self.adaptive_version_boundary_drops = 0
+        self.adaptive_max_round_drops = 0
+        self.adaptive_filter_drops = 0
+        self.adaptive_discarded_trajectories = 0
+        self.adaptive_discarded_tokens = 0
+        self.adaptive_speculative_budget_drops = 0
+        self.adaptive_speculative_version_drops = 0
+        self.adaptive_speculative_queue_drops = 0
+        self.adaptive_speculative_discarded_trajectories = 0
+        self.adaptive_speculative_discarded_tokens = 0
+        self.adaptive_success_round_counts = defaultdict(int)
+        self.adaptive_final_group_size_counts = defaultdict(int)
         self.processed_sample_count = 0
         self._output_format_metric_totals = defaultdict(float)
         self._output_format_source_metric_totals: dict[str, defaultdict[str, float]] = {}
@@ -558,6 +611,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 )
         # we start from step 1
         self.global_steps = 1
+        self.current_param_version = 0
         self.idle_start_time = time.time()
         self.step_start_time = time.time()
 
@@ -598,11 +652,14 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 / (self.required_samples * self.config.async_training.trigger_parameter_sync_step)
             )
 
+            self.num_rollout_replicas = len(self.llm_server_manager.get_replicas())
             self.max_concurrent_samples = _max_concurrent_prompt_groups(
-                num_replicas=len(self.llm_server_manager.get_replicas()),
+                num_replicas=self.num_rollout_replicas,
                 rollout_n=int(self.config.actor_rollout_ref.rollout.n),
                 n_per_round=self.n_per_round,
                 max_required_samples=self.max_required_samples,
+                speculative_enabled=self.speculative_prompt_concurrency_enabled,
+                target_inflight_trajectories_per_replica=self.target_inflight_trajectories_per_replica,
             )
             self.max_queue_size = self.max_required_samples
 
@@ -613,6 +670,9 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 f"total_train_steps: {self.total_train_steps} "
                 f"total_rollout_steps: {self.total_rollout_steps} "
                 f"max_concurrent_samples: {self.max_concurrent_samples} "
+                f"speculative_prompt_concurrency: {self.speculative_prompt_concurrency_enabled} "
+                f"target_inflight_trajectories_per_replica: "
+                f"{self.target_inflight_trajectories_per_replica} "
             )
 
     def get_replicas(self):
@@ -625,18 +685,39 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
     def get_total_train_steps(self):
         return self.total_train_steps
 
-    async def reset_staleness(self):
+    async def begin_parameter_sync(self, next_param_version: int):
+        """Close speculative publication before rollout weights begin changing."""
+        if not self.speculative_prompt_concurrency_enabled:
+            return
+
+        async with self.lock:
+            self.acceptance_window_open = False
+            self.current_param_version = int(next_param_version)
+            self.paused = True
+            self._resume_event.clear()
+            print(
+                "[FullyAsyncRollouter][Public][begin_parameter_sync] "
+                f"closed acceptance window for version {self.current_param_version}"
+            )
+
+    async def reset_staleness(self, current_param_version: int | None = None):
         """
         Reset staleness samples after parameter update.
         Returns timing_raw dictionary for metrics.
         """
         async with self.lock:
+            if current_param_version is not None:
+                self.current_param_version = int(current_param_version)
+            if self.speculative_prompt_concurrency_enabled:
+                self.staleness_samples = await self.message_queue_client.get_queue_size()
+                self.acceptance_window_open = True
+            else:
+                # Legacy accounting counts active, queued, and newly-started prompt groups.
+                self.staleness_samples = len(self.active_tasks) + await self.message_queue_client.get_queue_size()
             self.paused = False
             # Wake the drain loop in _processor_worker so it can exit early and resume submitting
             # new samples to idle replicas instead of waiting for long-tail in-flight tasks.
             self._resume_event.set()
-            # every time param change, reset staleness_samples
-            self.staleness_samples = len(self.active_tasks) + await self.message_queue_client.get_queue_size()
             timing_raw = {}
             rollout_version_time = max(time.time() - self.step_start_time, 1e-6)
             if self.idle_start_time > self.step_start_time:
@@ -760,6 +841,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
         # Extract and set global step
         trainer_global_steps = int(global_step_folder.split("global_step_")[-1])
+        self.current_param_version = trainer_global_steps
         self.global_steps = (
             trainer_global_steps * self.required_samples * self.config.async_training.trigger_parameter_sync_step + 1
         )
@@ -791,6 +873,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         validate_inverse_batch(rollout_config)
         self.n_per_round = int(rollout_config.n_per_round)
         validate_async_filter_groups_config(self.config, logger=logger)
+        validate_adaptive_group_size_config(self.config)
 
     async def init_workers(self):
         """Initialize distributed training workers using Ray backend.
@@ -998,43 +1081,102 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             # Get sample from appropriate queue and immediately mark task as done
             rollout_sample = await self.pending_queue.get()
             self.pending_queue.task_done()
-            self.staleness_samples += 1
 
             if rollout_sample is None:
                 print(
                     "[FullyAsyncRollouter][Processor] Received end signal, waiting for remaining tasks to complete..."
                 )
                 while self.active_tasks:
+                    done_tasks, _pending_tasks = await asyncio.wait(
+                        set(self.active_tasks), return_when=asyncio.FIRST_COMPLETED
+                    )
                     async with self.lock:
-                        if self.active_tasks:
-                            done_tasks, self.active_tasks = await asyncio.wait(
-                                self.active_tasks, return_when=asyncio.FIRST_COMPLETED
-                            )
-                            for task in done_tasks:
-                                await task
+                        self.active_tasks.difference_update(done_tasks)
+                    for task in done_tasks:
+                        await task
                 break
+
+            if not self.speculative_prompt_concurrency_enabled:
+                self.staleness_samples += 1
 
             # Check whether the number of concurrent tasks exceeds the limit
             while len(self.active_tasks) >= self.max_concurrent_samples:
+                done_tasks, _pending_tasks = await asyncio.wait(
+                    set(self.active_tasks), return_when=asyncio.FIRST_COMPLETED
+                )
                 async with self.lock:
-                    if self.active_tasks:
-                        done_tasks, self.active_tasks = await asyncio.wait(
-                            self.active_tasks, return_when=asyncio.FIRST_COMPLETED
-                        )
-                        for task in done_tasks:
-                            await task
+                    self.active_tasks.difference_update(done_tasks)
+                for task in done_tasks:
+                    await task
 
             # Submit single sample processing
             if self.paused:
                 await self._resume_event.wait()
             async with self.lock:
+                group_start_version = (
+                    self.current_param_version if adaptive_group_size_enabled(self.config) else None
+                )
                 task = safe_create_task(
-                    self._process_single_sample_streaming(rollout_sample),
+                    self._process_single_sample_streaming(
+                        rollout_sample,
+                        group_start_version=group_start_version,
+                    ),
                     name=rollout_sample.sample_id,
                     task_set=self.active_tasks,
                 )
 
-    async def _process_single_sample_streaming(self, rollout_sample: RolloutSample):
+    @staticmethod
+    def _batch_token_count(batch: DataProto) -> int:
+        if batch.batch is None or "attention_mask" not in batch.batch:
+            return 0
+        return int(batch.batch["attention_mask"].sum().item())
+
+    async def _try_publish_speculative_group(
+        self,
+        rollout_sample: RolloutSample,
+        *,
+        group_start_version: int,
+    ) -> str | None:
+        """Publish one eligible group while atomically claiming an acceptance credit."""
+        async with self.lock:
+            if not self.acceptance_window_open or group_start_version != self.current_param_version:
+                return "version_boundary"
+            if self.staleness_samples >= self.max_required_samples:
+                return "acceptance_budget"
+            if await self.message_queue_client.get_queue_size() >= self.max_queue_size:
+                return "queue_full"
+
+            success = await self.message_queue_client.put_sample(sample=ray.cloudpickle.dumps(rollout_sample))
+            if not success:
+                return "queue_full"
+            self.staleness_samples += 1
+            if self.staleness_samples >= self.max_required_samples:
+                self.paused = True
+                self._resume_event.clear()
+            return None
+
+    def _record_speculative_discard(self, batch: DataProto, reason: str) -> None:
+        trajectories = len(batch)
+        tokens = self._batch_token_count(batch)
+        self.dropped_stale_samples += 1
+        self.adaptive_discarded_trajectories += trajectories
+        self.adaptive_discarded_tokens += tokens
+        self.adaptive_speculative_discarded_trajectories += trajectories
+        self.adaptive_speculative_discarded_tokens += tokens
+        if reason == "version_boundary":
+            self.adaptive_version_boundary_drops += 1
+            self.adaptive_speculative_version_drops += 1
+        elif reason == "acceptance_budget":
+            self.adaptive_speculative_budget_drops += 1
+        elif reason == "queue_full":
+            self.adaptive_speculative_queue_drops += 1
+
+    async def _process_single_sample_streaming(
+        self,
+        rollout_sample: RolloutSample,
+        *,
+        group_start_version: int | None = None,
+    ):
         """Process a single sample streamingly"""
         # Calling asynchronous generation methods
         # The prompt-group uid is also used as the sticky routing key in inverse batching,
@@ -1043,31 +1185,96 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             [f"uid_{rollout_sample.sample_id}"] * len(rollout_sample.full_batch), dtype=object
         )
         preserved_non_tensor_batch = {
-            key: rollout_sample.full_batch.non_tensor_batch[key]
+            key: np.asarray(rollout_sample.full_batch.non_tensor_batch[key])
             for key in ("data_source", "reward_model")
             if key in rollout_sample.full_batch.non_tensor_batch
         }
-        ret = await _generate_sequences_inverse_batch(
-            self.async_rollout_manager,
-            rollout_sample.full_batch,
-            self.n_per_round,
-        )
-        rollout_sample.full_batch = ret
+        adaptive_enabled = adaptive_group_size_enabled(self.config)
+        filter_groups_config = self.config.algorithm.get("filter_groups", None)
+        completed_rounds = 1
+        success_round = None
+        adaptive_drop_reason = None
+
+        if adaptive_enabled:
+            max_num_rounds = int(self.config.actor_rollout_ref.rollout.adaptive_group_size.max_num_rounds)
+            if group_start_version is None:
+                async with self.lock:
+                    group_start_version = self.current_param_version
+            assert group_start_version is not None
+
+            round_outputs = []
+            for sampling_round in range(1, max_num_rounds + 1):
+                # A logical sampling round is atomic. Check the policy boundary only
+                # before its first inverse chunk, then finish every chunk in that round.
+                if sampling_round > 1:
+                    async with self.lock:
+                        if self.current_param_version != group_start_version:
+                            adaptive_drop_reason = "version_boundary"
+                            break
+
+                async with self.lock:
+                    scheduled_version = self.current_param_version
+                self.adaptive_rounds_attempted += 1
+                round_output = await _generate_sequences_inverse_batch(
+                    self.async_rollout_manager,
+                    rollout_sample.full_batch,
+                    self.n_per_round,
+                    sampling_round=sampling_round,
+                    scheduled_version=scheduled_version,
+                )
+                self._annotate_adaptive_round_versions(round_output)
+                round_outputs.append(round_output)
+                self.adaptive_trajectories_attempted += len(round_output)
+
+                if adaptive_group_has_success(round_output, filter_groups_config):
+                    success_round = sampling_round
+                    break
+
+                async with self.lock:
+                    version_changed = self.current_param_version != group_start_version
+                if version_changed:
+                    adaptive_drop_reason = "version_boundary"
+                    break
+                if sampling_round == max_num_rounds:
+                    adaptive_drop_reason = "max_rounds"
+
+            completed_rounds = len(round_outputs)
+            if not round_outputs:
+                raise RuntimeError("adaptive rollout completed no sampling rounds")
+            rollout_sample.full_batch = DataProto.concat(round_outputs)
+            self._annotate_adaptive_group_versions(
+                rollout_sample.full_batch,
+                group_start_version=group_start_version,
+                completed_rounds=completed_rounds,
+                success_round=success_round,
+            )
+            self.adaptive_final_group_size_counts[len(rollout_sample.full_batch)] += 1
+            if success_round is not None:
+                self.adaptive_successful_groups += 1
+                self.adaptive_success_round_counts[success_round] += 1
+        else:
+            rollout_sample.full_batch = await _generate_sequences_inverse_batch(
+                self.async_rollout_manager,
+                rollout_sample.full_batch,
+                self.n_per_round,
+            )
         # Re-set input metadata on output — agent loop worker returns a new
         # DataProto without the input's non_tensor_batch.
         rollout_sample.full_batch.non_tensor_batch["uid"] = np.array(
             [f"uid_{rollout_sample.sample_id}"] * len(rollout_sample.full_batch), dtype=object
         )
         for key, value in preserved_non_tensor_batch.items():
-            rollout_sample.full_batch.non_tensor_batch[key] = value
+            repeated = np.concatenate([value] * completed_rounds)
+            rollout_sample.full_batch.non_tensor_batch[key] = repeated[: len(rollout_sample.full_batch)]
         self._record_output_format_prefilter_metrics(rollout_sample.full_batch)
         rollout_sample.rollout_status = await self.get_statistics()
 
-        filter_groups_config = self.config.algorithm.get("filter_groups", None)
         filter_groups_enabled = filter_groups_config is not None and filter_groups_config.enable
-        if not filter_groups_enabled:
+        if adaptive_drop_reason is not None:
+            keep_group = False
+        elif not filter_groups_enabled:
             keep_group = True
-        elif output_format_enabled(self.config):
+        elif output_format_enabled(self.config) and not adaptive_enabled:
             keep_group = should_keep_output_format_group(rollout_sample.full_batch)
         else:
             keep_group = should_keep_async_filter_group(rollout_sample.full_batch, filter_groups_config)
@@ -1075,13 +1282,46 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         if not keep_group:
             self.filtered_group_samples += 1
             self.filtered_group_trajectories += len(rollout_sample.full_batch)
-            # This dropped sample has been counted already, decrement stalaness_samples
-            self.staleness_samples = max(0, self.staleness_samples - 1)
-            if self.paused and (
-                self.max_required_samples is None or self.staleness_samples < self.max_required_samples
-            ):
-                self.paused = False
-                self._resume_event.set()
+            if adaptive_enabled:
+                self.adaptive_discarded_trajectories += len(rollout_sample.full_batch)
+                if rollout_sample.full_batch.batch is not None and "attention_mask" in rollout_sample.full_batch.batch:
+                    self.adaptive_discarded_tokens += int(
+                        rollout_sample.full_batch.batch["attention_mask"].sum().item()
+                    )
+                if adaptive_drop_reason == "version_boundary":
+                    self.adaptive_version_boundary_drops += 1
+                    if self.speculative_prompt_concurrency_enabled:
+                        self.adaptive_speculative_version_drops += 1
+                        self.adaptive_speculative_discarded_trajectories += len(rollout_sample.full_batch)
+                        self.adaptive_speculative_discarded_tokens += self._batch_token_count(
+                            rollout_sample.full_batch
+                        )
+                elif adaptive_drop_reason == "max_rounds":
+                    self.adaptive_max_round_drops += 1
+                else:
+                    self.adaptive_filter_drops += 1
+            if not self.speculative_prompt_concurrency_enabled:
+                # Legacy launch-time accounting reserves credit before filtering.
+                self.staleness_samples = max(0, self.staleness_samples - 1)
+                if self.paused and (
+                    self.max_required_samples is None or self.staleness_samples < self.max_required_samples
+                ):
+                    self.paused = False
+                    self._resume_event.set()
+            self.processed_sample_count += 1
+            return
+
+        if self.speculative_prompt_concurrency_enabled:
+            publish_drop_reason = await self._try_publish_speculative_group(
+                rollout_sample,
+                group_start_version=group_start_version,
+            )
+            if publish_drop_reason is not None:
+                self._record_speculative_discard(rollout_sample.full_batch, publish_drop_reason)
+                self.processed_sample_count += 1
+                return
+            self.total_generated_samples += 1
+            self.total_generated_trajectories += len(rollout_sample.full_batch)
             self.processed_sample_count += 1
             return
 
@@ -1090,9 +1330,53 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         )
         if success:
             self.total_generated_samples += 1
+            self.total_generated_trajectories += len(rollout_sample.full_batch)
         else:
             self.dropped_stale_samples += 1
         self.processed_sample_count += 1
+
+    @staticmethod
+    def _trajectory_versions(batch: DataProto) -> list[int]:
+        """Collect observed rollout-server versions, ignoring missing metadata."""
+        versions = []
+        for key in ("min_global_steps", "max_global_steps"):
+            values = batch.non_tensor_batch.get(key)
+            if values is None:
+                continue
+            for value in np.asarray(values, dtype=object).reshape(-1):
+                if value is None:
+                    continue
+                try:
+                    versions.append(int(value))
+                except (TypeError, ValueError, OverflowError):
+                    continue
+        return versions
+
+    @classmethod
+    def _annotate_adaptive_round_versions(cls, batch: DataProto) -> None:
+        versions = cls._trajectory_versions(batch)
+        round_min = min(versions) if versions else -1
+        round_max = max(versions) if versions else -1
+        batch.non_tensor_batch["round_min_version"] = np.full(len(batch), round_min, dtype=np.int64)
+        batch.non_tensor_batch["round_max_version"] = np.full(len(batch), round_max, dtype=np.int64)
+
+    @classmethod
+    def _annotate_adaptive_group_versions(
+        cls,
+        batch: DataProto,
+        *,
+        group_start_version: int,
+        completed_rounds: int,
+        success_round: int | None,
+    ) -> None:
+        versions = cls._trajectory_versions(batch)
+        group_end_version = max(versions) if versions else group_start_version
+        batch.non_tensor_batch["group_start_version"] = np.full(len(batch), group_start_version, dtype=np.int64)
+        batch.non_tensor_batch["group_end_version"] = np.full(len(batch), group_end_version, dtype=np.int64)
+        batch.non_tensor_batch["total_completed_rounds"] = np.full(len(batch), completed_rounds, dtype=np.int32)
+        batch.non_tensor_batch["success_round"] = np.full(
+            len(batch), success_round if success_round is not None else -1, dtype=np.int32
+        )
 
     async def _streaming_generation_main(self):
         """The main entry method for stream processing"""
@@ -1221,6 +1505,9 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
     async def _should_pause_generation(self) -> bool:
         """Determine whether the build should be paused"""
+        if self.speculative_prompt_concurrency_enabled and not self.acceptance_window_open:
+            return True
+
         queue_stats = await self.message_queue_client.get_statistics()
         queue_size = queue_stats["queue_size"]
 
@@ -1245,25 +1532,76 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
     async def get_statistics(self) -> dict:
         queue_stats = await self.message_queue_client.get_statistics()
+        acceptance_credits_remaining = None
+        if self.max_required_samples is not None:
+            acceptance_credits_remaining = max(0, self.max_required_samples - self.staleness_samples)
+        estimated_inflight_trajectories_per_replica = 0.0
+        if self.num_rollout_replicas:
+            estimated_inflight_trajectories_per_replica = (
+                len(self.active_tasks) * self.n_per_round / self.num_rollout_replicas
+            )
 
         stats = {
             # monitor stats
             "monitor/active_tasks_size": len(self.active_tasks),
             "monitor/queue/pending_queue_size": self.pending_queue.qsize(),
             "monitor/queue/mq_queue_size": queue_stats["queue_size"],
+            "monitor/acceptance_credits_remaining": acceptance_credits_remaining,
+            "monitor/estimated_inflight_trajectories_per_replica": (
+                estimated_inflight_trajectories_per_replica
+            ),
             # counting stats
             "count/total_generated_samples": self.total_generated_samples,
             "count/staleness_samples": self.staleness_samples,
             "count/dropped_stale_samples": self.dropped_stale_samples,
             "count/filtered_group_samples": self.filtered_group_samples,
             "count/filtered_group_trajectories": self.filtered_group_trajectories,
+            "count/total_generated_trajectories": self.total_generated_trajectories,
+            "adaptive/count/rounds_attempted": self.adaptive_rounds_attempted,
+            "adaptive/count/trajectories_attempted": self.adaptive_trajectories_attempted,
+            "adaptive/count/successful_groups": self.adaptive_successful_groups,
+            "adaptive/count/version_boundary_drops": self.adaptive_version_boundary_drops,
+            "adaptive/count/max_round_drops": self.adaptive_max_round_drops,
+            "adaptive/count/filter_drops": self.adaptive_filter_drops,
+            "adaptive/count/discarded_trajectories": self.adaptive_discarded_trajectories,
+            "adaptive/count/discarded_tokens": self.adaptive_discarded_tokens,
+            "adaptive/count/speculative_budget_drops": self.adaptive_speculative_budget_drops,
+            "adaptive/count/speculative_version_drops": self.adaptive_speculative_version_drops,
+            "adaptive/count/speculative_queue_drops": self.adaptive_speculative_queue_drops,
+            "adaptive/count/speculative_discarded_trajectories": (
+                self.adaptive_speculative_discarded_trajectories
+            ),
+            "adaptive/count/speculative_discarded_tokens": self.adaptive_speculative_discarded_tokens,
             # static stats
             "static/max_required_samples": self.max_required_samples,
             "static/required_samples": self.required_samples,
             "static/staleness_threshold": self.staleness_threshold,
             "static/max_queue_size": self.max_queue_size,
             "static/max_concurrent_samples": self.max_concurrent_samples,
+            "static/speculative_prompt_concurrency_enabled": self.speculative_prompt_concurrency_enabled,
+            "static/target_inflight_trajectories_per_replica": (
+                self.target_inflight_trajectories_per_replica
+            ),
         }
+        if self.speculative_prompt_concurrency_enabled:
+            stats.update(
+                {
+                    "monitor/acceptance_window_open": self.acceptance_window_open,
+                    "count/accepted_prompt_groups_in_window": self.staleness_samples,
+                }
+            )
+        stats.update(
+            {
+                f"adaptive/success_round/{round_index}": count
+                for round_index, count in self.adaptive_success_round_counts.items()
+            }
+        )
+        stats.update(
+            {
+                f"adaptive/final_group_size/{group_size}": count
+                for group_size, count in self.adaptive_final_group_size_counts.items()
+            }
+        )
         stats.update(self._output_format_prefilter_metrics())
 
         return stats

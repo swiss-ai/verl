@@ -15,9 +15,29 @@
 import re
 from typing import Any
 
-_ANSWER_PATTERN = re.compile(
-    r"\b(?:FINAL\s+)?ANSWER(?:\s+IS)?\s*[:\-]?\s*([A-Z])\b",
-    flags=re.IGNORECASE,
+_ANSWER_MARKER = re.compile(
+    r"""
+    \b(?:
+        (?:the\s+)?(?:(?:final|correct)\s+)?answer
+        | (?:the\s+)?correct\s+(?:option|choice)
+    )
+    (?:\s+is)?\s*[:\-]?\s*
+    """,
+    flags=re.IGNORECASE | re.VERBOSE,
+)
+_WRAPPER_PREFIX = re.compile(
+    r"""
+    ^(
+        \s+
+        | [*_`~$"']+
+        | \\(?:boxed|text)\s*\{\s*
+        | \\?[\[\(\{]\s*
+    )+
+    """,
+    flags=re.IGNORECASE | re.VERBOSE,
+)
+_CHOICE_LETTER = re.compile(
+    r"(?i)^([A-Z])(?=$|[^\w])"
 )
 
 
@@ -38,26 +58,68 @@ def _completion_text(solution_str: str) -> str:
     return re.sub(r"(?:<pad>|\s)+$", "", text, flags=re.IGNORECASE).strip()
 
 
+def _choice_from_fragment(fragment: str) -> str | None:
+    """Extract a choice letter after common Markdown/LaTeX wrappers."""
+    fragment = _strip_wrapper_prefix(fragment)
+
+    match = _CHOICE_LETTER.match(fragment)
+    return match.group(1).upper() if match else None
+
+
+def _strip_wrapper_prefix(fragment: str) -> str:
+    """Remove common wrappers that precede an answer letter."""
+    for _ in range(8):
+        cleaned = _WRAPPER_PREFIX.sub("", fragment, count=1)
+        if cleaned == fragment:
+            break
+        fragment = cleaned
+    return fragment
+
+
+def _explicit_choice_candidates(text: str) -> list[tuple[int, str]]:
+    candidates = []
+    for match in _ANSWER_MARKER.finditer(text):
+        letter = _choice_from_fragment(text[match.end() :])
+        if letter is not None:
+            candidates.append((match.start(), letter))
+    return candidates
+
+
 def extract_choice_letter(solution_str: str) -> str | None:
     """Extract an answer following the MCQA prompt contract.
 
-    Prefer the last explicit ``Answer: C`` declaration so a later correction
-    wins. Also accept a bare final answer line and completions beginning with
-    an option-style answer such as ``C. option text``.
+    Prefer the last valid explicit answer declaration in the final response
+    region so a later correction wins. Common Markdown/LaTeX wrappers around
+    the answer letter are accepted. Also accept a bare final answer line and
+    completions beginning with an option-style answer such as ``C. option
+    text``.
     """
-    text = _completion_text(solution_str).upper()
+    text = _completion_text(solution_str)
 
-    explicit_answers = _ANSWER_PATTERN.findall(text)
+    # Keep old reasoning from dominating the result while allowing long final
+    # explanations and answer blocks. Invalid markers such as ``Answer:
+    # $letter`` are ignored, allowing a later valid declaration to win.
+    final_region = text[-2048:]
+    explicit_answers = _explicit_choice_candidates(final_region)
+    if not explicit_answers:
+        # Preserve compatibility with long completions whose explicit answer
+        # occurs before the final response region.
+        explicit_answers = _explicit_choice_candidates(text)
     if explicit_answers:
-        return explicit_answers[-1]
+        return explicit_answers[-1][1]
 
     final_line = text.rsplit("\n", 1)[-1]
-    bare_answer = re.fullmatch(r"\s*([A-Z])\s*[\).]?\s*", final_line)
+    bare_line = _strip_wrapper_prefix(final_line)
+    bare_answer = re.fullmatch(
+        r"([A-Z])\s*[\).]?\s*[*_`~$\\\]\}]*",
+        bare_line,
+        flags=re.IGNORECASE,
+    )
     if bare_answer:
-        return bare_answer.group(1)
+        return bare_answer.group(1).upper()
 
     option_start = re.match(r"^\s*([A-Z])\s*[\).:\-]\s+\S", text)
-    return option_start.group(1) if option_start else None
+    return option_start.group(1).upper() if option_start else None
 
 
 def compute_score(

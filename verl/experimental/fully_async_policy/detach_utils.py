@@ -101,6 +101,80 @@ def validate_inverse_batch(rollout_config) -> None:
         )
 
 
+def adaptive_group_size_enabled(config) -> bool:
+    adaptive_config = config.actor_rollout_ref.rollout.get("adaptive_group_size", {})
+    return bool(adaptive_config.get("enabled", False))
+
+
+def speculative_prompt_concurrency_enabled(config) -> bool:
+    adaptive_config = config.actor_rollout_ref.rollout.get("adaptive_group_size", {})
+    speculative_config = adaptive_config.get("speculative_prompt_concurrency", {})
+    return bool(speculative_config.get("enabled", False))
+
+
+def validate_adaptive_group_size_config(config) -> None:
+    """Validate the deliberately narrow first fully-async adaptive implementation."""
+    adaptive_config = config.actor_rollout_ref.rollout.get("adaptive_group_size", {})
+    speculative_config = adaptive_config.get("speculative_prompt_concurrency", {})
+    speculative_enabled = bool(speculative_config.get("enabled", False))
+
+    if speculative_enabled and not adaptive_group_size_enabled(config):
+        raise ValueError("speculative_prompt_concurrency requires adaptive_group_size.enabled=True")
+    if not adaptive_group_size_enabled(config):
+        return
+
+    max_num_rounds = int(adaptive_config.max_num_rounds)
+    if max_num_rounds < 1:
+        raise ValueError(
+            "actor_rollout_ref.rollout.adaptive_group_size.max_num_rounds must be >= 1, "
+            f"got {max_num_rounds}"
+        )
+
+    filter_config = config.algorithm.get("filter_groups", None)
+    if filter_config is None or not filter_config.enable:
+        raise ValueError("adaptive_group_size requires algorithm.filter_groups.enable=True")
+    if filter_config.metric not in {"acc", "task_success"}:
+        raise ValueError(
+            "adaptive_group_size supports filter_groups.metric in {'acc', 'task_success'}, "
+            f"got {filter_config.metric!r}"
+        )
+
+    if str(config.algorithm.adv_estimator) != "rloo_vectorized":
+        raise ValueError("adaptive_group_size currently requires algorithm.adv_estimator=rloo_vectorized")
+    rollout_correction = config.algorithm.get("rollout_correction", None)
+    if rollout_correction is None or not rollout_correction.get("bypass_mode", False):
+        raise ValueError("adaptive_group_size currently requires algorithm.rollout_correction.bypass_mode=True")
+    if not config.async_training.get("use_rollout_log_probs", False):
+        raise ValueError("adaptive_group_size currently requires async_training.use_rollout_log_probs=True")
+    if config.actor_rollout_ref.actor.get("use_prefix_grouper", False):
+        raise ValueError("adaptive_group_size currently does not support actor.use_prefix_grouper=True")
+
+    from verl.trainer.distillation.losses import is_distillation_enabled
+    from verl.trainer.ppo.utils import need_critic, need_reference_policy
+
+    if need_critic(config):
+        raise ValueError("adaptive_group_size currently does not support critic training")
+    if need_reference_policy(config):
+        raise ValueError("adaptive_group_size currently does not support a reference policy")
+    if is_distillation_enabled(config.get("distillation")):
+        raise ValueError("adaptive_group_size currently does not support distillation")
+
+    if speculative_enabled:
+        target = int(speculative_config.get("target_inflight_trajectories_per_replica", 40))
+        if target < 1:
+            raise ValueError(
+                "adaptive_group_size.speculative_prompt_concurrency."
+                f"target_inflight_trajectories_per_replica must be >= 1, got {target}"
+            )
+        max_num_seqs = int(config.actor_rollout_ref.rollout.max_num_seqs)
+        if target > max_num_seqs:
+            raise ValueError(
+                "adaptive_group_size.speculative_prompt_concurrency."
+                "target_inflight_trajectories_per_replica must be <= rollout.max_num_seqs, "
+                f"got target={target}, max_num_seqs={max_num_seqs}"
+            )
+
+
 def validate_async_filter_groups_config(config, logger=None):
     """Validate filter_groups settings in config."""
     filter_groups_config = config.algorithm.get("filter_groups", None)
@@ -145,8 +219,8 @@ def validate_async_filter_groups_config(config, logger=None):
         )
 
 
-def should_keep_async_filter_group(batch: DataProto, filter_groups_config) -> bool:
-    """Return whether a fully async rollout group should be enqueued for training."""
+def get_async_filter_metric_values(batch: DataProto, filter_groups_config) -> np.ndarray:
+    """Extract one scalar filtering metric per trajectory."""
     metric_name = filter_groups_config.metric
     if metric_name in {"seq_reward", "seq_final_reward"}:
         if batch.batch is None or "rm_scores" not in batch.batch.keys():
@@ -165,6 +239,24 @@ def should_keep_async_filter_group(batch: DataProto, filter_groups_config) -> bo
     if isinstance(metric_values, torch.Tensor):
         metric_values = metric_values.detach().cpu().numpy()
     metric_values = np.asarray(metric_values, dtype=np.float64).reshape(-1)
+    if len(metric_values) != len(batch):
+        raise ValueError(
+            f"algorithm.filter_groups.metric={metric_name!r} produced {len(metric_values)} values "
+            f"for {len(batch)} trajectories"
+        )
+    return metric_values
+
+
+def adaptive_group_has_success(batch: DataProto, filter_groups_config) -> bool:
+    """Return whether a completed logical sampling round contains a fully correct trajectory."""
+    metric_values = get_async_filter_metric_values(batch, filter_groups_config)
+    correct_threshold = 0.8
+    return bool(np.any(np.isfinite(metric_values) & (metric_values >= correct_threshold)))
+
+
+def should_keep_async_filter_group(batch: DataProto, filter_groups_config) -> bool:
+    """Return whether a fully async rollout group should be enqueued for training."""
+    metric_values = get_async_filter_metric_values(batch, filter_groups_config)
     return bool(
         np.std(metric_values) > 0
         and filter_groups_config.min < np.mean(metric_values) < filter_groups_config.max
@@ -315,6 +407,82 @@ def assemble_batch_from_rollout_samples(
     print(f"[BatchUtils] Batch assembly completed in {time.time() - start_time:.2f}s")
 
     return final_batch
+
+
+def partition_adaptive_prompt_minibatches(
+    batch: DataProto,
+    *,
+    prompts_per_minibatch: int,
+    num_minibatches: int,
+    seed: int,
+) -> list[DataProto]:
+    """Partition a variable-trajectory batch by prompt UID, never splitting a group."""
+    if "uid" not in batch.non_tensor_batch:
+        raise ValueError("adaptive prompt minibatching requires a 'uid' field")
+
+    uids = np.asarray(batch.non_tensor_batch["uid"], dtype=object).reshape(-1)
+    unique_uids = list(dict.fromkeys(uids.tolist()))
+    expected_prompts = prompts_per_minibatch * num_minibatches
+    if len(unique_uids) != expected_prompts:
+        raise ValueError(
+            "adaptive prompt minibatching requires exactly "
+            f"{expected_prompts} prompt UIDs, got {len(unique_uids)}"
+        )
+
+    rng = np.random.default_rng(seed)
+    rng.shuffle(unique_uids)
+    minibatches = []
+    for start in range(0, expected_prompts, prompts_per_minibatch):
+        selected_uids = set(unique_uids[start : start + prompts_per_minibatch])
+        selected_indices = np.flatnonzero(np.fromiter((uid in selected_uids for uid in uids), dtype=bool))
+        minibatch = batch.select_idxs(selected_indices)
+        minibatch.meta_info = dict(batch.meta_info)
+        minibatches.append(minibatch)
+    return minibatches
+
+
+def pad_adaptive_minibatch(batch: DataProto, *, batch_multiple: int) -> tuple[DataProto, int]:
+    """Append duplicated zero-loss rows until a prompt minibatch is DP-divisible."""
+    if batch_multiple < 1:
+        raise ValueError(f"batch_multiple must be >= 1, got {batch_multiple}")
+    padding_size = (-len(batch)) % batch_multiple
+
+    batch.non_tensor_batch["is_padding"] = np.zeros(len(batch), dtype=bool)
+    if padding_size == 0:
+        return batch, 0
+
+    padding = batch.select_idxs([0]).repeat(padding_size)
+    zero_tensor_keys = {
+        "response_mask",
+        "loss_mask",
+        "advantages",
+        "returns",
+        "rewards",
+        "token_level_rewards",
+        "token_level_scores",
+        "rm_scores",
+        "rollout_log_probs",
+        "old_log_probs",
+        "importance_weights",
+        "importance_sampling_ratio",
+        "rollout_is_weights",
+    }
+    if padding.batch is not None:
+        for key in zero_tensor_keys.intersection(padding.batch.keys()):
+            padding.batch[key] = torch.zeros_like(padding.batch[key])
+
+    padding_uid = "__adaptive_padding__"
+    padding.non_tensor_batch["uid"] = np.full(padding_size, padding_uid, dtype=object)
+    padding.non_tensor_batch["is_padding"] = np.ones(padding_size, dtype=bool)
+    # ``select_idxs`` and ``repeat`` retain the source metadata.  The padding
+    # rows do not own metadata, and passing the inherited copy to concat makes
+    # DataProto compare values such as trajectory_param_versions with scalar
+    # equality.  Array-valued metadata then raises an ambiguous-truth error.
+    # Keep the real minibatch metadata as the single source of truth instead.
+    padding.meta_info = {}
+    padded = DataProto.concat([batch, padding])
+    padded.meta_info = dict(batch.meta_info)
+    return padded, padding_size
 
 
 class MetricsAggregator:

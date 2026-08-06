@@ -94,8 +94,10 @@ def get_generation_request_id(rollout_config, kwargs: dict[str, Any]) -> str:
     """
     rollout_n = int(rollout_config.n)
     n_per_round = int(getattr(rollout_config, "n_per_round", rollout_n))
+    adaptive_config = getattr(rollout_config, "adaptive_group_size", None)
+    adaptive_enabled = bool(adaptive_config and adaptive_config.get("enabled", False))
     uid = kwargs.get("uid")
-    if uid is not None and n_per_round < rollout_n:
+    if uid is not None and (n_per_round < rollout_n or adaptive_enabled):
         return str(uid)
     return uuid4().hex
 

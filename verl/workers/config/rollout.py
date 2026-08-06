@@ -30,6 +30,8 @@ __all__ = [
     "TraceConfig",
     "ServerConfig",
     "PrometheusConfig",
+    "SpeculativePromptConcurrencyConfig",
+    "AdaptiveGroupSizeConfig",
     "RolloutConfig",
     "CheckpointEngineConfig",
 ]
@@ -42,6 +44,25 @@ class SamplingConfig(BaseConfig):
     top_p: float = 1.0
     do_sample: bool = True
     n: int = 1
+
+
+@dataclass
+class SpeculativePromptConcurrencyConfig(BaseConfig):
+    """Generation occupancy independent from the accepted-data staleness budget."""
+
+    enabled: bool = False
+    target_inflight_trajectories_per_replica: int = 40
+
+
+@dataclass
+class AdaptiveGroupSizeConfig(BaseConfig):
+    """Adaptive fully-async sampling configuration."""
+
+    enabled: bool = False
+    max_num_rounds: int = 1
+    speculative_prompt_concurrency: SpeculativePromptConcurrencyConfig = field(
+        default_factory=SpeculativePromptConcurrencyConfig
+    )
 
 
 @dataclass
@@ -163,6 +184,7 @@ class RolloutConfig(BaseConfig):
     do_sample: bool = True
     n: int = 1
     n_per_round: int = 1
+    adaptive_group_size: AdaptiveGroupSizeConfig = field(default_factory=AdaptiveGroupSizeConfig)
     repetition_penalty: float = 1.0
 
     # Early termination threshold for multi-turn rollout in sglang.

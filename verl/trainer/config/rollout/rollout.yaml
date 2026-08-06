@@ -121,6 +121,25 @@ n: 1
 # Number of responses generated per sequential inverse-batch round.
 n_per_round: ${.n}
 
+# Fully-async adaptive group sizing. Each adaptive round still contains `n`
+# responses and may be split into inverse-batch chunks of `n_per_round`.
+adaptive_group_size:
+
+  # Whether to enable adaptive sampling for fully-async prompt groups.
+  enabled: False
+
+  # Maximum number of logical `n`-trajectory sampling rounds per prompt.
+  max_num_rounds: 1
+
+  # Optionally decouple active generation occupancy from accepted-data staleness.
+  speculative_prompt_concurrency:
+
+    # When disabled, retain the existing coupled fully-async behavior.
+    enabled: False
+
+    # Desired number of trajectories generating concurrently on each rollout replica.
+    target_inflight_trajectories_per_replica: 40
+
 # The over_sample_rate parameter controls the early termination threshold for training rollouts,
 # where the system will abort remaining requests when (1 - over_sample_rate) * total_requests completions are reached.
 over_sample_rate: 0

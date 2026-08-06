@@ -24,17 +24,63 @@ ENVIRONMENT_PATH="${ENVIRONMENT_PATH:-/capstor/store/cscs/swissai/infra01/reason
 PY_DEPS_ROOT="${PY_DEPS_ROOT:-}"
 PY_DEPS_DIR="${PY_DEPS_DIR:-}"
 
-# MODEL_NAME_OR_PATH="/iopsstor/scratch/cscs/msantelmo/checkpoints/Apertus-8B-Instruct-2509"
-# MODEL_NAME_OR_PATH="/iopsstor/scratch/cscs/msantelmo/checkpoints/sft_0/Apertus-8B-2509__sft_0_lr5e-5-ratio03__global_step_11776"
-# TOKENIZER_NAME_OR_PATH="/iopsstor/scratch/cscs/msantelmo/tokenizers/apertus_2509_text_only_aligned_v3"
+# Qwen2.5 prefilled
+# TOKENIZER_NAME_OR_PATH="${TOKENIZER_NAME_OR_PATH:-/iopsstor/scratch/cscs/msantelmo/tokenizers/qwen2.5-7b-instruct-thinking-prefilled}"
+# MODEL_NAME_OR_PATH=/users/msantelmo/scratch/SSFT/outputs/sft_1/qwen2_5_prefilled__sft1__Qwen2.5-7B__sft0+self-cap-filter-fill-Qwen2.5-7B__sft_0_lr1e-5-ratio03__global_step_8192__sp2-lr5e-6-bs512-warmuplinear-lr_warmup_steps_ratio0.03__20260728-120647/global_step_12444/huggingface
+# MODEL_TAG=Qwen2.5-7B__sft1__self-cap-filter-fill__prefill-think
+# MODEL_NAME_OR_PATH=/users/msantelmo/scratch/SSFT/outputs/sft_1/qwen2_5_prefilled__sft1__Qwen2.5-7B__sft0+cap-filter-fill-Qwen2.5-7B__sft_0_lr1e-5-ratio03__global_step_8192__sp2-lr5e-6-bs512-warmuplinear-lr_warmup_steps_ratio0.03__20260729-013949/global_step_12288/huggingface
+# MODEL_TAG=Qwen2.5-7B__sft1__cap-filter-fill__prefill-length
 
-# MODEL_NAME_OR_PATH=/iopsstor/scratch/cscs/msantelmo/checkpoints/sft_0/apertus-1p5_8b_seq_len_256k_7000__sft_0_lr5e-5-ratio03__global_step_11264
-# TOKENIZER_NAME_OR_PATH=/iopsstor/scratch/cscs/msantelmo/tokenizers/apertus_emu3.5_wavtok_instruct_thinking_token_fixed
-# MODEL_TAG=apertus-1p5_8b_256k__sft0_11264
+# Qwen2.5
+TOKENIZER_NAME_OR_PATH="${TOKENIZER_NAME_OR_PATH:-/iopsstor/scratch/cscs/msantelmo/tokenizers/qwen2.5-7b-instruct-thinking}"
+# MODEL_NAME_OR_PATH=/iopsstor/scratch/cscs/msantelmo/checkpoints/sft_1/Qwen2.5-7B__sft1__teacher-baseline__lr1e-5-ratio03__global_step_12288
+# MODEL_TAG=Qwen2.5-7B__sft1__teacher-baseline_xml-think
+# MODEL_NAME_OR_PATH=/iopsstor/scratch/cscs/msantelmo/checkpoints/sft_1/Qwen2.5-7B__sft1__self-teacher-baseline__lr5e-6-ratio03__global_step_10240
+# MODEL_TAG=Qwen2.5-7B__sft1__self-teacher-baseline_xml-think-noif
 
-MODEL_NAME_OR_PATH=/iopsstor/scratch/cscs/msantelmo/checkpoints/sft_0/Qwen2.5-7B__sft_0_lr1e-5-ratio03__global_step_8192
-TOKENIZER_NAME_OR_PATH=/iopsstor/scratch/cscs/msantelmo/checkpoints/Qwen2.5-7B-Instruct
-MODEL_TAG=Qwen2.5-7B__sft_0_8192
+# MODEL_NAME_OR_PATH=/iopsstor/scratch/cscs/msantelmo/checkpoints/sft_1/Qwen2.5-7B__sft1__self-cap-filter-fill__lr5e-6-ratio03__global_step_10240
+# MODEL_TAG=Qwen2.5-7B__sft1__self-cap-filter-fill_xml-think-noif
+
+######
+MODEL_NAME_OR_PATH=/iopsstor/scratch/cscs/msantelmo/checkpoints/sft_1/Qwen2.5-7B__sft1__cap-filter-fill__lr1e-5-ratio03__global_step_10240
+MODEL_TAG=Qwen2.5-7B__sft1__cap-filter-fill__xml-think
+# MODEL_TAG=Qwen2.5-7B__sft1__cap-filter-fill__xml-think_0.5
+
+# MODEL_NAME_OR_PATH=/iopsstor/scratch/cscs/msantelmo/checkpoints/sft_1/Qwen2.5-7B__sft1__self-cap-filter-fill__lr5e-6-ratio03__global_step_10240
+# MODEL_TAG=Qwen2.5-7B__sft1__self-cap-filter-fill__xml-think
+# MODEL_TAG=Qwen2.5-7B__sft1__self-cap-filter-fill__xml-think_0.5
+
+# MODEL_NAME_OR_PATH=/iopsstor/scratch/cscs/msantelmo/checkpoints/sft_1/Qwen2.5-7B__sft1__teacher-baseline__lr1e-5-ratio03__global_step_12288
+# MODEL_TAG=Qwen2.5-7B__sft1__teacher-baseline__xml-think
+# MODEL_TAG=Qwen2.5-7B__sft1__teacher-baseline__xml-think_0.5
+
+# MODEL_NAME_OR_PATH=/iopsstor/scratch/cscs/msantelmo/checkpoints/sft_1/Qwen2.5-7B__sft1__self-teacher-baseline__lr1e-5-ratio03__global_step_10240
+# MODEL_TAG=Qwen2.5-7B__sft1__self-teacher-baseline__xml-think
+# MODEL_TAG=Qwen2.5-7B__sft1__teacher-baseline__xml-think_0.5
+
+
+#### Apertus-1.5-8B
+# TOKENIZER_NAME_OR_PATH="${TOKENIZER_NAME_OR_PATH:-/iopsstor/scratch/cscs/msantelmo/tokenizers/apertus_emu3.5_wavtok_instruct_thinking_token_non_special}"
+# THINK_PREFIX_TOKEN="${THINK_PREFIX_TOKEN:-<|inner_prefix|>}"
+# OUTPUT_FORMAT_PARSER="${OUTPUT_FORMAT_PARSER:-prefilled_inner}"
+
+# Prefilled SFT/RLVR:
+# TOKENIZER_NAME_OR_PATH=/iopsstor/scratch/cscs/msantelmo/tokenizers/apertus_emu3.5_wavtok_instruct_thinking_token_non_special_prefilled
+# THINK_PREFIX_TOKEN="<|inner_prefix|>"
+# OUTPUT_FORMAT_PARSER="prefilled_inner"
+
+# MODEL_NAME_OR_PATH=/iopsstor/scratch/cscs/msantelmo/checkpoints/sft_1/Apertus-1.5-8B__sft1__self-teacher-baseline__lr5e-5-ratio03__global_step_10240
+# MODEL_TAG=Apertus-1.5-8B__sft1__self-teacher-baseline_xml-inner-noif
+
+# MODEL_NAME_OR_PATH="${MODEL_NAME_OR_PATH:-/iopsstor/scratch/cscs/msantelmo/checkpoints/sft_1/Apertus-1.5-8B__sft1__teacher-baseline__lr5e-5-ratio03__global_step_11264}"
+# MODEL_TAG="${MODEL_TAG:-Apertus-1.5-8B__sft1__teacher-baseline_xml-inner-noif}"
+
+
+# MODEL_NAME_OR_PATH=/iopsstor/scratch/cscs/msantelmo/checkpoints/sft_1/Apertus-1.5-8B__sft1__self-cap-filter-fill__lr5e-5-ratio03__global_step_10240
+# MODEL_TAG=Apertus-1.5-8B__sft1__self-cap-filter-fill
+# MODEL_NAME_OR_PATH=/iopsstor/scratch/cscs/msantelmo/checkpoints/sft_1/Apertus-1.5-8B__sft1__cap-filter-fill__lr5e-5-ratio03__global_step_8192
+# MODEL_TAG=Apertus-1.5-8B__sft1__cap-filter-fill
+# THINK_PREFIX_TOKEN="${THINK_PREFIX_TOKEN:-<|inner_prefix|>}
 
 MULTIMODAL="${MULTIMODAL:-false}"
 
@@ -43,22 +89,22 @@ SLURM_TIME="${SLURM_TIME:-12:00:00}"
 TRAIN_NNODES="${TRAIN_NNODES:-16}"
 ROLLOUT_NNODES="${ROLLOUT_NNODES:-16}"
 NNODES="${NNODES:-$((TRAIN_NNODES + ROLLOUT_NNODES))}"
-TRAINING_DATA_DIR="/iopsstor/scratch/cscs/msantelmo/SSFT/data/rl"
+TRAINING_DATA_DIR="/iopsstor/scratch/cscs/msantelmo/SSFT/data/rl_1"
 ENABLE_THINKING="true"
 FORCE_THINKING="false"
 THINK_PREFIX_TOKEN="${THINK_PREFIX_TOKEN:-<think>}"
-# THINK_PREFIX_TOKEN="${THINK_PREFIX_TOKEN:-<|inner_prefix|>}"
+# THINK_PREFIX_TOKEN="${THINK_PREFIX_TOKEN:-<|inner_prefix|>}"  FIXME: add this for apertus!!!!
 SEED="${SEED:-85}"
-ROLLOUT_N="${ROLLOUT_N:-8}"
+ROLLOUT_N=4 # "${ROLLOUT_N:-8}"
 N_PER_ROUND="${N_PER_ROUND:-${ROLLOUT_N}}"
-ADAPTIVE_GROUP_SIZE="${ADAPTIVE_GROUP_SIZE:-false}"
-ADAPTIVE_MAX_NUM_ROUNDS="${ADAPTIVE_MAX_NUM_ROUNDS:-1}"
-ADAPTIVE_SPECULATIVE_PROMPT_CONCURRENCY="${ADAPTIVE_SPECULATIVE_PROMPT_CONCURRENCY:-false}"
+ADAPTIVE_GROUP_SIZE=true  #"${ADAPTIVE_GROUP_SIZE:-false}"
+ADAPTIVE_MAX_NUM_ROUNDS=8 # "${ADAPTIVE_MAX_NUM_ROUNDS:-1}"
+ADAPTIVE_SPECULATIVE_PROMPT_CONCURRENCY=true # "${ADAPTIVE_SPECULATIVE_PROMPT_CONCURRENCY:-false}"
 ADAPTIVE_TARGET_INFLIGHT_TRAJECTORIES_PER_REPLICA="${ADAPTIVE_TARGET_INFLIGHT_TRAJECTORIES_PER_REPLICA:-40}"
 USE_GROUP_FILTERING="${USE_GROUP_FILTERING:-true}"
-JOB_NAME=""
+JOB_NAME="test-async-ada-qwen-4x8"
 RUN_NAME=""
-VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-true}"
+VAL_BEFORE_TRAIN=false # "${VAL_BEFORE_TRAIN:-true}"
 
 WANDB_ENTITY="${WANDB_ENTITY:-apertus}"
 WANDB_BACKGROUND_SYNC="${WANDB_BACKGROUND_SYNC:-false}"
@@ -78,13 +124,13 @@ ASYNC_TRIGGER_PARAMETER_SYNC_STEP="${ASYNC_TRIGGER_PARAMETER_SYNC_STEP:-}"
 ASYNC_STALENESS_THRESHOLD="${ASYNC_STALENESS_THRESHOLD:-}"
 ASYNC_STEADY_WARMUP_STEPS="${ASYNC_STEADY_WARMUP_STEPS:-}"
 
-OUTPUT_FORMAT=false
-OUTPUT_FORMAT_PARSER="${OUTPUT_FORMAT_PARSER:-xml_think}"
+OUTPUT_FORMAT=${OUTPUT_FORMAT:-false}
+OUTPUT_FORMAT_PARSER="xml_think"
 OUTPUT_FORMAT_PROMPT_ROLE="${OUTPUT_FORMAT_PROMPT_ROLE:-system}"
 TASK_SUCCESS_THRESHOLD="${TASK_SUCCESS_THRESHOLD:-0.7}"
-FORMAT_PENALTY=0.2 # "${FORMAT_PENALTY:-0.1}"
-FORMAT_BONUS=0.05 # "${FORMAT_BONUS:-0.05}"
-ARCHIVE_ALL_ROLLOUTS="true"
+FORMAT_PENALTY=0.0
+FORMAT_BONUS=0.0
+ARCHIVE_ALL_ROLLOUTS="false"
 DEGENERATION_EARLY_STOP="true"
 DEGENERATION_EARLY_STOP_STRIDE="${DEGENERATION_EARLY_STOP_STRIDE:-128}"
 
@@ -145,7 +191,7 @@ resolve_run_name_and_dir() {
   fi
 
   if [[ -z "${JOB_NAME}" ]]; then
-    JOB_NAME="async__${CONFIG_NAME}_${group_filtering_tag}${MODEL_TAG}_${TRAIN_NNODES}tn-${ROLLOUT_NNODES}rn__s${SEED}${thinking_tag}"
+    JOB_NAME="rl-1__${CONFIG_NAME}_${group_filtering_tag}${MODEL_TAG}_${TRAIN_NNODES}tn-${ROLLOUT_NNODES}rn__s${SEED}${thinking_tag}"
   fi
   JOB_NAME="$(sanitize_job_name "${JOB_NAME}")"
   if [[ -n "${RUN_NAME}" ]]; then

@@ -28,7 +28,12 @@ from verl import DataProto
 from verl.checkpoint_engine import CheckpointEngineManager
 from verl.experimental.fully_async_policy.detach_utils import (
     MetricsAggregator,
+    adaptive_group_size_enabled,
     assemble_batch_from_rollout_samples,
+    pad_adaptive_minibatch,
+    partition_adaptive_prompt_minibatches,
+    speculative_prompt_concurrency_enabled,
+    validate_adaptive_group_size_config,
 )
 from verl.experimental.fully_async_policy.message_queue import MessageQueueClient
 from verl.experimental.fully_async_policy.scaling_metrics import (
@@ -46,6 +51,7 @@ from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
+from verl.utils.metric import reduce_metrics
 from verl.utils.output_format import output_format_enabled
 from verl.utils.tracking import Tracking
 
@@ -79,6 +85,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         # Store the tokenizer for text processing
         self.tokenizer = tokenizer
         self.config = config
+        validate_adaptive_group_size_config(self.config)
 
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
         assert not self.hybrid_engine
@@ -340,7 +347,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
 
         queue_samples = [ray.cloudpickle.loads(x) for x in queue_samples]
         # Assemble batch - now working directly with RolloutSample objects
-        if self.config.trainer.balance_batch:
+        if self.config.trainer.balance_batch and not adaptive_group_size_enabled(self.config):
             batch = assemble_batch_from_rollout_samples(queue_samples, self.tokenizer, self.config, self._balance_batch)
         else:
             batch = assemble_batch_from_rollout_samples(queue_samples, self.tokenizer, self.config, None)
@@ -527,6 +534,53 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             self.current_param_version += 1
             self.local_trigger_step = 1
 
+    def _fit_update_actor(self, batch: DataProto) -> DataProto:
+        """Update adaptive batches in fixed prompt-group minibatches."""
+        if not adaptive_group_size_enabled(self.config):
+            return super()._fit_update_actor(batch)
+        if self.config.trainer.critic_warmup > self.global_steps:
+            return batch
+
+        prompts_per_minibatch = int(self.config.actor_rollout_ref.actor.ppo_mini_batch_size)
+        seed = int(self.config.actor_rollout_ref.actor.get("data_loader_seed", 0) or 0) + int(
+            self.global_steps
+        )
+        prompt_minibatches = partition_adaptive_prompt_minibatches(
+            batch,
+            prompts_per_minibatch=prompts_per_minibatch,
+            num_minibatches=int(self.require_batches),
+            seed=seed,
+        )
+        actor_dp_size = self._get_dp_size(self.actor_rollout_wg, "actor")
+        merged_actor_metrics: dict[str, list[Any]] = {}
+        total_padding = 0
+
+        with marked_timer("update_actor", self.timing_raw, color="red"):
+            for prompt_minibatch in prompt_minibatches:
+                padded_minibatch, padding_size = pad_adaptive_minibatch(
+                    prompt_minibatch, batch_multiple=actor_dp_size
+                )
+                total_padding += padding_size
+                if self.config.trainer.balance_batch:
+                    self._balance_batch(
+                        padded_minibatch,
+                        metrics=self.metrics,
+                        logging_prefix="adaptive_minibatch_seqlen",
+                    )
+                padded_minibatch.meta_info["ppo_global_mini_batch_size"] = len(padded_minibatch)
+                actor_output = self._update_actor(padded_minibatch)
+                for key, values in actor_output.meta_info["metrics"].items():
+                    if isinstance(values, list):
+                        merged_actor_metrics.setdefault(key, []).extend(values)
+                    else:
+                        merged_actor_metrics.setdefault(key, []).append(values)
+
+        self.metrics.update(reduce_metrics(merged_actor_metrics))
+        self.metrics["adaptive/trainer/actor_calls"] = len(prompt_minibatches)
+        self.metrics["adaptive/trainer/real_trajectories"] = len(batch)
+        self.metrics["adaptive/trainer/padding_trajectories"] = total_padding
+        return batch
+
     async def _fit_update_weights(self):
         if self.local_trigger_step != 1:
             return
@@ -535,6 +589,13 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         last_profiler_step = self.current_param_version
         if steps is not None and last_profiler_step in steps:
             await asyncio.wrap_future(self.rollouter._stop_profiling.remote().future())
+
+        if speculative_prompt_concurrency_enabled(self.config):
+            await asyncio.wrap_future(
+                self.rollouter.begin_parameter_sync.remote(
+                    next_param_version=self.current_param_version
+                ).future()
+            )
 
         with marked_timer("timing_s/param_sync", self.timing_raw):
             await self.checkpoint_manager.update_weights(global_steps=self.current_param_version)
@@ -550,7 +611,9 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             await asyncio.wrap_future(self.rollouter._start_profiling.remote().future())
 
         # Reset staleness in rollouter
-        timing_raw = await asyncio.wrap_future(self.rollouter.reset_staleness.remote().future())
+        timing_raw = await asyncio.wrap_future(
+            self.rollouter.reset_staleness.remote(current_param_version=self.current_param_version).future()
+        )
         self.pending_rollouter_timing = timing_raw
 
     def _log_pending_version_metrics(self):
@@ -862,14 +925,50 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         """
         if hasattr(batch, "meta_info") and batch.meta_info:
             trajectory_param_versions = batch.meta_info["trajectory_param_versions"]
-            stale_traj_count = sum(1 for v in trajectory_param_versions if self.current_param_version - v >= 1)
+            version_ages = np.asarray(
+                [max(0, self.current_param_version - int(v)) for v in trajectory_param_versions],
+                dtype=np.int64,
+            )
+            stale_mask = version_ages >= 1
+            stale_traj_count = int(stale_mask.sum())
             self.stale_trajectory_processed += stale_traj_count
+            token_counts = batch.batch["attention_mask"].reshape(len(batch), -1).sum(dim=-1).cpu().numpy()
             metrics.update(
                 {
                     "fully_async/count/stale_trajectory_processed": self.stale_trajectory_processed,
                     "fully_async/count/current_param_version": self.current_param_version,
+                    "fully_async/staleness/trajectory_count": stale_traj_count,
+                    "fully_async/staleness/trajectory_ratio": float(stale_mask.mean()),
+                    "fully_async/staleness/trajectory_version_age_mean": float(version_ages.mean()),
+                    "fully_async/staleness/trajectory_version_age_max": int(version_ages.max()),
+                    "fully_async/staleness/token_count": int(token_counts[stale_mask].sum()),
+                    "fully_async/staleness/token_ratio": float(
+                        token_counts[stale_mask].sum() / max(token_counts.sum(), 1)
+                    ),
                 }
             )
+            if "total_completed_rounds" in batch.non_tensor_batch:
+                uids = np.asarray(batch.non_tensor_batch["uid"], dtype=object)
+                unique_uids, first_indices, group_sizes = np.unique(
+                    uids, return_index=True, return_counts=True
+                )
+                completed_rounds = np.asarray(
+                    batch.non_tensor_batch["total_completed_rounds"], dtype=np.float64
+                )
+                success_rounds = np.asarray(batch.non_tensor_batch["success_round"], dtype=np.float64)
+                prompt_completed_rounds = completed_rounds[first_indices]
+                prompt_success_rounds = success_rounds[first_indices]
+                metrics.update(
+                    {
+                        "adaptive/trainer/prompt_groups": len(unique_uids),
+                        "adaptive/trainer/final_group_size_mean": float(group_sizes.mean()),
+                        "adaptive/trainer/final_group_size_min": int(group_sizes.min()),
+                        "adaptive/trainer/final_group_size_max": int(group_sizes.max()),
+                        "adaptive/trainer/prompt_attempted_rounds_mean": float(prompt_completed_rounds.mean()),
+                        "adaptive/trainer/prompt_success_round_mean": float(prompt_success_rounds.mean()),
+                        "adaptive/trainer/trajectory_attempted_rounds_mean": float(completed_rounds.mean()),
+                    }
+                )
             for key, value in batch.meta_info.items():
                 if key.startswith("fully_async") or key.startswith("timing_s") or key.startswith("rollout/"):
                     metrics[key] = value
