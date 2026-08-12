@@ -291,6 +291,7 @@ class MegatronEngine(BaseEngine):
         print(f"module: {len(module)}")
 
         if self.engine_config.use_dist_checkpointing:
+            print("loading using megatron distributed checkpointing")
             load_mcore_dist_weights(
                 module, self.engine_config.dist_checkpointing_path, is_value_model=self.is_value_model
             )

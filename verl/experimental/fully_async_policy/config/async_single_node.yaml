@@ -1,48 +1,18 @@
 hydra:
   searchpath:
-    - pkg://verl.trainer.config
+    - pkg://verl/trainer/config
 
 defaults:
-  - ppo_trainer
+  - ppo_megatron_trainer
   - override model_engine: megatron
   - _self_
 
-algorithm:
-  adv_estimator: rloo_vectorized
-  norm_adv_by_std_in_grpo: false
-  filter_groups:
-    enable: true
-    metric: acc
-    min: 0.0
-    max: 1.0
-
-  rollout_correction:
-    bypass_mode: true
-
-data:
-  apply_chat_template_kwargs:
-    enable_thinking: false
-  train_files: ./data/apertus_demo_rl/train.parquet
-  val_files: ./data/apertus_demo_rl/val.parquet
-  train_batch_size: 0
-  gen_batch_size: 1
-  max_prompt_length: 2048
-  max_response_length: 4096
-  truncation: left
-
 async_training:
-  staleness_threshold: 0.2
-  trigger_parameter_sync_step: 1
-  require_batches: 2
-  steady_warmup_steps: 5
-  partial_rollout: true
-  use_rollout_log_probs: true
-  compute_prox_log_prob: false
-  use_trainer_do_validate: false
-  checkpoint_engine:
-    enable: false
-    device_buffer_size_M: 4096
-    overlap_broadcast_and_consume: false
+  staleness_threshold: 0.1
+  trigger_parameter_sync_step: 4
+  require_batches: 1
+  partial_rollout: True
+  use_trainer_do_validate: False
 
 rollout:
   nnodes: 1
@@ -50,27 +20,25 @@ rollout:
   total_rollout_steps: 180000
   total_epochs: ${trainer.total_epochs}
 
-actor_rollout_ref:
-  hybrid_engine: false
-  nccl_timeout: 1800
-  checkpoint_engine: ${oc.select:async_training.checkpoint_engine,null}
+data:
+  apply_chat_template_kwargs:
+    enable_thinking: false
+  train_batch_size: 0
+  gen_batch_size: 1
+  max_prompt_length: 2048
+  max_response_length: 1024
+  truncation: left
 
-  model:
-    path: swiss-ai/Apertus-8B-Instruct-2509
-    tokenizer_path: null
-    use_remove_padding: true
-    enable_gradient_checkpointing: true
-    use_shm: false
-    override_config:
-      attn_implementation: flash_attention_3
+actor_rollout_ref:
+  hybrid_engine: False
 
   actor:
     use_rollout_log_probs: ${oc.select:async_training.use_rollout_log_probs,true}
-    ppo_mini_batch_size: 128
-    ppo_micro_batch_size: 32
+    ppo_mini_batch_size: 8
     use_dynamic_bsz: true
-    ppo_max_token_len_per_gpu: 32768
+    ppo_max_token_len_per_gpu: 3072
     calculate_entropy: true
+    ppo_micro_batch_size: 4
 
     optim:
       lr_decay_steps: 1
@@ -81,16 +49,16 @@ actor_rollout_ref:
       lr_decay_style: constant
 
     megatron:
-      tensor_model_parallel_size: 4
-      pipeline_model_parallel_size: 2
+      tensor_model_parallel_size: 2
+      pipeline_model_parallel_size: 1
       context_parallel_size: 1
       sequence_parallel: false
       use_distributed_optimizer: true
       use_mbridge: true
-      vanilla_mbridge: true
+      vanilla_mbridge: false
       param_offload: false
-      grad_offload: true
-      optimizer_offload: true
+      grad_offload: false
+      optimizer_offload: false
       override_transformer_config:
         recompute_granularity: full
         recompute_method: uniform
@@ -105,14 +73,14 @@ actor_rollout_ref:
     shuffle: true
 
   rollout:
-    nnodes: ${rollout.nnodes}
-    n_gpus_per_node: ${rollout.n_gpus_per_node}
+    nnodes: 1
+    n_gpus_per_node: 2
     log_prob_use_dynamic_bsz: true
-    log_prob_max_token_len_per_gpu: 32768
-    max_num_batched_tokens: 8192
-    max_num_seqs: 256
+    log_prob_max_token_len_per_gpu: 3072
+    max_num_batched_tokens: 3072
+    max_num_seqs: 16
     gpu_memory_utilization: 0.7
-    tensor_model_parallel_size: 4
+    tensor_model_parallel_size: 2
     pipeline_model_parallel_size: 1
     n: 8
     name: vllm
@@ -130,19 +98,39 @@ actor_rollout_ref:
       n: 4
       top_p: 0.95
       temperature: 0.7
+ 
+  model:
+    path: /capstor/store/cscs/swissai/infra01/models/Alignment/constitutional_ai/final_8b/Apertus-1.5-8B-SFT-RL-DPO-SDPO-Low-Less-Refuse-Feedback
+    tokenizer_path: /capstor/store/cscs/swissai/infra01/models/Alignment/constitutional_ai/final_8b/Apertus-1.5-8B-SFT-RL-DPO-SDPO-Low-Less-Refuse-Feedback
+    use_remove_padding: true
+    enable_gradient_checkpointing: true
+    use_shm: false
+    override_config:
+      attn_implementation: flash_attention_2
 
+# Only then will the use of log probs be correct.
+# And it can be used in conjunction with other rollout_correction algorithms.
+algorithm:
+  adv_estimator: rloo_vectorized
+  norm_adv_by_std_in_grpo: false
+  filter_groups:
+    enable: true
+    metric: acc
+    min: 0.0
+    max: 1.0
 critic:
   checkpoint:
     save_contents: []
 
+
 trainer:
   total_epochs: 100
   total_training_steps: 10000
-  save_freq: 20
-  test_freq: 10
+  save_freq: -1
+  test_freq: -1
   max_actor_ckpt_to_keep: 10
   max_critic_ckpt_to_keep: null
-  project_name: apertus-rl-megatron-tests
+  project_name: single-node-rl-test
   experiment_name: GRPO
   logger: [console]
   nnodes: 1

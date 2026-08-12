@@ -71,6 +71,8 @@ from verl.workers.config import (
     RolloutConfig,
 )
 from verl.workers.rollout.llm_server import LLMServerClient
+from verl.tools.base_tool import BaseTool
+from verl.tools.function_tool import FunctionTool
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -525,6 +527,13 @@ class AgentLoopWorker:
             if function_tool_path
             else None,
         )
+        log_str = "Initialized agent loop with the following available tools:\n"
+        for tool in self.tools:
+            if isinstance(tool, FunctionTool):
+                log_str += f"\t{tool.name}"
+            else:
+                log_str += f"\t{str(tool)}"
+        print(log_str)
 
         # Load custom agent loop implementations from config path
         agent_loop_config_path = self.rollout_config.agent.agent_loop_config_path

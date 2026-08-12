@@ -284,7 +284,7 @@ def make_row(
 ) -> dict[str, Any]:
     row = {
         "data_source": config.data_source,
-        # "agent_name": agent_name(config),
+        "agent_name": agent_name(config),
         "prompt": prompt,
         "ability": ability,
         "reward_model": {"style": "rule", "ground_truth": ground_truth},
@@ -339,7 +339,7 @@ def adapt_rgym(
     )
     row["prompt"] = prompt
     row["data_source"] = config.data_source
-    # row["agent_name"] = agent_name(config)
+    row["agent_name"] = agent_name(config)
     extra_info.update(prompt_controls(config))
     extra_info["source_dataset"] = normalize_text(get_value(example, "data_source"))
     row["extra_info"] = extra_info
@@ -361,7 +361,7 @@ def adapt_table_gpt(
         metadata = {}
     return {
         "data_source": f"tablegpt/{task}",
-        # "agent_name": agent_name(config),
+        "agent_name": agent_name(config),
         "prompt": make_prompt(normalize_text(get_value(example, config.prompt_key))),
         "ability": task,
         "reward_model": {"style": "rule", "ground_truth": ground_truth},
@@ -426,7 +426,7 @@ def adapt_tools(
     row["data_source"] = normalize_text(row.get("data_source")) or config.data_source
     row["reward_model"] = reward_model
     row["extra_info"] = extra_info
-    # row["agent_name"] = agent_name_for_tools(extra_info.get("tool_selection"))
+    row["agent_name"] = agent_name_for_tools(extra_info.get("tool_selection"))
     row.pop("tools", None)
     return row
 

@@ -254,7 +254,7 @@ class vLLMHttpServer:
         args = {
             "dtype": self.config.dtype,
             "load_format": self.config.load_format,
-            "skip_tokenizer_init": False,
+            "skip_tokenizer_init": False, # keep this to false or vllm will generate huge core dumps (100+ GB)
             "distributed_executor_backend": "mp",
             "worker_extension_cls": self._get_worker_extension_cls(),
             "trust_remote_code": self.model_config.trust_remote_code,
@@ -269,6 +269,7 @@ class vLLMHttpServer:
             "gpu_memory_utilization": self.config.gpu_memory_utilization,
             "disable_log_stats": self.config.disable_log_stats,
             "tensor_parallel_size": self.config.tensor_model_parallel_size,
+            "pipeline_parallel_size": self.config.pipeline_model_parallel_size,
             "seed": self.replica_rank + (self.config.get("seed") or 0),
             "override_generation_config": json.dumps(override_generation_config),
             "quantization": quantization,

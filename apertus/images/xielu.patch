@@ -1,0 +1,29 @@
+diff --git a/vllm/model_executor/layers/activation.py b/vllm/model_executor/layers/activation.py
+index ddad6801a..bdff8629e 100644
+--- a/vllm/model_executor/layers/activation.py
++++ b/vllm/model_executor/layers/activation.py
+@@ -628,13 +628,6 @@ class XIELU(CustomOp):
+             x = x.unsqueeze(0)
+         if x.dim() > 3:
+             x = x.view(-1, 1, x.size(-1))
+-        if original_shape != x.shape:
+-            logger.warning_once(
+-                "Warning: xIELU input tensor expects 3 dimensions"
+-                " but got (shape: %s). Reshaping to (shape: %s).",
+-                original_shape,
+-                x.shape,
+-            )
+         result = self._xielu_cuda_obj.forward(
+             x,
+             self.alpha_p,
+@@ -651,10 +644,6 @@ class XIELU(CustomOp):
+         if self._xielu_cuda_obj is not None and input.is_cuda:
+             if not torch._dynamo.is_compiling():
+                 return self._xielu_cuda_fn(input)
+-            else:
+-                logger.warning_once(
+-                    "torch._dynamo is compiling, using Python version of xIELU."
+-                )
+         return self._xielu_python(input)
+ 
+     def forward_cuda(self, input: torch.Tensor) -> torch.Tensor:

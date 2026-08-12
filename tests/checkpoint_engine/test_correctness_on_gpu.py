@@ -192,9 +192,9 @@ if __name__ == "__main__":
     test_nccl_checkpoint_engine(
         rebuild_group=False,
         num_trainer=2,
-        num_rollout=30,
-        num_nodes=4,
-        num_gpus_per_node=8,
+        num_rollout=2,
+        num_nodes=1,
+        num_gpus_per_node=4,
         check_allclose=False,
-        model_path=os.environ["HDFS_ROOT"] + "/model/Qwen3-30B-A3B-Base",
+        model_path="Qwen/Qwen3-4B-Thinking-2507",
     )

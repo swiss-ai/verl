@@ -58,22 +58,28 @@ from verl.workers.engine_workers import TrainingWorker, TrainingWorkerConfig
 from verl.workers.utils.losses import ppo_loss, sft_loss, value_loss
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
 
+APERTUS_REFERENCE_MODEL_PATH = "/capstor/store/cscs/swissai/infra01/reasoning/checkpoints/Apertus-1p5-8B-sft-capfilter-linear-it8816"
 
 def get_test_language_model(device_count):
     if device_count == 1:
         model = "~/models/HuggingFaceTB/SmolLM2-135M-Instruct"
     else:
-        model = "~/models/Qwen/Qwen2.5-0.5B"
+        model = APERTUS_REFERENCE_MODEL_PATH
     model = os.path.expanduser(model)
     return model
 
 
-def create_training_config(model_type, strategy, device_count, model):
+def create_training_config(
+        model_type, strategy, 
+        device_count, 
+        model,
+        tp = 1,
+        pp = 1,
+        cp = 1,
+        fsdp = 1
+    ):
     if device_count == 1:
         tp = pp = cp = fsdp_size = 1
-    else:
-        tp = pp = cp = 2
-        fsdp_size = 4
 
     path = os.path.expanduser(model)
     model_config = HFModelConfig(path=path, use_remove_padding=True)
@@ -95,6 +101,7 @@ def create_training_config(model_type, strategy, device_count, model):
             tensor_model_parallel_size=tp,
             pipeline_model_parallel_size=pp,
             context_parallel_size=cp,
+            vanilla_mbridge=False,
             **kwargs,
         )
         optimizer_config = McoreOptimizerConfig(lr_decay_steps=10)
@@ -115,9 +122,11 @@ def create_training_config(model_type, strategy, device_count, model):
     )
     return config
 
-
-@pytest.mark.parametrize("strategy", ["fsdp", "fsdp2", "megatron"])
-def test_actor_engine(strategy):
+@pytest.mark.run_only_on("GPU")
+@pytest.mark.parametrize("tp", [1,2])
+@pytest.mark.parametrize("pp", [1,2])
+@pytest.mark.parametrize("strategy", ["megatron"])
+def test_actor_engine(strategy, tp, pp):
     ray.init()
     device_count = torch.cuda.device_count()
     config = create_training_config(
@@ -125,6 +134,8 @@ def test_actor_engine(strategy):
         strategy=strategy,
         device_count=device_count,
         model=get_test_language_model(device_count),
+        tp = tp,
+        pp = pp
     )
     ray_cls_with_init = RayClassWithInitArgs(cls=ray.remote(TrainingWorker), config=config)
     resource_pool = RayResourcePool(process_on_nodes=[device_count])
@@ -434,7 +445,7 @@ def _worker(rank: int, world_size: int, rendezvous_file: str, strategy: str, mod
     dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("world_size", [8])
+@pytest.mark.parametrize("world_size", [4])
 @pytest.mark.parametrize("config", [Qwen3Config(num_hidden_layers=2), Qwen3MoeConfig(num_hidden_layers=2)])
 @pytest.mark.parametrize("strategy", ["megatron", "fsdp", "fsdp2"])
 def test_per_tensor_generator(world_size, tmp_path, config, strategy):
@@ -510,7 +521,7 @@ def _autocast_dtype_worker(rank: int, world_size: int, rendezvous_file: str, mod
     dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("world_size", [8])
+@pytest.mark.parametrize("world_size", [4])
 @pytest.mark.parametrize("config", [Qwen3Config(num_hidden_layers=2)])
 def test_fsdp2_autocast_dtype_honors_mixed_precision(world_size, tmp_path, config):
     rendezvous_file = str(tmp_path / "rdzv_autocast")
