@@ -14,8 +14,9 @@ export HOME="${SCRATCH_HOME}"
 export HF_HOME="${HF_HOME:-${SCRATCH_HOME}/huggingface}"
 export CONFIG_PATH=$LAUNCH_SCRIPT_DIR
 export VERL_DIR=$(realpath $LAUNCH_SCRIPT_DIR/../../../) # it's kinda ugly
-export PYTHONPATH="/vllm:${VERL_DIR}:${PYTHONPATH:-}"
-echo $PYTHONPATH
+# hacky tool-gym pythonpath, otherwise tool calls don't work. TODO: refactor package structure, imports are broken
+export PYTHONPATH="/vllm:${VERL_DIR}:$(python3 -c "import tool_gym; print(tool_gym.__path__[0])"):${PYTHONPATH:-}"
+echo "PYTHONPATH is: ${PYTHONPATH}"
 
 export MODEL_NAME_OR_PATH="${MODEL_NAME_OR_PATH:-/capstor/store/cscs/swissai/infra01/reasoning/models/Apertus-1p5-8B-sft-capfilter-linear-it8816}"
 export TOKENIZERS_ROOT="${TOKENIZERS_ROOT:-/capstor/store/cscs/swissai/infra01/reasoning/models/tokenizers}"

@@ -4,7 +4,6 @@
 #SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=4
-#SBATCH --cpus-per-task=64
 #SBATCH --time=12:00:00
 #SBATCH --reservation=SD-69241-apertus-1-5-0
 #SBATCH --output=%x_%j.out
@@ -13,11 +12,13 @@
 set -xeuo pipefail
 
 clear_inherited_pyxis_options() {
+  set +e
   local name
   while IFS='=' read -r name _; do
     case "${name}" in
       SLURM_SPANK__SLURM_SPANK_OPTION_pyxis_*) unset "${name}" ;;
     esac
+  set -e
   done < <(env)
 }
 
@@ -37,7 +38,7 @@ MODEL_NAME_OR_PATH="${MODEL_NAME_OR_PATH:-swiss-ai/Apertus-8B-Instruct-2509}"
 TOKENIZER_NAME_OR_PATH="${TOKENIZER_NAME_OR_PATH:-}"
 MULTIMODAL="${MULTIMODAL:-false}"
 CONFIG_NAME="${CONFIG_NAME:-async}"
-VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-true}"
+VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-false}"
 ROLLOUT_N="${ROLLOUT_N:-8}"
 N_PER_ROUND="${N_PER_ROUND:-${ROLLOUT_N}}"
 SEED="${SEED:-85}"
@@ -77,7 +78,7 @@ GPUS_PER_NODE="${GPUS_PER_NODE%%(*}"
 GPUS_PER_NODE="${GPUS_PER_NODE##*:}"
 TRAIN_GPUS_PER_NODE="${TRAIN_GPUS_PER_NODE:-${GPUS_PER_NODE}}"
 ROLLOUT_GPUS_PER_NODE="${ROLLOUT_GPUS_PER_NODE:-${GPUS_PER_NODE}}"
-CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-64}"
+CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-288}"
 ENVIRONMENT_PATH="${ENVIRONMENT_PATH:-/users/${USERNAME}/.edf/async.toml}"
 SRUN_ENV=(--environment="${ENVIRONMENT_PATH}" --container-writable)
 
@@ -335,9 +336,9 @@ build_overrides() {
       "actor_rollout_ref.rollout.multi_turn.max_assistant_turns=1"
       "+actor_rollout_ref.rollout.multi_turn.terminal_tool_names=[display_answers]"
       "actor_rollout_ref.rollout.multi_turn.tool_config_path=null"
-      "actor_rollout_ref.rollout.multi_turn.function_tool_path=${TOOL_GYM_FUNCTION_TOOL_PATH}"
+      # "actor_rollout_ref.rollout.multi_turn.function_tool_path=${TOOL_GYM_FUNCTION_TOOL_PATH}"
       "actor_rollout_ref.rollout.agent.default_agent_loop=tool_agent"
-      "data.function_tool_path=${TOOL_GYM_FUNCTION_TOOL_PATH}"
+      # "data.function_tool_path=${TOOL_GYM_FUNCTION_TOOL_PATH}"
     )
   fi
 
@@ -580,15 +581,6 @@ prepare_shared_python_deps() {
       else
         python3 -m pip install --no-cache-dir --upgrade --force-reinstall --target "${PY_DEPS_DIR}" "${pip_constraints[@]}" reasoning-gym
       fi
-      if [ -n "${TOOL_GYM_DIR}" ]; then
-        if [ ! -d "${TOOL_GYM_DIR}" ]; then
-          echo "TOOL_GYM_DIR=${TOOL_GYM_DIR} does not exist. Clone tool-gym there or set TOOL_GYM_DIR to the correct path." >&2
-          exit 1
-        fi
-        python3 -m pip install --no-cache-dir --upgrade --force-reinstall --target "${PY_DEPS_DIR}" "${pip_constraints[@]}" "${TOOL_GYM_DIR}"
-      else
-        python3 -m pip install --no-cache-dir --upgrade --force-reinstall --target "${PY_DEPS_DIR}" "${pip_constraints[@]}" tool-gym
-      fi
       python3 -c "import nltk; [nltk.download(pkg, download_dir=\"${NLTK_DATA_DIR}\", quiet=True) for pkg in (\"punkt\", \"punkt_tab\", \"stopwords\", \"averaged_perceptron_tagger_eng\")]"
       touch "${DEPS_STAMP}"
     fi
@@ -598,7 +590,7 @@ prepare_shared_python_deps() {
       python3 -m pip install --no-cache-dir --upgrade --force-reinstall --target "${PY_DEPS_DIR}" "${pip_constraints[@]}" ${EXTRA_PIP_PACKAGES_OVERLAY}
       touch "${overlay_stamp}"
     fi
-    python3 -c "import sys; sys.path[:0] = [\"${PY_DEPS_DIR}\", \"${WORKING_DIR}\"]; import absl, emoji, immutabledict, langdetect, math_verify, nltk, reasoning_gym, tool_gym, requests, syllapy, verl; print(\"Using shared deps from\", \"${PY_DEPS_DIR}\"); print(\"Using verl from\", verl.__file__)"
+    python3 -c "import sys; sys.path[:0] = [\"${PY_DEPS_DIR}\", \"${WORKING_DIR}\"]; import absl, emoji, immutabledict, langdetect, math_verify, nltk, reasoning_gym, requests, syllapy, verl; print(\"Using shared deps from\", \"${PY_DEPS_DIR}\"); print(\"Using verl from\", verl.__file__)"
   '
 }
 
@@ -759,7 +751,7 @@ fi
 head_node="${nodes_array[0]}"
 prepare_shared_python_deps
 srun "${SRUN_ENV[@]}" --nodes=1 --ntasks=1 -w "${head_node}" \
-  bash -lc "python3 -c \"import sys; sys.path[:0] = ['${PY_DEPS_DIR}', '${WORKING_DIR}']; import reasoning_gym, tool_gym, requests; print('Using requests from', requests.__file__)\""
+  bash -lc "python3 -c \"import sys; sys.path[:0] = ['${PY_DEPS_DIR}', '${WORKING_DIR}']; import reasoning_gym, requests; print('Using requests from', requests.__file__)\""
 
 head_node_ip="$(srun "${SRUN_ENV[@]}" --nodes=1 --ntasks=1 -w "${head_node}" \
   bash -lc "cd '${WORKING_DIR}' && hostname --ip-address")"
@@ -783,7 +775,7 @@ export MASTER_PORT="${port}"
 
 echo "Starting Ray head at ${head_node} (${ip_head})"
 srun "${SRUN_ENV[@]}" --nodes=1 --ntasks=1 -w "${head_node}" \
-  bash -lc "cd '${WORKING_DIR}' && ray start --head --node-ip-address='${head_node_ip}' --port='${port}' --dashboard-host=0.0.0.0 --num-cpus '${CPUS_PER_TASK}' --num-gpus '${GPUS_PER_NODE}' --block" &
+  bash -lc "cd '${WORKING_DIR}' && ray start --head --node-ip-address='${head_node_ip}' --port='${port}' --dashboard-host=0.0.0.0 --num-gpus '${GPUS_PER_NODE}' --block" &
 
 sleep 10
 
@@ -792,7 +784,7 @@ for ((i = 1; i <= worker_num; i++)); do
   node_i="${nodes_array[$i]}"
   echo "Starting Ray worker ${i} at ${node_i}"
   srun "${SRUN_ENV[@]}" --nodes=1 --ntasks=1 -w "${node_i}" \
-    bash -lc "cd '${WORKING_DIR}' && ray start --address '${ip_head}' --num-cpus '${CPUS_PER_TASK}' --num-gpus '${GPUS_PER_NODE}' --block" &
+    bash -lc "cd '${WORKING_DIR}' && ray start --address '${ip_head}' --num-gpus '${GPUS_PER_NODE}' --block" &
   sleep 5
 done
 

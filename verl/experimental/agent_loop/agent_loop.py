@@ -527,6 +527,8 @@ class AgentLoopWorker:
             if function_tool_path
             else None,
         )
+        if (self.rollout_config.multi_turn.strict):
+            assert self.tools != None and len(self.tools) > 0
         log_str = "Initialized agent loop with the following available tools:\n"
         for tool in self.tools:
             if isinstance(tool, FunctionTool):
@@ -943,7 +945,7 @@ class AgentLoopWorker:
             parsed = self.reasoning_parser.parse(response_text)
             output.extra_fields["response_text"] = [parsed.response_text]
 
-        if not self._display_answers_selected(extra_info):
+        if not self._display_answers_selected(extra_info) or self.tools is None or len(self.tools) == 0:
             return
 
         terminal_tool_arguments = output.extra_fields.get("terminal_tool_arguments")

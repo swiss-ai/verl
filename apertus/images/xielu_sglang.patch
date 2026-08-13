@@ -1,0 +1,31 @@
+diff --git a/python/sglang/srt/layers/activation.py b/python/sglang/srt/layers/activation.py
+index 216e37a..6ade33b 100644
+--- a/python/sglang/srt/layers/activation.py
++++ b/python/sglang/srt/layers/activation.py
+@@ -282,15 +282,6 @@ class XIELU(MultiPlatformOp):
+             x = x.unsqueeze(0)
+         if x.dim() > 3:
+             x = x.view(-1, 1, x.size(-1))
+-        if original_shape != x.shape:
+-            logger.warning_once(
+-                "Warning: xIELU input tensor expects 3 dimensions"
+-                " but got (shape: %s). Reshaping to (shape: %s).\n"
+-                "Note: For SGLang this may be expected if sending"
+-                "[B*S,D] instead of [B,S,D].",
+-                original_shape,
+-                x.shape,
+-            )
+         result = self._xielu_cuda_obj.forward(
+             x,
+             self.alpha_p,
+@@ -306,10 +297,6 @@ class XIELU(MultiPlatformOp):
+         if self._xielu_cuda_obj is not None and input.is_cuda:
+             if not torch._dynamo.is_compiling():
+                 return self._xielu_cuda_fn(input)
+-            else:
+-                logger.warning_once(
+-                    "torch._dynamo is compiling, using Python version of xIELU."
+-                )
+         return self._xielu_python(input)
+ 
+ 

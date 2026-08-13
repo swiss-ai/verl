@@ -13,7 +13,7 @@ echo $PYTHONPATH
 
 build_overrides() {
   overrides=(
-    "--config-name=async_single_node"
+    "--config-name=async_single_node_sglang"
     "--config-path=${CONFIG_PATH}"
     "data.train_files=['${TRAIN_FILE}']"
     "data.val_files=['${VAL_FILE}']"
@@ -30,6 +30,7 @@ build_overrides() {
     "actor_rollout_ref.rollout.skip_tokenizer_init=False"
     "+actor_rollout_ref.rollout.engine_kwargs.sglang.grammar_backend=llguidance"
     "actor_rollout_ref.rollout.reasoning_format=apertus2509"
+    "actor_rollout_ref.model.tokenizer_path=${TOKENIZER_NAME_OR_PATH}"
     "rollout.nnodes=1"
     "rollout.n_gpus_per_node=2"
     "reward.sandbox_fusion.memory_limit_mb=${DEFAULT_MEMORY_LIMIT_MB}"
@@ -51,7 +52,6 @@ build_overrides() {
     "+ray_kwargs.ray_init.runtime_env.env_vars.OTEL_LOGS_EXPORTER='none'"
     "+ray_kwargs.ray_init.runtime_env.env_vars.NO_FORMAT='${NO_FORMAT}'"
     "+ray_kwargs.ray_init.runtime_env.env_vars.PYTHONPATH='${PYTHONPATH}'"
-    "actor_rollout_ref.rollout.name='vllm'"
   )
 
 # TODO: later
@@ -68,33 +68,30 @@ build_overrides() {
 #     )
 #   fi
 
-  # if [[ "${NO_FORMAT}" ]]; then
-  #   overrides+=(
-  #     "actor_rollout_ref.rollout.multi_turn.enable=false"
-  #     "actor_rollout_ref.rollout.agent.default_agent_loop=single_turn_agent"
-  #     "data.function_tool_path=null"
-  #     "actor_rollout_ref.rollout.multi_turn.tool_config_path=null"
-  #     "actor_rollout_ref.rollout.multi_turn.function_tool_path=null"
-  #     "actor_rollout_ref.rollout.multi_turn.terminal_tool_names=[]"
-  #   )
-  # else
-  overrides+=(
-    "actor_rollout_ref.rollout.multi_turn.enable=true"
-    "actor_rollout_ref.rollout.multi_turn.format=apertus2509"
-    "actor_rollout_ref.rollout.multi_turn.max_assistant_turns=1"
-    "+actor_rollout_ref.rollout.multi_turn.terminal_tool_names=[display_answers]"
-    "actor_rollout_ref.rollout.multi_turn.tool_config_path=null"
-    "actor_rollout_ref.rollout.multi_turn.function_tool_path=${TOOL_GYM_FUNCTION_TOOL_PATH}"
-    "actor_rollout_ref.rollout.agent.default_agent_loop=tool_agent"
-    "data.function_tool_path=${TOOL_GYM_FUNCTION_TOOL_PATH}"
-  )
-  # fi
+  if [ $USE_TOOLS -eq 1 ]; then
+    overrides+=(
+      "actor_rollout_ref.rollout.multi_turn.enable=true"
+      "+actor_rollout_ref.rollout.multi_turn.strict=true"
+      "actor_rollout_ref.rollout.multi_turn.format=apertus2509"
+      "actor_rollout_ref.rollout.multi_turn.max_assistant_turns=1"
+      "+actor_rollout_ref.rollout.multi_turn.terminal_tool_names=[display_answers]"
+      "actor_rollout_ref.rollout.multi_turn.tool_config_path=null"
+      "actor_rollout_ref.rollout.multi_turn.function_tool_path=${TOOL_GYM_FUNCTION_TOOL_PATH}"
+      "actor_rollout_ref.rollout.agent.default_agent_loop=tool_agent"
+      "data.function_tool_path=${TOOL_GYM_FUNCTION_TOOL_PATH}"
+    )
+  else
+    overrides+=(
+      "actor_rollout_ref.rollout.multi_turn.enable=false"
+      "+actor_rollout_ref.rollout.multi_turn.strict=false"
+      "actor_rollout_ref.rollout.agent.default_agent_loop=single_turn_agent"
+      "data.function_tool_path=null"
+      "actor_rollout_ref.rollout.multi_turn.tool_config_path=null"
+      "actor_rollout_ref.rollout.multi_turn.function_tool_path=null"
+      "actor_rollout_ref.rollout.multi_turn.terminal_tool_names=[]"
+    )
+  fi
 
-#   if [ -n "${reward_sandbox_url}" ]; then
-#     overrides+=(
-#       "reward.sandbox_fusion.url='${reward_sandbox_url}'"
-#     )
-#   fi
   overrides+=("+ray_kwargs.ray_init.runtime_env.env_vars.KUBERNETES_SANDBOX_URL='${KUBERNETES_SANDBOX_URL}'")
   excluded_abilities+=(long_context_qa)
 
@@ -124,7 +121,7 @@ build_overrides() {
 }
 
 build_overrides
-python3 -m verl.experimental.fully_async_policy.fully_async_main \
+cd $WORKING_DIR && python3 -m verl.experimental.fully_async_policy.fully_async_main \
   "${overrides[@]}" \
   "$@"
 

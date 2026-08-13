@@ -2,7 +2,7 @@
 #SBATCH --account=infra01
 #SBATCH --partition=normal
 #SBATCH --reservation=SD-69241-apertus-1-5-0
-#SBATCH --nodes=16
+#SBATCH --nodes=12
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=4
 #SBATCH --time=2:00:00
@@ -13,7 +13,7 @@
 set -xeuo pipefail
 
 export DATA_PATH="/capstor/store/cscs/swissai/infra01/reasoning/users/atazza/data_verl"
-export ENV_PATH=$(realpath ../vllm_env_debug.toml)
+export ENV_PATH=$(realpath ../sglang_env.toml)
 export CONFIG_PATH=$(realpath .)
 export WORKING_DIR=$(realpath .)
 export VERL_DIR=$(realpath ../../../)
@@ -59,6 +59,7 @@ srun --environment=$ENV_PATH --container-writable --nodes=1 --ntasks=1 -w "${hea
 sleep 10
 
 worker_num=$((NNODES - 1))
+worker_nodes=("${nodes_array[@]:1}")
 for ((i = 1; i <= worker_num; i++)); do
   node_i="${nodes_array[$i]}"
   echo "Starting Ray worker ${i} at ${node_i}"
@@ -66,7 +67,6 @@ for ((i = 1; i <= worker_num; i++)); do
     bash -lc "cd '${WORKING_DIR}' && ray start --address '${ip_head}' --num-gpus 4 --block" &
   sleep 5
 done
-
 wait_for_ray_cluster() {
   local attempt
   for attempt in {1..60}; do

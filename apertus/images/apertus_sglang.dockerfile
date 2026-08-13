@@ -35,3 +35,9 @@ RUN --mount=type=ssh git clone git@github.com:swiss-ai/tool-gym.git && \
     cd r-gym && \
     git checkout translate && \
     pip install -e .
+
+RUN pip install --break-system-packages nvidia-cutlass-dsl==4.5.2 \
+    nvidia-cutlass-dsl-libs-cu13==4.5.2 
+COPY xielu_sglang.patch /tmp/xielu.patch
+RUN cd /sgl-workspace/sglang && \
+    git apply /tmp/xielu.patch

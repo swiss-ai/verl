@@ -17,29 +17,30 @@ USERNAME="$(whoami)"
 ###############################################################################
 PROJECT_NAME="apertus-rl-tests"
 SCRATCH_HOME="/iopsstor/scratch/cscs/${USER}"
-WORKING_DIR="${SCRATCH_HOME}/apertus_rl_async"
+WORKING_DIR="/capstor/store/cscs/swissai/infra01/reasoning/users/atazza/verl"
 HOME="${SCRATCH_HOME}"
 HF_HOME="${HF_HOME:-${SCRATCH_HOME}/huggingface}"
-ENVIRONMENT_PATH="${ENVIRONMENT_PATH:-/capstor/store/cscs/swissai/infra01/reasoning/raas/docker/vs:251215-degenstop/env.toml}"
+# ENVIRONMENT_PATH="${ENVIRONMENT_PATH:-/capstor/store/cscs/swissai/infra01/reasoning/raas/docker/vs:251215-degenstop/env.toml}"
+ENVIRONMENT_PATH=/users/atazza/.edf/test_vllm_mega.toml
 PY_DEPS_ROOT="${PY_DEPS_ROOT:-}"
 PY_DEPS_DIR="${PY_DEPS_DIR:-}"
 
-MODEL_NAME_OR_PATH=/capstor/store/cscs/swissai/infra01/apertus_1p5/hf_checkpoints/ap1p5-8b-sft-256k-adam-lr6e-5-constant-128n_4200
+MODEL_NAME_OR_PATH=/iopsstor/scratch/cscs/atazza/apertus/ap1p5-70b-sft-262k-2700-striped
 TOKENIZERS_ROOT=/capstor/store/cscs/swissai/infra01/reasoning/models/tokenizers
 MULTIMODAL=true
 if [[ -z "${TOKENIZER_NAME_OR_PATH:-}" ]]; then
   if [[ "${MULTIMODAL}" == "true" ]]; then
-    TOKENIZER_NAME_OR_PATH="${TOKENIZERS_ROOT}/apertus_emu3.5_wavtok_instruct_thinking_token_fixed"
+    TOKENIZER_NAME_OR_PATH=""
   else
-    TOKENIZER_NAME_OR_PATH="${TOKENIZERS_ROOT}/apertus_emu3.5_wavtok_text_only"
+    TOKENIZER_NAME_OR_PATH=""
   fi
 fi
 CONFIG_NAME="${CONFIG_NAME:-async}"
-SLURM_TIME=12:00:00
-TRAIN_NNODES=16
-ROLLOUT_NNODES=16
+SLURM_TIME=4:00:00
+TRAIN_NNODES=8
+ROLLOUT_NNODES=4
 NNODES="${NNODES:-$((TRAIN_NNODES + ROLLOUT_NNODES))}"
-TRAINING_DATA_DIR=/capstor/store/cscs/swissai/infra01/reasoning/data/RL-prod/apertus_1p5_incogitans
+TRAINING_DATA_DIR=/capstor/store/cscs/swissai/infra01/reasoning/data/RL-prod/apertus_1p5_incogitans_no_tools
 FORCE_THINKING=false
 THINK_PREFIX_TOKEN="<|inner_prefix|>"
 ENABLE_THINKING=false
@@ -47,7 +48,7 @@ SEED=85
 ROLLOUT_N=8
 N_PER_ROUND="${N_PER_ROUND:-${ROLLOUT_N}}"
 USE_GROUP_FILTERING=true
-JOB_NAME=1p5_8b_incogitans
+JOB_NAME=1p5_70b_megatron_vllm_test
 RESUME_RUN_NAME=""
 VAL_BEFORE_TRAIN=true
 
@@ -74,8 +75,8 @@ ASYNC_STEADY_WARMUP_STEPS="${ASYNC_STEADY_WARMUP_STEPS:-}"
 ###############################################################################
 
 # Set REASONING_GYM_DIR="" to install reasoning-gym from PyPI.
-REASONING_GYM_DIR="${SCRATCH_HOME}/r-gym"
-TOOL_GYM_DIR="${SCRATCH_HOME}/projects/tool-gym"
+REASONING_GYM_DIR="/capstor/store/cscs/swissai/infra01/reasoning/rl-deps/r-gym"
+TOOL_GYM_DIR="/capstor/store/cscs/swissai/infra01/reasoning/rl-deps/tool-gym"
 TOOL_GYM_FUNCTION_TOOL_PATH="${TOOL_GYM_FUNCTION_TOOL_PATH:-/capstor/store/cscs/swissai/infra01/reasoning/data/RL-prod/toolgym_test_v3/apertus_function_tools_v3.py}"
 SANDBOX_BACKEND="kubernetes"  # kubernetes, codegym, or none
 KUBERNETES_SANDBOX_URL="https://sandbox-dev.swissai.svc.cscs.ch"

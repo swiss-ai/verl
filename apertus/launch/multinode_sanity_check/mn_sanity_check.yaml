@@ -36,9 +36,8 @@ actor_rollout_ref:
     use_rollout_log_probs: ${oc.select:async_training.use_rollout_log_probs,true}
     ppo_mini_batch_size: 128
     use_dynamic_bsz: true
-    ppo_max_token_len_per_gpu: 12288
+    ppo_max_token_len_per_gpu: 32768
     calculate_entropy: true
-    ppo_micro_batch_size: 16
 
     optim:
       lr_decay_steps: 1
@@ -76,14 +75,14 @@ actor_rollout_ref:
     nnodes: 1
     n_gpus_per_node: 4
     log_prob_use_dynamic_bsz: true
-    log_prob_max_token_len_per_gpu: 12288
-    max_num_batched_tokens: 4096
-    max_num_seqs: 16
+    log_prob_max_token_len_per_gpu: 32768
+    max_num_batched_tokens: 8192
+    max_num_seqs: 256
     gpu_memory_utilization: 0.7
     tensor_model_parallel_size: 4
     pipeline_model_parallel_size: 1
     n: 8
-    name: vllm
+    name: sglang
     mode: async
     calculate_log_probs: true
     checkpoint_engine:
@@ -92,7 +91,7 @@ actor_rollout_ref:
     dtype: bfloat16
     free_cache_engine: true
     enforce_eager: false
-    load_format: instanttensor 
+    # load_format: instanttensor 
     val_kwargs:
       do_sample: true
       n: 4
@@ -103,7 +102,7 @@ actor_rollout_ref:
     path: /capstor/store/cscs/swissai/infra01/models/SFT/apertus-8b-sft-1.5--lr8e-5
     tokenizer_path: /capstor/store/cscs/swissai/infra01/models/SFT/apertus-8b-sft-1.5--lr8e-5
     use_remove_padding: true
-    enable_gradient_checkpointing: true
+    enable_gradient_checkpointing: false
     use_shm: false
     override_config:
       attn_implementation: flash_attention_2
@@ -124,8 +123,8 @@ critic:
 
 
 trainer:
-  total_epochs: 1
-  total_training_steps: 100
+  total_epochs: 10
+  total_training_steps: 500000
   save_freq: 50
   test_freq: 10
   max_actor_ckpt_to_keep: 10
