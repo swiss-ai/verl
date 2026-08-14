@@ -1,8 +1,6 @@
 # Dataset configuration used by data_preprocess.py. Fields omitted from a
 # dataset entry use the defaults defined by DatasetConfig.
 preprocessing:
-  output_dir: /capstor/scratch/cscs/atazza/data_rl
-  datasets_cache_dir: ./data/apertus_1p5_incogitans/.hf_datasets_cache
   seed: 85
 
 # Disable display_answers and use a prompt template instead:
@@ -18,13 +16,22 @@ preprocessing:
 
 train_datasets:
 
-  # - name: big_math_rl_verified GATED
+  # - name: big_math_rl_verified
   #   dataset_id: SynthLabsAI/Big-Math-RL-Verified
   #   split: train
   #   adapter: math
   #   data_source: SynthLabsAI/Big-Math-RL-Verified
   #   subject_key: domain
   #   tool_selection: [display_answers]
+
+  # random dataset above is gated
+  - name: numina_math_rl_verified
+    dataset_id: nlile/NuminaMath-1.5-RL-Verifiable
+    split: train
+    adapter: math
+    data_source: nlile/NuminaMath-1.5-RL-Verifiable
+    subject_key: domain
+    tool_selection: [display_answers]
 
   - name: deepmath103k
     dataset_id: zwhe99/DeepMath-103K
@@ -109,12 +116,12 @@ train_datasets:
     data_source: table_gpt
     answer_key: completion
 
-  - name: vrl
-    dataset_id: /capstor/store/cscs/swissai/infra01/reasoning/data/RL-prod/vrl/train.parquet
-    split: train
-    adapter: vrl
-    data_source: blindtasks_rl
-    tool_selection: [display_answers]
+  # - name: vrl
+  #   dataset_id: /capstor/store/cscs/swissai/infra01/reasoning/data/RL-prod/vrl/train.parquet
+  #   split: train
+  #   adapter: vrl
+  #   data_source: blindtasks_rl
+  #   tool_selection: [display_answers]
 
   - name: code_contests
     dataset_id: deepmind/code_contests
@@ -181,7 +188,7 @@ eval_datasets:
     data_source: aime2025
     tool_selection: [display_answers]
 
-  # - name: gpqa_diamond GATED
+  # - name: gpqa_diamond
   #   dataset_id: Idavidrein/gpqa
   #   subset: gpqa_diamond
   #   split: train

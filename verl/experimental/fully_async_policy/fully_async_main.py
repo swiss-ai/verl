@@ -139,10 +139,14 @@ class FullyAsyncTaskRunner:
         )
 
         # param_version resume from ckpt or default 0
-        ray.get(self.components["trainer"].load_checkpoint.remote())
-        ray.get(self.components["rollouter"].load_checkpoint.remote())
+        tload_fut = self.components["trainer"].load_checkpoint.remote()
+        rload_fut = self.components["rollouter"].load_checkpoint.remote()
+        ray.get([tload_fut, rload_fut])
 
         print("[ASYNC MAIN] Param sync before fit..")
+        # This is the first iter of checkpoint_engine, meaning that no matter
+        # what we load in the rollout it will be replaced by the trainer regardless
+        # thus don't load rollout weights from disk, because it's useless
         ray.get(self.components["trainer"]._fit_update_weights.remote())
 
         if config.trainer.get("val_before_train", True):

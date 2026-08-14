@@ -100,7 +100,7 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
         # reward message
         self.reward_tensor = None
         self.reward_extra_infos_dict = {}
-        self.checkpoint_manager = None
+        self.checkpoint_engine_manager = None
 
     def init_workers(self):
         """Initialize distributed training workers using Ray backend.
@@ -123,7 +123,7 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
         else:
             from verl.checkpoint_engine import CheckpointEngineManager
 
-        self.checkpoint_manager = CheckpointEngineManager(
+        self.checkpoint_engine_manager = CheckpointEngineManager(
             config=omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine),
             trainer=self.actor_rollout_wg,
             replicas=self.llm_server_manager.get_replicas(),
@@ -293,7 +293,7 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
 
         # load checkpoint and update weights before doing anything
         self._load_checkpoint()
-        self.checkpoint_manager.update_weights(self.global_steps)
+        self.checkpoint_engine_manager.update_weights(self.global_steps)
 
         current_epoch = self.global_steps // len(self.train_dataloader)
 
@@ -425,7 +425,7 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
             if self.curr_step_profile:
                 self.async_rollout_manager.start_profile(global_step=self.global_steps)
             combined_gen_output = self.async_rollout_manager.generate_sequences(combined_gen_batch)
-            self.checkpoint_manager.sleep_replicas()
+            self.checkpoint_engine_manager.sleep_replicas()
             if self.curr_step_profile:
                 self.llm_server_manager.stop_profile()
 
@@ -642,7 +642,7 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
         if self.config.trainer.critic_warmup <= self.global_steps:
             # update weights from trainer to rollout
             with marked_timer("update_weights", timing_raw, color="red"):
-                self.checkpoint_manager.update_weights(self.global_steps)
+                self.checkpoint_engine_manager.update_weights(self.global_steps)
 
     def _fit_dump_data(self, batch: DataProto):
         timing_raw = self.timing_raw

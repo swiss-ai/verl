@@ -12,7 +12,7 @@
 
 set -xeuo pipefail
 
-export DATA_PATH="/capstor/store/cscs/swissai/infra01/reasoning/users/atazza/data_verl"
+export DATA_PATH="/capstor/store/cscs/swissai/infra01/reasoning/apertus_megatron/data_naive"
 export ENV_PATH=$(realpath ../sglang_env.toml)
 export CONFIG_PATH=$(realpath .)
 export WORKING_DIR=$(realpath .)
@@ -20,7 +20,6 @@ export VERL_DIR=$(realpath ../../../)
 export NNODES=$SLURM_JOB_NUM_NODES
 export TRAIN_NODES=8
 export ROLLOUT_NODES=$((NNODES - TRAIN_NODES))
-export MEGATRON_CKPT_PATH="/capstor/scratch/cscs/atazza/megatron_checkpoints/iter_0000000/"
 export EXPERIMENT_NAME="GRPO-$(date +'%Y%m%dT%H%M%S')"
 echo $EXPERIMENT_NAME
 

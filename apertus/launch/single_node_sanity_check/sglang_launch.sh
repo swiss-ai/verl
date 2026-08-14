@@ -1,7 +1,7 @@
 #!/bin/bash
 set -xeuo pipefail
 
-export DATA_PATH="/capstor/store/cscs/swissai/infra01/reasoning/users/atazza/data_verl"
+export DATA_PATH="/capstor/store/cscs/swissai/infra01/reasoning/apertus_megatron/data_naive"
 export VERL_DIR=$(realpath ../../../)
 export MEGATRON_CKPT_PATH="/capstor/scratch/cscs/atazza/megatron_checkpoints/iter_0000000/"
 export PYTHONPATH=${VERL_DIR}:${PYTHONPATH:-}

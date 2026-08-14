@@ -1,4 +1,4 @@
-image = "/capstor/scratch/cscs/atazza/apertus_sglang_megatron/sanity_fix.sqsh"
+image = "/capstor/store/cscs/swissai/infra01/reasoning/apertus_megatron/images/verl_sglang.sqsh"
 
 mounts = [
   "/capstor",
@@ -30,6 +30,4 @@ FI_CXI_DEFAULT_CQ_SIZE = "131072"
 FI_CXI_DEFAULT_TX_SIZE = "32768"
 FI_CXI_DISABLE_HOST_REGISTER = "1"
 OFI_NCCL_DISABLE_DMABUF = "1"
-HF_HOME = "/capstor/store/cscs/swissai/infra01/reasoning/raas/.cache/huggingface"
-# FLASHINFER_WORKSPACE_DIR = "/capstor/store/cscs/swissai/infra01/reasoning/raas/.cache/flashinfer"
-TVM_FFI_CACHE_DIR = "/capstor/store/cscs/swissai/infra01/reasoning/raas/.cache/tvm-ffi"
+TVM_FFI_CACHE_DIR = "/capstor/store/cscs/swissai/infra01/reasoning/apertus_megatron/tvm-ffi"

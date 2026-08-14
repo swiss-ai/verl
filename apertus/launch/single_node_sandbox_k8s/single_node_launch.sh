@@ -11,7 +11,7 @@
 #SBATCH --job-name=verl_single_node_k8s
 set -xeuo
 
-export DATA_PATH="/capstor/store/cscs/swissai/infra01/reasoning/users/atazza/data_verl"
+export DATA_PATH="/capstor/store/cscs/swissai/infra01/reasoning/apertus_megatron/data_nothink"
 export ENV_PATH=$(realpath ../vllm_env.toml)
 export WORKING_DIR=$(realpath .)
 export LAUNCH_SCRIPT_DIR=$(realpath .)

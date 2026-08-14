@@ -172,18 +172,19 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
 
         # Reference to rollouter for parameter synchronization
         self.rollouter = None
-        self.checkpoint_manager = None
+        self.checkpoint_engine_manager = None
 
         # Hybrid checkpoint manager for trainer-side validation (use_trainer_do_validate)
         # Uses naive backend to sync weights from trainer to hybrid rollout replicas.
         # Initialized in _setup_hybrid_checkpoint_manager_and_sleep() via set_rollouter().
         self.hybrid_checkpoint_manager = None
+        self._is_checkpoint_init = False
 
     async def _setup_checkpoint_manager(self):
         """Setup checkpoint manager after rollouter is initialized"""
         replicas = await self.rollouter.get_replicas.remote()
         checkpoint_engine_config = omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine)
-        self.checkpoint_manager = CheckpointEngineManager(
+        self.checkpoint_engine_manager = CheckpointEngineManager(
             config=checkpoint_engine_config, trainer=self.actor_wg, replicas=replicas
         )
         print("[FullyAsyncTrainer] Checkpoint manager initialized")
@@ -365,6 +366,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         pass
 
     def _init_models(self):
+        self._check_checkpoint()
         if self.use_critic:
             self.critic_wg = self.all_wg[str(Role.Critic)]
             self.critic_wg.init_model()
@@ -535,7 +537,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             await asyncio.wrap_future(self.rollouter._stop_profiling.remote().future())
 
         with marked_timer("timing_s/param_sync", self.timing_raw):
-            await self.checkpoint_manager.update_weights(global_steps=self.current_param_version)
+            await self.checkpoint_engine_manager.update_weights(global_steps=self.current_param_version)
         print(
             f"[FullyAsyncTrainer] _fit_update_weights, "
             f"timing_s/param_sync: {self.timing_raw['timing_s/param_sync']:.4f} seconds "
@@ -620,12 +622,12 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         phase_1_start = time.time()
         print("[FullyAsyncTrainer] Phase 1: Switching all GPUs to ROLLOUT mode")
         await self.hybrid_checkpoint_manager.update_weights(global_steps=self.current_param_version)
-        await self.checkpoint_manager.abort_replicas()
+        await self.checkpoint_engine_manager.abort_replicas()
         await self.hybrid_checkpoint_manager.abort_replicas()
         hybrid_replicas_dict = await self.rollouter.get_all_hybrid_replicas.remote()
         hybrid_resource_ids = list(hybrid_replicas_dict.keys())
         await self.rollouter.add_replicas.remote(hybrid_resource_ids)
-        await self.checkpoint_manager.resume_generation_replicas()
+        await self.checkpoint_engine_manager.resume_generation_replicas()
         await self.hybrid_checkpoint_manager.resume_generation_replicas()
         print(f"[FullyAsyncTrainer] Phase 1 done ({time.time() - phase_1_start:.2f}s)")
 
@@ -654,12 +656,12 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         # Phase 3: Switch hybrid GPUs back to TRAIN mode
         # ================================================================
         print("[FullyAsyncTrainer] Phase 3: Switching hybrid GPUs back to TRAIN mode")
-        await self.checkpoint_manager.abort_replicas()
+        await self.checkpoint_engine_manager.abort_replicas()
         await self.hybrid_checkpoint_manager.abort_replicas()
         # Batch remove all hybrid replicas from the load balancer in a single RPC.
         await self.rollouter.remove_replicas.remote(hybrid_resource_ids)
         await self.hybrid_checkpoint_manager.sleep_replicas()
-        await self.checkpoint_manager.resume_generation_replicas()
+        await self.checkpoint_engine_manager.resume_generation_replicas()
         await self.hybrid_checkpoint_manager.resume_generation_replicas()
 
         total_time = time.time() - validate_start
@@ -768,7 +770,58 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         with open(local_latest_checkpointed_iteration, "w") as f:
             f.write(str(self.current_param_version))
 
+    def _check_checkpoint(self):
+        if (self.use_critic):
+            raise NotImplementedError("Critic not implemented yet!")
+                
+        if self.config.trainer.resume_mode == "disable":
+            return 0
+
+        # load from hdfs
+        if self.config.trainer.default_hdfs_dir is not None:
+            raise NotImplementedError("load from hdfs is not implemented yet")
+        else:
+            checkpoint_folder = self.config.trainer.default_local_dir  # TODO: check path
+            if not os.path.isabs(checkpoint_folder):
+                working_dir = os.getcwd()
+                checkpoint_folder = os.path.join(working_dir, checkpoint_folder)
+            global_step_folder = find_latest_ckpt_path(checkpoint_folder)  # None if no latest
+
+        # find global_step_folder
+        if self.config.trainer.resume_mode == "auto":
+            if global_step_folder is None:
+                return 0
+        else:
+            if self.config.trainer.resume_mode == "resume_path":
+                assert isinstance(self.config.trainer.resume_from_path, str), "resume ckpt must be str type"
+                assert "global_step_" in self.config.trainer.resume_from_path, (
+                    "resume ckpt must specify the global_steps"
+                )
+                global_step_folder = self.config.trainer.resume_from_path
+                if not os.path.isabs(global_step_folder):
+                    working_dir = os.getcwd()
+                    global_step_folder = os.path.join(working_dir, global_step_folder)
+        print(f"[FullyAsyncTrainer] Load from checkpoint folder: {global_step_folder}")
+        # set global step
+        self.current_param_version = int(global_step_folder.split("global_step_")[-1])
+        self.global_steps = self.current_param_version * self.trigger_parameter_sync_step + 1
+        self.last_ckpt_version = self.current_param_version
+        print(
+            f"[FullyAsyncTrainer] Setting global step to {self.global_steps}, "
+            f"current_param_version to {self.current_param_version}"
+        )
+        print(f"[FullyAsyncTrainer] Resuming from  {global_step_folder}")
+        actor_path = os.path.join(global_step_folder, "actor")
+        if (self.config.actor_rollout_ref.actor.megatron.use_dist_checkpointing):
+            self.config.actor_rollout_ref.actor.megatron.dist_checkpointing_path = actor_path
+            self._is_checkpoint_init = True
+
     async def load_checkpoint(self):
+        if self._is_checkpoint_init:
+            print(
+                f"[FullyAsyncTrainer] Version already loaded {self.current_param_version}, skipping..."
+            )
+            return self.current_param_version
         if self.config.trainer.resume_mode == "disable":
             return 0
 

@@ -1,24 +1,24 @@
 #!/bin/bash
 #SBATCH --account=infra01
 #SBATCH --partition=normal
-#SBATCH --nodes=32
+#SBATCH --nodes=12
 #SBATCH --reservation=SD-69241-apertus-1-5-0
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=4
-#SBATCH --time=1:00:00
+#SBATCH --time=6:00:00
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
 #SBATCH --job-name=verl_multinode_k8s
 set -xeuo
 
 export LAUNCH_SCRIPT_DIR=$(realpath .)
-export DATA_PATH="/capstor/store/cscs/swissai/infra01/reasoning/users/atazza/data_verl"
+export DATA_PATH="/capstor/store/cscs/swissai/infra01/reasoning/apertus_megatron/data_nothink"
 export ENV_PATH=$(realpath ../sglang_env.toml)
 export CONFIG_PATH=$(realpath .)
 export WORKING_DIR=$(realpath .)
 export VERL_DIR=$(realpath ../../../)
 export NNODES=$SLURM_JOB_NUM_NODES
-export TRAIN_NODES=16
+export TRAIN_NODES=8
 export USE_TOOLS=1
 if [ $USE_TOOLS -eq 1]; then
   NO_FORMAT=0
@@ -32,7 +32,6 @@ export NO_FORMAT
 
 export ENABLE_THINKING="false"
 export ROLLOUT_NODES=$((NNODES - TRAIN_NODES))
-export MEGATRON_CKPT_PATH="/capstor/scratch/cscs/atazza/megatron_checkpoints/iter_0000000/"
 export EXPERIMENT_NAME="GRPO-k8s-$(date +'%Y%m%dT%H%M%S')"
 echo $EXPERIMENT_NAME
 
@@ -65,42 +64,30 @@ export RAY_ADDRESS="${ip_head}"
 export MASTER_ADDR="${head_node_ip}"
 export MASTER_PORT="${port}"
 
-echo "Starting Ray head at ${head_node} (${ip_head})"
-srun --environment=$ENV_PATH --container-writable --nodes=1 --ntasks=1 -w "${head_node}" \
-  bash -lc "cd '${WORKING_DIR}' && ray start --head --node-ip-address='${head_node_ip}' --port='${port}' --dashboard-host=0.0.0.0 --num-gpus 4 --block" &
 
-sleep 10
-
-worker_num=$((NNODES - 1))
-worker_nodes=("${nodes_array[@]:1}")
-for ((i = 1; i <= worker_num; i++)); do
-  node_i="${nodes_array[$i]}"
-  echo "Starting Ray worker ${i} at ${node_i}"
-  srun --environment=$ENV_PATH --container-writable --nodes=1 --ntasks=1 -w "${node_i}" \
-    bash -lc "cd '${WORKING_DIR}' && ray start --address '${ip_head}' --num-gpus 4 --block" &
-  sleep 5
-done
-
-wait_for_ray_cluster() {
-  local attempt
-  for attempt in {1..60}; do
-    if srun --overlap --environment=$ENV_PATH --container-writable --nodes=1 --ntasks=1 -w "${head_node}" \
-      bash -lc 'python3 -c '"'"'import os, ray
-ray.init(address=os.environ["ip_head"], ignore_reinit_error=True)
-alive = sum(1 for node in ray.nodes() if node.get("Alive"))
-expected = int(os.environ["NNODES"])
-print(f"Ray nodes alive: {alive}/{expected}")
-ray.shutdown()
-raise SystemExit(0 if alive >= expected else 1)'"'"''; then
-      return 0
-    fi
-    sleep 5
-  done
-  echo "Timed out waiting for Ray workers to join ${ip_head}" >&2
-  return 1
-}
-
-wait_for_ray_cluster
-
-srun --overlap --environment=$ENV_PATH --container-writable --nodes=1 --ntasks=1 -w "${head_node}" \
-  bash ${WORKING_DIR}/trainer_script.bash
+srun --nodes="${SLURM_JOB_NUM_NODES}" --ntasks-per-node=1 -u --environment=$ENV_PATH --container-writable bash -lc '
+  set ueox
+  unset HTTPS_PROXY HTTP_PROXY http_proxy https_proxy no_proxy
+  export RAY_TMP_DIR="/tmp/ray_tmp_${SLURM_JOB_ID}"
+  mkdir -p "$RAY_TMP_DIR"
+  cd ${WORKING_DIR}
+  if [[ "$SLURM_PROCID" == "0" ]]; then
+    ray start --head \
+      --node-ip-address="$MASTER_ADDR" \
+      --port="$MASTER_PORT" \
+      --temp-dir="$RAY_TMP_DIR" \
+      --disable-usage-stats
+    until [ "$(ray status 2>/dev/null | awk "/Active:/{flag=1;next}/Pending:/{flag=0}flag" | grep -c "node_" || true)" -ge "$SLURM_JOB_NUM_NODES" ]; do
+      echo "Waiting for all nodes to join..."; sleep 1
+    done
+    bash trainer_script.bash
+  else
+    until (echo > /dev/tcp/"$MASTER_ADDR"/"$MASTER_PORT") >/dev/null 2>&1; do sleep 1; done
+    ray start \
+      --address="${RAY_ADDRESS}" \
+      --node-ip-address="$(hostname -i | awk "{print \$1}")" \
+      --temp-dir="$RAY_TMP_DIR" \
+      --disable-usage-stats \
+      --block
+  fi
+'

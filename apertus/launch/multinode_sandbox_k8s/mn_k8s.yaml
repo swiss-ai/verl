@@ -91,7 +91,7 @@ actor_rollout_ref:
     dtype: bfloat16
     free_cache_engine: true
     enforce_eager: false
-    # load_format: instanttensor 
+    load_format: dummy # use dummy format so that sglang won't load weights (they get synced by the actor anyways) 
     val_kwargs:
       do_sample: true
       n: 4
@@ -105,10 +105,8 @@ actor_rollout_ref:
     enable_gradient_checkpointing: false
     use_shm: false
     override_config:
-      attn_implementation: flash_attention_2
+      attn_implementation: flash_attention_2 # this doesn't really matter, sglang and megatron use their own
 
-# Only then will the use of log probs be correct.
-# And it can be used in conjunction with other rollout_correction algorithms.
 algorithm:
   adv_estimator: rloo_vectorized
   norm_adv_by_std_in_grpo: false
@@ -123,15 +121,14 @@ critic:
 
 
 trainer:
-  total_epochs: 10
-  total_training_steps: 500000
+  total_epochs: 10 
+  total_training_steps: 500000 # put an arbitrarily big value
   save_freq: 50
-  test_freq: 10
+  test_freq: 10 # don't do this too often, running the validation can take some time
   max_actor_ckpt_to_keep: 10
   max_critic_ckpt_to_keep: null
   project_name: multi-node-rl-test
-  # experiment_name: GRPO
-  logger: [console]
+  logger: [console, wandb]
   nnodes: 1
   n_gpus_per_node: 4
   log_val_generations: 5

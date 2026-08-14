@@ -381,7 +381,7 @@ class RayPPOTrainer:
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
-        self.checkpoint_manager = None
+        self.checkpoint_engine_manager = None
         self._init_dump_executor()
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
@@ -727,12 +727,12 @@ class RayPPOTrainer:
             if self.use_rm and "rm_scores" not in test_output_gen_batch_padded.batch.keys():
                 # for colocate reward models, we need to sleep rollout model
                 # to spare GPU memory for reward model
-                self.checkpoint_manager.sleep_replicas()
+                self.checkpoint_engine_manager.sleep_replicas()
                 batch_reward = self._compute_reward_colocate(test_output_gen_batch_padded)
                 test_output_gen_batch_padded = test_output_gen_batch_padded.union(batch_reward)
                 # wake up rollout model
                 # replace with wake_up method once supported
-                self.checkpoint_manager.update_weights(self.global_steps)
+                self.checkpoint_engine_manager.update_weights(self.global_steps)
 
             # unpad
             test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
@@ -1119,14 +1119,14 @@ class RayPPOTrainer:
             CheckpointEngineManager = load_class_from_fqn(checkpoint_manager_class_fqn, "CheckpointEngineManager")
         else:
             from verl.checkpoint_engine import CheckpointEngineManager
-        self.checkpoint_manager = CheckpointEngineManager(
+        self.checkpoint_engine_manager = CheckpointEngineManager(
             config=checkpoint_engine_config,
             trainer=self.actor_rollout_wg,
             replicas=self.llm_server_manager.get_replicas(),
         )
 
         # sleep all replicas to load checkpoint
-        self.checkpoint_manager.sleep_replicas()
+        self.checkpoint_engine_manager.sleep_replicas()
 
     def _save_checkpoint(self):
         from verl.utils.fs import local_mkdir_safe
@@ -1545,7 +1545,7 @@ class RayPPOTrainer:
 
         # load checkpoint and update weights before doing anything
         self._load_checkpoint()
-        self.checkpoint_manager.update_weights(self.global_steps)
+        self.checkpoint_engine_manager.update_weights(self.global_steps)
 
         current_epoch = self.global_steps // len(self.train_dataloader)
 
@@ -1744,7 +1744,7 @@ class RayPPOTrainer:
                     # another generation batch. Sleeping inside the resampling
                     # loop offloads SGLang's weights and KV cache before the next
                     # request, leaving its Triton kernels with CPU tensors.
-                    self.checkpoint_manager.sleep_replicas()
+                    self.checkpoint_engine_manager.sleep_replicas()
 
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,
@@ -1902,7 +1902,7 @@ class RayPPOTrainer:
                     # implement critic warmup
                     if self.config.trainer.critic_warmup > self.global_steps:
                         # Still in critic warmup, only update weights to wake up rollout replicas.
-                        self.checkpoint_manager.update_weights(self.global_steps)
+                        self.checkpoint_engine_manager.update_weights(self.global_steps)
                     else:
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
@@ -1932,7 +1932,7 @@ class RayPPOTrainer:
 
                         # update weights from trainer to rollout
                         with marked_timer("update_weights", timing_raw, color="red"):
-                            self.checkpoint_manager.update_weights(self.global_steps)
+                            self.checkpoint_engine_manager.update_weights(self.global_steps)
 
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)

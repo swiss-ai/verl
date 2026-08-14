@@ -10,11 +10,10 @@
 #SBATCH --job-name=verl_single_node_sanity
 set -xeuo pipefail
 
-export DATA_PATH="/capstor/store/cscs/swissai/infra01/reasoning/users/atazza/data_verl"
+export DATA_PATH="/capstor/store/cscs/swissai/infra01/reasoning/apertus_megatron/data_naive"
 export VERL_DIR=$(realpath ../../../)
 export CONFIG_PATH=$(realpath .)
 export ENV_PATH=$(realpath ../vllm_env.toml)
-export MEGATRON_PATH=""
 
 run_driver() {
   export PYTHONPATH="/vllm:${VERL_DIR}:${PYTHONPATH:-}"

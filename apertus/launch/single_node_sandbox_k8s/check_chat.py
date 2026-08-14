@@ -1,3 +1,5 @@
+# WORK IN PROGRESS: not ready
+
 from verl.experimental.agent_loop import AgentLoopManager
 from verl.workers.rollout.llm_server import LLMServerClient, TokenOutput
 import ray
@@ -10,7 +12,6 @@ import pyarrow.compute as pc
 class MockLLMClient(LLMServerClient):
 
     async def generate(self, request_id, *, prompt_ids, sampling_params, image_data = None, video_data = None, audio_data = None, mm_processor_kwargs = None, **kwargs):
-        print(prompt_ids)
         return TokenOutput(token_ids=prompt_ids)
 
 
@@ -48,8 +49,8 @@ def get_uniques(
     return result
 
 @hydra.main(
-    config_path="/capstor/store/cscs/swissai/infra01/reasoning/users/atazza/verl/verl/experimental/fully_async_policy/config", 
-    config_name="fully_async_ppo_trainer", 
+    config_path=".", 
+    config_name="async_single_node", 
     version_base=None
 )
 def validate_data_main(config):
@@ -62,8 +63,6 @@ def validate_data_main(config):
     )
     n = 2
     config.actor_rollout_ref.rollout.n = n
-    
-    # =========================== 2. Generate sequences  ===========================
     raw_prompts = [
         [
             {"role": "user", "content": "How are you?"},
@@ -90,10 +89,6 @@ def validate_data_main(config):
     batch = batch.repeat(n)
     result = agent_loop_manager.generate_sequences(prompts=batch)
     assert len(result) == len(raw_prompts) * n
-    
-
-    print(result)
-
 
     ray.shutdown()
 

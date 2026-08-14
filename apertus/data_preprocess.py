@@ -100,6 +100,8 @@ def parse_dataset_config(value: Any, section: str, index: int) -> DatasetConfig:
 
 def load_config(
     path: str | os.PathLike[str],
+    out_dir: str | os.PathLike[str],
+    cache_dir: str | os.PathLike[str]
 ) -> tuple[PreprocessConfig, list[DatasetConfig], list[DatasetConfig]]:
     config = OmegaConf.to_container(OmegaConf.load(path), resolve=True)
     if not isinstance(config, dict):
@@ -118,6 +120,8 @@ def load_config(
     if unknown_fields:
         unknown = ", ".join(sorted(unknown_fields))
         raise ValueError(f"Unknown preprocessing fields: {unknown}")
+    preprocessing["output_dir"] = out_dir
+    preprocessing["datasets_cache_dir"] = cache_dir 
     try:
         preprocess_config = PreprocessConfig(**preprocessing)
     except TypeError as error:
@@ -1200,12 +1204,20 @@ def parse_args() -> argparse.Namespace:
         default=str(DEFAULT_CONFIG_PATH),
         help="YAML file defining preprocessing, train_datasets, and eval_datasets",
     )
+    parser.add_argument(
+        "--output_dir",
+        help="output directory for the data"
+    )
+    parser.add_argument(
+        "--cache_dir",
+        help="directory for caching dataset"
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    preprocess_config, train_configs, eval_configs = load_config(args.config)
+    preprocess_config, train_configs, eval_configs = load_config(args.config, args.output_dir, args.cache_dir)
     train_dataset = concatenate_named(
         (config.name, preprocess_dataset(config, preprocess_config))
         for config in train_configs
@@ -1217,7 +1229,7 @@ def main() -> None:
     write_outputs(
         train_dataset,
         eval_datasets,
-        preprocess_config.output_dir,
+        args.output_dir,
         args.config,
     )
 

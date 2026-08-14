@@ -19,20 +19,12 @@ export PYTHONPATH="/vllm:${VERL_DIR}:$(python3 -c "import tool_gym; print(tool_g
 echo "PYTHONPATH is: ${PYTHONPATH}"
 
 export MODEL_NAME_OR_PATH="${MODEL_NAME_OR_PATH:-/capstor/store/cscs/swissai/infra01/reasoning/models/Apertus-1p5-8B-sft-capfilter-linear-it8816}"
-export TOKENIZERS_ROOT="${TOKENIZERS_ROOT:-/capstor/store/cscs/swissai/infra01/reasoning/models/tokenizers}"
-export MULTIMODAL="${MULTIMODAL:-false}"
+export MULTIMODAL="false"
 
-# if [[ -z "${TOKENIZER_NAME_OR_PATH:-}" ]]; then
-#   if [[ "${MULTIMODAL}" == "true" ]]; then
-#     TOKENIZER_NAME_OR_PATH="${TOKENIZERS_ROOT}/apertus_emu3.5_wavtok_instruct_thinking_token_fixed"
-#   else
-#     TOKENIZER_NAME_OR_PATH="${TOKENIZERS_ROOT}/apertus_emu3.5_wavtok_text_only"
-#   fi
-# fi
-
+# this for now TODO: multimodal tokenizer if/when/how
 export TOKENIZER_NAME_OR_PATH=${MODEL_NAME_OR_PATH}
 
-export TRAINING_DATA_DIR="${TRAINING_DATA_DIR:-/capstor/scratch/cscs/atazza/data_rl}"
+export TRAINING_DATA_DIR="${DATA_PATH}"
 export TRAIN_FILE="${TRAINING_DATA_DIR}/train.parquet"
 export VAL_FILE="${TRAINING_DATA_DIR}/val.parquet"
 
@@ -62,7 +54,6 @@ export KUBERNETES_SANDBOX_URL="https://sandbox-dev.swissai.svc.cscs.ch"
 export PORT="${PORT:-8000}"
 export POLL_SECS="${POLL_SECS:-3}"
 export MAX_WAIT="${MAX_WAIT:-$((60 * 10))}"
-export NO_FORMAT="${NO_FORMAT:-false}"  # disable tool-formatting (legacy plain-text rollouts)
 export LONG_CONTEXT="${LONG_CONTEXT:-false}"  # enable QA-gym data and long-context config parameters
 export SANDBOX_REWARD_CONTINUOUS="${SANDBOX_REWARD_CONTINUOUS:-false}" # default is binary reward
 export QA_GYM_RERANKER_URL="${QA_GYM_RERANKER_URL:-https://api.swissai.svc.cscs.ch/v1/score}"
