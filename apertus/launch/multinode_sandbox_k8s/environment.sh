@@ -22,14 +22,14 @@ export MODEL_NAME_OR_PATH="${MODEL_NAME_OR_PATH:-/capstor/store/cscs/swissai/inf
 export MULTIMODAL="false"
 
 # this for now TODO: multimodal tokenizer if/when/how
-export TOKENIZER_NAME_OR_PATH=${MODEL_NAME_OR_PATH}
+export TOKENIZER_NAME_OR_PATH="${MODEL_NAME_OR_PATH}"
 
 export TRAINING_DATA_DIR="${DATA_PATH}"
 export TRAIN_FILE="${TRAINING_DATA_DIR}/train.parquet"
 export VAL_FILE="${TRAINING_DATA_DIR}/val.parquet"
 
 export FORCE_THINKING="${FORCE_THINKING:-false}"
-export THINK_PREFIX_TOKEN="${THINK_PREFIX_TOKEN:-<|inner_prefix|>}"
+export THINK_PREFIX_TOKEN="${THINK_PREFIX_TOKEN:-<think>}"
 export ENABLE_THINKING="${ENABLE_THINKING:-false}"
 export SEED="${SEED:-85}"
 export ROLLOUT_N="${ROLLOUT_N:-8}"

@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --account=infra01
 #SBATCH --partition=normal
-#SBATCH --nodes=12
+#SBATCH --nodes=48
 #SBATCH --reservation=SD-69241-apertus-1-5-0
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=4
@@ -12,14 +12,15 @@
 set -xeuo
 
 export LAUNCH_SCRIPT_DIR=$(realpath .)
-export DATA_PATH="/capstor/store/cscs/swissai/infra01/reasoning/apertus_megatron/data_nothink"
+export DATA_PATH="/capstor/store/cscs/swissai/infra01/reasoning/apertus_megatron/data_think"
+export MEGATRON_CKPT_PATH="/capstor/store/cscs/swissai/infra01/reasoning/apertus_megatron/megatron_checkpoints/iter_0000000"
 export ENV_PATH=$(realpath ../sglang_env.toml)
 export CONFIG_PATH=$(realpath .)
 export WORKING_DIR=$(realpath .)
 export VERL_DIR=$(realpath ../../../)
 export NNODES=$SLURM_JOB_NUM_NODES
-export TRAIN_NODES=8
-export USE_TOOLS=1
+export TRAIN_NODES=32
+export USE_TOOLS=0
 if [ $USE_TOOLS -eq 1]; then
   NO_FORMAT=0
 else
@@ -30,7 +31,7 @@ fi
 # gets applied. The ENV_VAR format is a bit shaky and prone to become a pain to maintain
 export NO_FORMAT
 
-export ENABLE_THINKING="false"
+export ENABLE_THINKING="true"
 export ROLLOUT_NODES=$((NNODES - TRAIN_NODES))
 export EXPERIMENT_NAME="GRPO-k8s-$(date +'%Y%m%dT%H%M%S')"
 echo $EXPERIMENT_NAME

@@ -69,7 +69,7 @@ class DatasetConfig:
     subject_key: str | None = None
     solution_key: str | None = None
     shuffle_choices: bool = False
-    enable_thinking: float = 0.0  # 0.0 means never enable, 1.0 means always enable
+    enable_thinking: float = 0.5  # 0.0 means never enable, 1.0 means always enable
     tool_selection: tuple[str, ...] = ()
     prompt_template: str | None = None
 

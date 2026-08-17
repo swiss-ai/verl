@@ -2,8 +2,8 @@ from megatron.bridge import AutoBridge
 import torch
 
 if __name__ == "__main__":
-    weight_path = "/capstor/store/cscs/swissai/infra01/apertus_1p5/hf_checkpoints/ap1p5-8b-sft-256k-adam-lr6e-5-constant-128n_4200"
-    dst_path = "/capstor/scratch/cscs/atazza/megatron_checkpoints/"
+    weight_path = "/capstor/store/cscs/swissai/infra01/reasoning/models/Apertus-1p5-8B-sft-capfilter-linear-it8816"
+    dst_path = "/capstor/store/cscs/swissai/infra01/reasoning/apertus_megatron/megatron_checkpoints"
     bridge: AutoBridge = AutoBridge.from_hf_pretrained(
         path=weight_path,
         torch_dtype=torch.bfloat16

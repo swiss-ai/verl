@@ -63,6 +63,7 @@ def default_compute_score(
         "DigitalLearningGmbH/MATH-lighteval",
         "HuggingFaceH4/MATH-500",
         "SynthLabsAI/Big-Math-RL-Verified",
+        "nlile/NuminaMath-1.5-RL-Verifiable",
         "zwhe99/DeepMath-103K",
         "deepmath",
         "deepscaler",

@@ -11,6 +11,14 @@ export RUN_DIR=$WORKING_DIR/outputs/$EXPERIMENT_NAME
 source ${WORKING_DIR}/environment.sh
 echo $PYTHONPATH
 
+export NODE_BATCH_SIZE=8
+export NODE_MICRO_BATCH=8
+export PROMPT_MAX_LEN=2048
+export RESP_MAX_LEN=8192
+# worst case we have NODE_BATCH_SIZE * (PROMPT_MAX_LEN + RESP_MAX_LEN) * NUM_GRPO_GROUPS tokens
+export MINI_BATCH_SIZE=$((NODE_BATCH_SIZE * TRAIN_NODES))
+export MAX_TOKEN_LEN_PER_GPU=$((NODE_MICRO_BATCH * (PROMPT_MAX_LEN + RESP_MAX_LEN)))
+
 build_overrides() {
   overrides=(
     "--config-name=mn_k8s"
@@ -88,6 +96,20 @@ build_overrides() {
     "algorithm.filter_groups.enable=false"
     "algorithm.filter_groups.metric=null"
   )
+
+  # batches overrides
+  overrides+=(
+    "++actor_rollout_ref.actor.ppo_mini_batch_size=${MINI_BATCH_SIZE}"
+    "++actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${MAX_TOKEN_LEN_PER_GPU}"
+    "++data.max_response_length=${RESP_MAX_LEN}"
+    "++data.max_prompt_length=${PROMPT_MAX_LEN}"
+  )
+  # megatron ckpt
+  overrides+=(
+    "++actor_rollout_ref.actor.megatron.use_dist_checkpointing='true'"
+    "++actor_rollout_ref.actor.megatron.dist_checkpointing_path='${MEGATRON_CKPT_PATH}'"
+  )
+
 }
 
 build_overrides

@@ -33,10 +33,18 @@ class NaiveRewardManager(RewardManagerBase):
         reward_model_tokenizer=None,
     ):
         super().__init__(config, tokenizer, compute_score)
-        self.compute_score = compute_score or default_compute_score
+        def noexcept_score(*args, **kwargs):
+            fn = compute_score or default_compute_score
+            try:
+                res = fn(*args, **kwargs)
+            except:
+                res = -1.0
+            return res
+        self.compute_score = noexcept_score
         self.is_async_reward_score = inspect.iscoroutinefunction(self.compute_score)
         self.reward_router_address = reward_router_address
         self.reward_model_tokenizer = reward_model_tokenizer
+
 
     async def run_single(self, data: DataProto) -> dict:
         data = data[

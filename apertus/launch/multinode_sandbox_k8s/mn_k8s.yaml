@@ -26,14 +26,14 @@ data:
   train_batch_size: 0
   gen_batch_size: 1
   max_prompt_length: 2048
-  max_response_length: 1024
+  max_response_length: 8192
   truncation: left
 
 actor_rollout_ref:
   hybrid_engine: False
 
   actor:
-    use_rollout_log_probs: ${oc.select:async_training.use_rollout_log_probs,true}
+    use_rollout_log_probs: true
     ppo_mini_batch_size: 128
     use_dynamic_bsz: true
     ppo_max_token_len_per_gpu: 32768
@@ -110,6 +110,8 @@ actor_rollout_ref:
 algorithm:
   adv_estimator: rloo_vectorized
   norm_adv_by_std_in_grpo: false
+  rollout_correction:
+    bypass_mode: True # apply this otherwise it recomputes log probs and it wastes a lot of time, since rollout already gives them
   filter_groups:
     enable: true
     metric: acc
@@ -121,10 +123,10 @@ critic:
 
 
 trainer:
-  total_epochs: 10 
-  total_training_steps: 500000 # put an arbitrarily big value
+  total_epochs: 50
+  total_training_steps: -1 # put an arbitrarily big value
   save_freq: 50
-  test_freq: 10 # don't do this too often, running the validation can take some time
+  test_freq: 5 # don't do this too often, running the validation can take some time
   max_actor_ckpt_to_keep: 10
   max_critic_ckpt_to_keep: null
   project_name: multi-node-rl-test
