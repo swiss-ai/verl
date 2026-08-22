@@ -1,6 +1,6 @@
 #!/bin/bash
 
-set -ueox
+set -ueox pipefail
 
 # tie tool gym tools to local path so it isn't all over the place
 export TOOL_GYM_FUNCTION_TOOL_PATH=$(realpath $VERL_DIR/apertus/apertus_function_tools.py )
@@ -12,7 +12,7 @@ source ${WORKING_DIR}/environment.sh
 echo $PYTHONPATH
 
 export NODE_BATCH_SIZE=8
-export NODE_MICRO_BATCH=8
+export NODE_MICRO_BATCH=4
 export PROMPT_MAX_LEN=2048
 export RESP_MAX_LEN=8192
 # worst case we have NODE_BATCH_SIZE * (PROMPT_MAX_LEN + RESP_MAX_LEN) * NUM_GRPO_GROUPS tokens
@@ -105,10 +105,10 @@ build_overrides() {
     "++data.max_prompt_length=${PROMPT_MAX_LEN}"
   )
   # megatron ckpt
-  overrides+=(
-    "++actor_rollout_ref.actor.megatron.use_dist_checkpointing='true'"
-    "++actor_rollout_ref.actor.megatron.dist_checkpointing_path='${MEGATRON_CKPT_PATH}'"
-  )
+  # overrides+=(
+  #   "++actor_rollout_ref.actor.megatron.use_dist_checkpointing='true'"
+  #   "++actor_rollout_ref.actor.megatron.dist_checkpointing_path='${MEGATRON_CKPT_PATH}'"
+  # )
 
 }
 

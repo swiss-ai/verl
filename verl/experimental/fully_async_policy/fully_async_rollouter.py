@@ -418,7 +418,6 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         return worker
 
 
-@ray.remote(num_cpus=10, max_concurrency=100)
 class FullyAsyncRollouter(SeparateRayPPOTrainer):
     """
     Asynchronous sample generator, responsible for continuously generating training samples
@@ -587,7 +586,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 f"max_concurrent_samples: {self.max_concurrent_samples} "
             )
 
-    def get_replicas(self):
+    def get_replicas(self) -> list[RolloutReplica]:
         """Get rollout worker group"""
         return self.llm_server_manager.get_replicas()
 
@@ -766,9 +765,10 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         """
         self._init_async_objects()
         self._create_worker_classes()
+        await self._init_async_replicas()
         await self._create_reward_loop_manager()
         await self._create_teacher_model_manager()
-        await self._init_async_rollout_manager()
+        await self._create_agent_loop_manager()
         SkipManager.init(self.config)
 
     async def _create_reward_loop_manager(self):
@@ -787,6 +787,24 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             None,
             lambda: RewardLoopManager(config=self.config, rm_resource_pool=None),
         )
+
+    async def _create_agent_loop_manager(self):
+        # infrastructure overview: https://verl.readthedocs.io/en/latest/advance/reward_loop.html#architecture-design
+        # agent_reward_loop: streaming reward computation with actor rollout
+        # two conditions satisfied: (1) no reward model, or (2) reward model with extra resource pool
+        enable_agent_reward_loop = not self.use_rm or self.config.reward.reward_model.enable_resource_pool
+
+        # if enable_agent_reward_loop, we directly pass reward_loop_workers to agent loop manager
+        # to stream reward computation with actor rollout
+        reward_loop_worker_handles = self.reward_loop_manager.reward_loop_workers if enable_agent_reward_loop else None
+
+        self.async_rollout_manager = await FullyAsyncAgentLoopManager.create(
+            config=self.config,
+            llm_client=self.llm_server_manager.get_client(client_cls=FullyAsyncLLMServerClient),
+            reward_loop_worker_handles=reward_loop_worker_handles,
+            teacher_client=self.teacher_model_manager.get_client() if self.teacher_model_manager else None,
+        )
+
 
     async def _create_teacher_model_manager(self):
         """Create MultiTeacherModelManager for distillation if enabled.
@@ -841,7 +859,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             for batch_dict in iterator:
                 yield epoch, batch_dict
 
-    async def _init_async_rollout_manager(self):
+    async def _init_async_replicas(self):
         """
         Create the server manager and agent loop manager for fully async training.
 
@@ -854,15 +872,6 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         routing.  Clients look up handles atomically — no per-worker notification
         needed on hybrid add/remove.
         """
-        # infrastructure overview: https://verl.readthedocs.io/en/latest/advance/reward_loop.html#architecture-design
-        # agent_reward_loop: streaming reward computation with actor rollout
-        # two conditions satisfied: (1) no reward model, or (2) reward model with extra resource pool
-        enable_agent_reward_loop = not self.use_rm or self.config.reward.reward_model.enable_resource_pool
-
-        # if enable_agent_reward_loop, we directly pass reward_loop_workers to agent loop manager
-        # to stream reward computation with actor rollout
-        reward_loop_worker_handles = self.reward_loop_manager.reward_loop_workers if enable_agent_reward_loop else None
-
         # create async rollout manager and request scheduler
         assert self.config.actor_rollout_ref.rollout.mode == "async"
 
@@ -872,12 +881,6 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         self.llm_server_manager = await FullyAsyncLLMServerManager.create(
             config=self.config,
             worker_group=self.get_hybrid_worker_group(),
-        )
-        self.async_rollout_manager = await FullyAsyncAgentLoopManager.create(
-            config=self.config,
-            llm_client=self.llm_server_manager.get_client(client_cls=FullyAsyncLLMServerClient),
-            reward_loop_worker_handles=reward_loop_worker_handles,
-            teacher_client=self.teacher_model_manager.get_client() if self.teacher_model_manager else None,
         )
 
     # Add samples to the pending_queue
@@ -1055,7 +1058,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         """The main entry method for stream processing"""
 
         if self.async_rollout_manager is None:
-            await self._init_async_rollout_manager()
+            await self._init_async_replicas()
 
         # Start the streaming loop
         print(f"[FullyAsyncRollouter] Start streaming mode, maximum concurrent samples: {self.max_concurrent_samples}")

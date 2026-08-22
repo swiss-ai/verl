@@ -451,6 +451,13 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         metrics["tool_call_counts/max"] = tool_call_counts.max()
         metrics["tool_call_counts/mean"] = tool_call_counts.mean()
 
+    q = [1, 10, 25, 50, 75, 90, 99]
+    q_name = [f"pc{pc}" for pc in q]
+    q_tensor = torch.tensor([float(pc) / 100.0 for pc in q])
+    percentiles = torch.quantile(response_length, q_tensor.to(response_length.device)).detach().cpu().tolist()
+    for qn, pc in zip(q_name, percentiles):
+        metrics[f"response_length/percentile/{qn}"] = pc
+
     return metrics
 
 

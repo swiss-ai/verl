@@ -111,8 +111,6 @@ actor_rollout_ref:
 algorithm:
   adv_estimator: rloo_vectorized
   norm_adv_by_std_in_grpo: false
-  rollout_correction: 
-    bypass_mode: True # apply this otherwise it recomputes log probs and it wastes a lot of time, since rollout already gives them
   filter_groups:
     enable: true
     metric: acc
@@ -124,10 +122,10 @@ critic:
 
 
 trainer:
-  total_epochs: 20
-  total_training_steps: 20
-  save_freq: 50
-  test_freq: 50
+  total_epochs: 1
+  total_training_steps: 10
+  save_freq: 5
+  test_freq: 5
   max_actor_ckpt_to_keep: 10
   max_critic_ckpt_to_keep: null
   project_name: single-node-rl-test

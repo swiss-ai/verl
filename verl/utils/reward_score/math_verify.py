@@ -26,6 +26,11 @@ logger = get_reward_logger(__name__)
 _pool = None
 _pool_lock = threading.Lock()
 
+def _pool_init():
+    import resource, sys
+    lim = 8 << 30 
+    resource.setrlimit(resource.RLIMIT_AS, (lim, lim))
+    sys.set_int_max_str_digits(50_000)
 
 def _get_pool():
     global _pool
@@ -33,7 +38,10 @@ def _get_pool():
         with _pool_lock:
             if _pool is None:
                 _pool = ProcessPoolExecutor(
-                    max_workers=4, mp_context=multiprocessing.get_context("spawn")
+                    max_workers=4, 
+                    mp_context=multiprocessing.get_context("spawn"),
+                    initializer=_pool_init,
+                    max_tasks_per_child=200
                 )
     return _pool
 

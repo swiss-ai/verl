@@ -17,7 +17,7 @@ import os
 import socket
 from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Optional, List, Dict
 
 import numpy as np
 import ray
@@ -119,6 +119,7 @@ class RayResourcePool(ResourcePool):
         max_colocate_count: int = 10,
         detached=False,
         accelerator_type: Optional[str] = None,
+        labels: Optional[Dict[str, str]] = None
     ) -> None:
         super().__init__(process_on_nodes, max_colocate_count)
         self.use_gpu = use_gpu
@@ -127,6 +128,7 @@ class RayResourcePool(ResourcePool):
         self.pgs = None
         self.detached = detached
         self.accelerator_type = accelerator_type
+        self.labels = labels
 
     def get_placement_groups(self, strategy="STRICT_PACK", name=None, device_name="cuda"):
         if self.pgs is not None:
@@ -151,13 +153,33 @@ class RayResourcePool(ResourcePool):
         pg_scheme = [[bundle.copy() for _ in range(process_count)] for process_count in self._store]
 
         lifetime = "detached" if self.detached else None
+        pgs = []
+        for idx, bundles in enumerate(pg_scheme):
+            pgs.append(placement_group(
+                bundles=bundles,
+                strategy=strategy,
+                name=pg_name_prefix + str(idx),
+                lifetime=lifetime,
+                bundle_label_selector=[self.labels] * len(bundles) if self.labels is not None else None
+            ))
 
-        pgs = [
-            placement_group(bundles=bundles, strategy=strategy, name=pg_name_prefix + str(idx), lifetime=lifetime)
-            for idx, bundles in enumerate(pg_scheme)
-        ]
-
-        ray.get([pg.ready() for pg in pgs])
+        _timeout_mins = 5
+        pg_ready_timeout = float(60 * _timeout_mins)
+        try:
+            ray.get([pg.ready() for pg in pgs], timeout=pg_ready_timeout)
+        except ray.exceptions.GetTimeoutError:
+            from ray.util import placement_group_table
+            pending = [
+                f"{entry['name']} state={entry['state']} stats={entry.get('stats', {})}"
+                for entry in placement_group_table().values()
+                if entry.get("state") != "CREATED"
+            ]
+            raise RuntimeError(
+                f"Placement groups not ready after {pg_ready_timeout:.0f}s "
+                f"(labels={self.labels}, bundles/pg={self._store}). "
+                f"A labeled node is likely missing, unhealthy, or its GPUs are held by "
+                f"another process. Non-created placement groups:\n" + "\n".join(pending)
+            ) from None
 
         self.pgs = sort_placement_group_by_node_ip(pgs)
         return pgs
@@ -191,6 +213,7 @@ class ResourcePoolManager:
     mapping: dict[int, str]
     max_colocate_count: int = 3
     resource_pool_dict: dict[str, RayResourcePool] = field(default_factory=dict)
+    resource_pool_labels: Dict[str, Dict[str, str]] = None
 
     def create_resource_pool(self):
         """Create Ray resource pools for distributed training.
@@ -210,6 +233,7 @@ class ResourcePoolManager:
                 use_gpu=True,
                 max_colocate_count=self.max_colocate_count,
                 name_prefix=resource_pool_name,
+                labels=self.resource_pool_labels[resource_pool_name] if self.resource_pool_labels is not None else None
             )
             self.resource_pool_dict[resource_pool_name] = resource_pool
 
@@ -225,6 +249,8 @@ class ResourcePoolManager:
 
     def _check_resource_available(self):
         """Check if the resource pool can be satisfied in this ray cluster."""
+        # TODO: add label checking
+
         node_available_resources = ray._private.state.available_resources_per_node()
         node_available_gpus = {
             node: node_info.get("GPU", 0) if "GPU" in node_info else node_info.get("NPU", 0)
@@ -985,7 +1011,7 @@ def _determine_fsdp_megatron_base_class(mros: list):
 
 
 # deprecated, switching to FusedWorker
-def create_colocated_worker_cls(class_dict: dict[str, RayClassWithInitArgs]):
+def create_colocated_worker_cls(class_dict: dict[str, RayClassWithInitArgs], class_name: str = None):
     """
     This function should return a class instance that delegates the calls to every
     cls in cls_dict
@@ -1023,6 +1049,10 @@ def create_colocated_worker_cls(class_dict: dict[str, RayClassWithInitArgs]):
     for key, user_defined_cls in cls_dict.items():
         user_defined_cls = _unwrap_ray_remote(user_defined_cls)
         _bind_workers_method_to_parent(WorkerDict, key, user_defined_cls)
+
+    if class_name is not None and isinstance(class_name, str):
+        WorkerDict.__name__ = class_name
+        WorkerDict.__qualname__ = class_name
 
     remote_cls = ray.remote(WorkerDict)
     remote_cls = RayClassWithInitArgs(cls=remote_cls)

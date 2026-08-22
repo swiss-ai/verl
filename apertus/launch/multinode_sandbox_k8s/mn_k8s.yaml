@@ -9,7 +9,7 @@ defaults:
 
 async_training:
   staleness_threshold: 0.1
-  trigger_parameter_sync_step: 4
+  trigger_parameter_sync_step: 1
   require_batches: 2
   partial_rollout: True
   use_trainer_do_validate: False
@@ -123,11 +123,11 @@ critic:
 
 
 trainer:
-  total_epochs: 50
+  total_epochs: 100
   total_training_steps: -1 # put an arbitrarily big value
   save_freq: 50
-  test_freq: 5 # don't do this too often, running the validation can take some time
-  max_actor_ckpt_to_keep: 10
+  test_freq: 20 # don't do this too often, running the validation can take some time
+  max_actor_ckpt_to_keep: 2
   max_critic_ckpt_to_keep: null
   project_name: multi-node-rl-test
   logger: [console, wandb]

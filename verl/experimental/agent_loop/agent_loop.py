@@ -1350,7 +1350,7 @@ class AgentLoopManager:
         node_ids = [
             node["NodeID"]
             for node in ray.nodes()
-            if node["Alive"] and node["Resources"].get("CPU", 0) > 0
+            if node["Alive"] and node["Resources"].get("CPU", 0) > 0 and "rollout" in node.get("Labels", {})
         ]
         for i in range(num_workers):
             # Round-robin scheduling over the all nodes

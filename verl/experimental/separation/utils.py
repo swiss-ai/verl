@@ -31,6 +31,7 @@ def create_resource_pool_manager(config, roles: list) -> ResourcePoolManager:
         ResourcePoolManager: Resource pool manager
     """
     resource_pool_spec = {}
+    resource_pool_labels = {}
     mapping = {}
 
     # Actor/Critic resource pool
@@ -41,7 +42,8 @@ def create_resource_pool_manager(config, roles: list) -> ResourcePoolManager:
 
         trainer_pool = [config.trainer.n_gpus_per_node] * config.trainer.nnodes
         resource_pool_spec["trainer_pool"] = trainer_pool
-
+        resource_pool_labels["trainer_pool"] = {"actor": "true"}
+        
         for role in training_roles:
             if role in roles:
                 mapping[role] = "trainer_pool"
@@ -56,7 +58,7 @@ def create_resource_pool_manager(config, roles: list) -> ResourcePoolManager:
         assert rm_cfg.n_gpus_per_node > 0, "config.reward.reward_model.n_gpus_per_node must be greater than 0"
         assert rm_cfg.nnodes > 0, "config.reward.reward_model.nnodes must be greater than 0"
 
-    return ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
+    return ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping, resource_pool_labels=resource_pool_labels)
 
 
 def create_role_worker_mapping(config):

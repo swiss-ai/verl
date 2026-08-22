@@ -89,7 +89,6 @@ def migrate_legacy_reward_impl(config):
 
     return config
 
-
 class RewardLoopWorker:
     """
     RewardLoopWork can tackle reward computation:
@@ -304,8 +303,14 @@ class RewardLoopManager:
     def _init_reward_loop_workers(self):
         self.reward_loop_workers = []
         num_workers = self.config.reward.num_workers
-        node_ids = [node["NodeID"] for node in ray.nodes() if node["Alive"] and node["Resources"].get("CPU", 0) > 0]
-
+        node_ids = []
+        for node in ray.nodes():
+            if (
+                node["Alive"] and 
+                node["Resources"].get("CPU", 0) > 0 and
+                "rollout" in node.get("Labels", {}).keys()
+            ):
+                node_ids.append(node["NodeID"])
         for i in range(num_workers):
             # Round-robin scheduling over the all nodes
             node_id = node_ids[i % len(node_ids)]
@@ -315,7 +320,7 @@ class RewardLoopManager:
                     name=f"reward_loop_worker_{i}",
                     scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
                         node_id=node_id,
-                        soft=True,
+                        soft=False,
                     ),
                 ).remote(self.config, self.reward_router_address)
             )

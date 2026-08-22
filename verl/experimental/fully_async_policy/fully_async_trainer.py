@@ -56,7 +56,6 @@ class TrainingStopException(Exception):
     pass
 
 
-@ray.remote(num_cpus=10)
 class FullyAsyncTrainer(SeparateRayPPOTrainer):
     """
     A fully asynchronous PPO trainer that obtains samples from a MessageQueue for training.
@@ -366,7 +365,6 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         pass
 
     def _init_models(self):
-        self._check_checkpoint()
         if self.use_critic:
             self.critic_wg = self.all_wg[str(Role.Critic)]
             self.critic_wg.init_model()
@@ -385,10 +383,14 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         1. Ray resource pools from configuration
         2. Worker groups for each role (actor, critic, etc.)
         """
+        self._check_checkpoint()
         self._init_resource_pools()
         self._create_worker_classes()
         self._init_worker_groups()
         self._init_models()
+
+    async def get_resource_pool(self):
+        return self.resource_pool_manager.get_resource_pool(self.train_role)
 
     async def fit(self):
         """
@@ -814,7 +816,9 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         actor_path = os.path.join(global_step_folder, "actor")
         if (self.config.actor_rollout_ref.actor.megatron.use_dist_checkpointing):
             self.config.actor_rollout_ref.actor.megatron.dist_checkpointing_path = actor_path
-            self._is_checkpoint_init = True
+        else:
+            self.config.actor_rollout_ref.model.path = os.path.join(actor_path, "model/huggingface")
+        self._is_checkpoint_init = True
 
     async def load_checkpoint(self):
         if self._is_checkpoint_init:

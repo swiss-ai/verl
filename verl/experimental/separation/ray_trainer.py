@@ -114,7 +114,7 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
         self._init_worker_groups()
         self._init_models()
         self._init_reward_loop()
-        self._init_async_rollout_manager()
+        self._init_async_replicas()
 
         # Support custom CheckpointEngineManager via config
         checkpoint_manager_class_fqn = self.config.actor_rollout_ref.rollout.get("checkpoint_manager_class")
@@ -218,7 +218,11 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
         wg_kwargs["device_name"] = self.device_name
 
         for resource_pool, class_dict in self.resource_pool_to_cls.items():
-            worker_dict_cls = create_colocated_worker_cls(class_dict=class_dict)
+            # i frankly have no idea why they made something so contrived but whatever
+            name = list(class_dict.keys())[0]
+            if (name == "actor"):
+                name = "Megatron" if self.config.model_engine == "megatron" else "Actor"
+            worker_dict_cls = create_colocated_worker_cls(class_dict=class_dict, class_name=name)
             wg_dict = self.ray_worker_group_cls(
                 resource_pool=resource_pool,
                 ray_cls_with_init=worker_dict_cls,
@@ -264,7 +268,7 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
             rm_resource_pool=resource_pool,
         )
 
-    def _init_async_rollout_manager(self):
+    def _init_async_replicas(self):
         pass
 
     def fit(self):

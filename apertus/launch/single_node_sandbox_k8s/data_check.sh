@@ -5,6 +5,7 @@ set -ueo
 # tie tool gym tools to local path so it isn't all over the place
 export TOOL_GYM_FUNCTION_TOOL_PATH=$(realpath ../../apertus_functional_tools.py )
 echo $TOOL_GYM_FUNCTION_TOOL_PATH
+export LAUNCH_SCRIPT_DIR=$(realpath .)
 
 export RUN_DIR=$(realpath ./outputs)
 
@@ -12,6 +13,7 @@ source ./environment.sh
 
 build_overrides() {
   overrides=(
+    "--config-dir=${VERL_DIR}/apertus/launch/single_node_sandbox_k8s/"
     "--config-name=async_single_node"
     "data.train_files=['${TRAIN_FILE}']"
     "data.val_files=['${VAL_FILE}']"

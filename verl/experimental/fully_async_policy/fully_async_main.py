@@ -21,6 +21,7 @@ from pprint import pprint
 import hydra
 import ray
 from omegaconf import OmegaConf
+import time
 
 from verl.experimental.fully_async_policy.fully_async_rollouter import (
     FullyAsyncRollouter,
@@ -38,23 +39,55 @@ from verl.experimental.separation.utils import (
 from verl.trainer.ppo.utils import Role
 from verl.utils.device import auto_set_device
 from verl.utils.fs import copy_to_local
+from dataclasses import dataclass
+from typing import List
 
+@dataclass
+class FullyAsyncClusterConfig:
+    trainer_head_id: str
+    rollout_head_id: str
+    trainer_nodes_ids: List[str]
+    rollout_nodes_ids: List[str]
 
-@ray.remote(num_cpus=1)
 class FullyAsyncTaskRunner:
     """
     Ray remote class for executing distributed PPO training tasks.
     """
 
     def __init__(self):
+        self.node_ids = []
+        self.train_node_ids = []
         self.running = False
         self.components = {}
         self.shutdown_event = threading.Event()
 
     def run(self, config):
         print("[ASYNC MAIN] Starting fully async PPO training...")
+        self.cluster_config = validate_cluster(config)
+        self._resolve_nodes()
         self._initialize_components(config)
         self._run_training_loop()
+
+    def _resolve_nodes(self):
+        self.fully_async_trainer_cls = ray.remote(
+            num_cpus=10,
+            label_selector={"actor": "true", "trainer_head": "true"}
+        )(FullyAsyncTrainer).options(
+            scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
+                node_id=self.cluster_config.trainer_head_id,
+                soft=False,
+            )
+        )
+        self.fully_async_rollout_cls = ray.remote(
+            num_cpus=10,
+            max_concurrency=100,
+            label_selector={"rollout": "true", "rollout_head": "true"}
+        )(FullyAsyncRollouter).options(
+            scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
+                node_id=self.cluster_config.rollout_head_id,
+                soft=False,
+            )
+        )
 
     def _initialize_components(self, config) -> None:
         print(
@@ -62,6 +95,8 @@ class FullyAsyncTaskRunner:
         )
         pprint(OmegaConf.to_container(config, resolve=True))
         OmegaConf.resolve(config)
+
+        self._resolve_nodes()
 
         print("[ASYNC MAIN] Initializing tokenizer...")
         use_shm = config.actor_rollout_ref.model.get("use_shm", False)
@@ -88,18 +123,7 @@ class FullyAsyncTaskRunner:
         self.components["role_worker_mapping"] = role_worker_mapping
         self.components["ray_worker_group_cls"] = ray_worker_group_cls
 
-        print(
-            "[ASYNC MAIN] Creating FullyAsyncTrainer first (needed for hybrid worker group injection)..."
-        )
-        self._create_trainer(config)
-
-        print(
-            "[ASYNC MAIN] Injecting trainer's worker group into rollouter for hybrid replicas..."
-        )
-        self._setup_hybrid_worker_group(config)
-
-        print("[ASYNC MAIN] Creating FullyAsyncRollouter...")
-        self._create_rollouter(config)
+        self._create_trainer_rollouter(config)
 
         print("[ASYNC MAIN] Setting up rollouter reference on trainer")
         ray.get(
@@ -127,21 +151,20 @@ class FullyAsyncTaskRunner:
         self.components["message_queue"] = message_queue
         self.components["message_queue_client"] = message_queue_client
 
-        ray.get(
+        ray.get([
             self.components["rollouter"].set_message_queue_client.remote(
                 self.components["message_queue_client"]
-            )
-        )
-        ray.get(
+            ),
             self.components["trainer"].set_message_queue_client.remote(
                 self.components["message_queue_client"]
             )
-        )
+        ])
 
         # param_version resume from ckpt or default 0
-        tload_fut = self.components["trainer"].load_checkpoint.remote()
-        rload_fut = self.components["rollouter"].load_checkpoint.remote()
-        ray.get([tload_fut, rload_fut])
+        ray.get([
+            self.components["trainer"].load_checkpoint.remote(), 
+            self.components["rollouter"].load_checkpoint.remote()
+        ])
 
         print("[ASYNC MAIN] Param sync before fit..")
         # This is the first iter of checkpoint_engine, meaning that no matter
@@ -154,40 +177,22 @@ class FullyAsyncTaskRunner:
 
         print("[ASYNC MAIN] All components initialized successfully")
 
-    def _create_rollouter(self, config) -> None:
-        print("[ASYNC MAIN] Starting create rollouter...")
-        rollouter = FullyAsyncRollouter.remote(
+    def _create_trainer_rollouter(self, config) -> None:
+        print("[ASYNC MAIN] Starting create trainer and rollouter...")
+        start = time.perf_counter()
+        rollouter = self.fully_async_rollout_cls.remote(
             config=config,
             tokenizer=self.components["tokenizer"],
             processor=self.components["processor"],
             device_name=config.trainer.device,
         )
-
-        # set_hybrid_worker_group must be called BEFORE init_workers() so that
-        # _init_async_rollout_manager can pass the hybrid WG to ALM.create().
-        if "hybrid_worker_group" in self.components:
-            ray.get(
-                rollouter.set_hybrid_worker_group.remote(
-                    self.components["hybrid_worker_group"]
-                )
-            )
-            print("[ASYNC MAIN] Hybrid worker group injected into rollouter")
-
-        ray.get(rollouter.init_workers.remote())
-        ray.get(rollouter.set_max_required_samples.remote())
-
-        self.components["rollouter"] = rollouter
-        print("[ASYNC MAIN] Rollouter created and initialized successfully")
-
-    def _create_trainer(self, config) -> None:
-        print("[ASYNC MAIN] Starting create trainer...")
         trainer_role_mapping = {
             role: worker_cls
             for role, worker_cls in self.components["role_worker_mapping"].items()
             if role != Role.Rollout
         }
 
-        trainer = FullyAsyncTrainer.remote(
+        trainer = self.fully_async_trainer_cls.remote(
             config=config,
             tokenizer=self.components["tokenizer"],
             role_worker_mapping=trainer_role_mapping,
@@ -198,28 +203,15 @@ class FullyAsyncTaskRunner:
             device_name=config.trainer.device,
         )
 
-        ray.get(trainer.init_workers.remote())
-        self.components["trainer"] = trainer
-        print("[ASYNC MAIN] FullyAsyncTrainer created and initialized successfully")
+        ray.get([trainer.init_workers.remote(), rollouter.init_workers.remote()])
+        ray.get(rollouter.set_max_required_samples.remote())
 
-    def _setup_hybrid_worker_group(self, config) -> None:
-        """
-        Extract the trainer's actor_rollout_wg and store it for later injection
-        into the rollouter. This WG backs the hybrid rollout replicas
-        used during trainer-side validation (use_trainer_do_validate).
-        """
-        trainer = self.components["trainer"]
-        if config.async_training.use_trainer_do_validate:
-            trainer_wg = ray.get(trainer.get_actor_wg.remote())
-            self.components["hybrid_worker_group"] = trainer_wg
-            print(
-                f"[ASYNC MAIN] Hybrid worker group extracted from trainer "
-                f"(world_size={getattr(trainer_wg, 'world_size', '?')})"
-            )
-        else:
-            print(
-                "[ASYNC MAIN] use_trainer_do_validate=False, skipping hybrid worker group setup"
-            )
+        self.components["rollouter"] = rollouter
+        self.components["trainer"] = trainer
+        end = time.perf_counter()
+        startup_time = (end-start)
+
+        print(f"[ASYNC MAIN] Trainer and Rollouter created and initialized successfully in {startup_time} seconds")
 
     def _run_training_loop(self):
         self.running = True
@@ -258,6 +250,43 @@ class FullyAsyncTaskRunner:
             asyncio.run(self.components["message_queue_client"].clear_queue())
             print("[ASYNC MAIN] Training completed or interrupted")
 
+def validate_cluster(config):
+    trainer_head_id = None
+    rollout_head_id = None
+    rollout_nodes = []
+    trainer_nodes = []
+    for node in ray.nodes():
+        id = node["NodeID"]
+        ip = node["NodeManagerAddress"]
+        labels = node.get("Labels", {})
+        assert "actor" in labels.keys() or "rollout" in labels.keys(), f"Node with id {id} and ip {ip} must be actor or rollout!" 
+        if ("actor" in labels.keys()):
+            assert labels["actor"] == "true", "Only valid value for 'actor' label is 'true'"
+            trainer_nodes.append(id)
+        if ("rollout" in labels.keys()):
+            assert labels["rollout"] == "true", "Only valid value for 'rollout' label is 'true'"
+            rollout_nodes.append(id)
+        if ("trainer_head" in labels):
+            assert "actor" in labels.keys(), "Cannot be trainer head and not a trainer node"
+            assert labels["trainer_head"] == "true", "Only valid value for trainer_head label is 'true'"
+            assert trainer_head_id == None, "Cannot have multiple trainer head nodes"
+            trainer_head_id = node["NodeID"]
+        if ("rollout_head" in labels):
+            assert "rollout" in labels.keys(), "Cannot be rollout head and not a rollout node"
+            assert labels["rollout_head"] == "true", "Only valid value for rollout_head label is 'true'"
+            assert rollout_head_id == None, "Cannot have multiple rollout head nodes"
+            rollout_head_id = node["NodeID"]
+
+    assert config.rollout.nnodes == len(rollout_nodes), "Mismatch between nodes tagged rollout and rollout nodes in config"
+    assert config.trainer.nnodes == len(trainer_nodes), "Mismatch between nodes tagged trainer and trainer nodes in config"
+    assert trainer_head_id is not None, "No node specified as trainer head!"
+    assert rollout_head_id is not None, "No node specified as rollout head!"
+    return FullyAsyncClusterConfig(
+        trainer_head_id=trainer_head_id,
+        rollout_head_id=rollout_head_id,
+        trainer_nodes_ids=trainer_nodes,
+        rollout_nodes_ids=rollout_nodes
+    )
 
 @hydra.main(
     config_path="config", config_name="fully_async_ppo_trainer", version_base=None
@@ -277,7 +306,7 @@ def main(config):
     config.actor_rollout_ref.rollout.nnodes = config.rollout.nnodes
     config.actor_rollout_ref.rollout.n_gpus_per_node = config.rollout.n_gpus_per_node
     config = migrate_legacy_reward_impl(config)
-    run_ppo(config, task_runner_class=FullyAsyncTaskRunner)
+    run_ppo(config, task_runner_class=ray.remote(num_cpus=1)(FullyAsyncTaskRunner))
     print(f"total time: {time() - start_time:.2f} seconds")
 
 

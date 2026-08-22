@@ -209,7 +209,8 @@ class TrainingWorker(Worker, DistProfilerExtension):
         # log memory
         final_metrics["perf/max_memory_allocated_gb"] = get_torch_device().max_memory_allocated() / (1024**3)
         final_metrics["perf/max_memory_reserved_gb"] = get_torch_device().max_memory_reserved() / (1024**3)
-        final_metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
+        final_metrics["perf/actor_cpu_rss_gb"] = psutil.Process().memory_info().rss / (1024**3)
+        # final_metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
 
         # TODO: confirm the mtp loss IS same across dp
         for k, v in final_metrics.items():
