@@ -96,8 +96,6 @@ class FullyAsyncTaskRunner:
         pprint(OmegaConf.to_container(config, resolve=True))
         OmegaConf.resolve(config)
 
-        self._resolve_nodes()
-
         print("[ASYNC MAIN] Initializing tokenizer...")
         use_shm = config.actor_rollout_ref.model.get("use_shm", False)
         tokenizer_path = (

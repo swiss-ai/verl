@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --account=infra01
 #SBATCH --partition=normal
-#SBATCH --nodes=128
+#SBATCH --nodes=64
 #SBATCH --reservation=SD-69241-apertus-1-5-0
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=4
@@ -19,7 +19,7 @@ export CONFIG_PATH=$(realpath .)
 export WORKING_DIR=$(realpath .)
 export VERL_DIR=$(realpath ../../../)
 export NNODES=$SLURM_JOB_NUM_NODES
-export TRAIN_NODES=64
+export TRAIN_NODES=32
 export USE_TOOLS=0
 if [ $USE_TOOLS -eq 1 ]; then
   NO_FORMAT=0

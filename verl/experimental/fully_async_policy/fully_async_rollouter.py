@@ -785,7 +785,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         loop = asyncio.get_running_loop()
         self.reward_loop_manager = await loop.run_in_executor(
             None,
-            lambda: RewardLoopManager(config=self.config, rm_resource_pool=None),
+            lambda: RewardLoopManager(config=self.config, rm_resource_pool=None, pin_to_rollout=True),
         )
 
     async def _create_agent_loop_manager(self):
@@ -803,6 +803,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             llm_client=self.llm_server_manager.get_client(client_cls=FullyAsyncLLMServerClient),
             reward_loop_worker_handles=reward_loop_worker_handles,
             teacher_client=self.teacher_model_manager.get_client() if self.teacher_model_manager else None,
+            pin_on_rollout=True
         )
 
 

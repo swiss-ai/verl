@@ -14,7 +14,7 @@
 import os
 
 from verl.utils.import_utils import deprecated
-
+import asyncio
 
 def _code_sandbox_backend():
     backend = os.environ.get("SANDBOX_BACKEND", "kubernetes")
@@ -30,6 +30,197 @@ def _code_test_cases_for_prime_code(ground_truth, extra_info):
             if value:
                 return value
     return ground_truth
+
+MATH_VERIFY_SOURCES = [
+    "lighteval/MATH",
+    "DigitalLearningGmbH/MATH-lighteval",
+    "HuggingFaceH4/MATH-500",
+    "SynthLabsAI/Big-Math-RL-Verified",
+    "nlile/NuminaMath-1.5-RL-Verifiable",
+    "zwhe99/DeepMath-103K",
+    "deepmath",
+    "deepscaler",
+    "math500",
+    "amc23",
+    "amc2023",
+    "aime2024",
+    "aime2025",
+    "aime2026",
+    "beyondaime",
+    "openai/gsm8k",
+    "gsm8k_boxed",
+    "dapo_en",
+    "hendrycks-math-12k",
+]
+
+MULTIPLE_CHOICE_SOURCES = [
+    "mmlu",
+    "gpqa_diamond",
+    "gpqa",
+    "Idavidrein/gpqa",
+    "riddle_sense",
+    "lexam_mcq",
+]
+
+IF_SOURCES = [
+    "allenai/IF_multi_constraints_upto5",
+    "swiss-ai/if-rl-singleturn-prompts",
+    "swiss-ai/if-rl-singleturn-hard-prompts",
+    "google/IFEval",
+    "allenai/IFBench_test",
+]
+
+CODE_SOURCES = [
+    "taco",
+    "likaixin/TACO-verified",
+    "lighteval/code_generation_lite",
+    "codecontests",
+    "deepmind/code_contests",
+    "code_contests",
+    "apps",
+    "codeforces",
+]
+
+async def async_compute_score(
+    data_source,
+    solution_str,
+    ground_truth,
+    extra_info=None,
+    sandbox_fusion_url=None,
+    concurrent_semaphore=None,
+    memory_limit_mb=None,
+    continuous=True,
+    **kwargs, 
+):
+    loop = asyncio.get_running_loop()
+
+    async def compute_score_in_threadpool(module, *args, **kwargs):
+        return await loop.run_in_executor(
+            None,
+            lambda: module.compute_score(*args, **kwargs)
+        )
+    
+    if data_source in MATH_VERIFY_SOURCES:
+        from . import math_verify
+        res = await math_verify.compute_score_async(
+            solution_str, ground_truth, data_source=data_source
+        )
+    elif data_source in MULTIPLE_CHOICE_SOURCES:
+        from . import multiple_choice
+        res = await compute_score_in_threadpool(
+            multiple_choice, solution_str, ground_truth, data_source=data_source)
+        # res = multiple_choice.compute_score(
+        #     solution_str, ground_truth, data_source=data_source
+        # )
+    elif data_source in IF_SOURCES:
+        from . import instruction_following
+        res = await compute_score_in_threadpool(
+            instruction_following, solution_str, ground_truth, extra_info=extra_info, data_source=data_source
+        )
+        # res = instruction_following.compute_score(
+        #     solution_str, ground_truth, extra_info=extra_info, data_source=data_source
+        # )
+    elif data_source in [
+        "humaneval",
+        "openai/openai_humaneval",
+    ]:
+        from . import prime_code
+        res = await compute_score_in_threadpool(
+            prime_code, solution_str, ground_truth, continuous=True, data_source=data_source
+        )
+        # res = prime_code.compute_score(
+        #     solution_str, ground_truth, continuous=True, data_source=data_source
+        # )
+    elif data_source in CODE_SOURCES:
+        # Select code evaluation sandbox backend
+        sandbox_backend = _code_sandbox_backend()
+        if sandbox_backend == "kubernetes":
+            sandbox_url = sandbox_fusion_url or os.environ.get("KUBERNETES_SANDBOX_URL")
+            from . import kubernetes_sandbox as code_sandbox
+        elif sandbox_backend == "codegym":
+            sandbox_url = sandbox_fusion_url or os.environ.get("SCHEDULER_URL")
+            from . import codegym_sandbox as code_sandbox
+        else:
+            sandbox_url = None
+
+        if sandbox_url:
+            res = await compute_score_in_threadpool(
+                code_sandbox,
+                data_source=data_source,
+                solution_str=solution_str,
+                ground_truth=ground_truth,
+                extra_info=extra_info,
+                sandbox_fusion_url=sandbox_url,
+                concurrent_semaphore=concurrent_semaphore,
+                memory_limit_mb=memory_limit_mb,
+                continuous=continuous,                
+            )
+            # res = code_sandbox.compute_score(
+            #     data_source=data_source,
+            #     solution_str=solution_str,
+            #     ground_truth=ground_truth,
+            #     extra_info=extra_info,
+            #     sandbox_fusion_url=sandbox_url,
+            #     concurrent_semaphore=concurrent_semaphore,
+            #     memory_limit_mb=memory_limit_mb,
+            #     continuous=continuous,
+            # )
+        else:
+            from . import prime_code
+
+            test_cases = _code_test_cases_for_prime_code(ground_truth, extra_info)
+            res = await compute_score_in_threadpool(
+                prime_code, solution_str, test_cases, continuous=continuous, data_source=data_source
+            )
+    elif data_source == "rgym":
+        from . import rgym
+        res = await compute_score_in_threadpool(rgym, data_source, solution_str, ground_truth, extra_info)
+        # res = rgym.compute_score(data_source, solution_str, ground_truth, extra_info)
+    elif data_source == "qa_gym":
+        from . import qa_gym
+        res = await compute_score_in_threadpool(qa_gym, data_source, solution_str, ground_truth, extra_info)
+        # res = qa_gym.compute_score(data_source, solution_str, ground_truth, extra_info)
+    elif isinstance(data_source, str) and data_source.startswith("tablegpt/"):
+        from . import table_gpt
+        res = await compute_score_in_threadpool(table_gpt, data_source, solution_str, ground_truth, extra_info)
+        # res = table_gpt.compute_score(
+        #     data_source, solution_str, ground_truth, extra_info
+        # )
+    elif isinstance(data_source, str) and data_source.startswith("blindtasks"):
+        from . import blindtasks
+        res = await compute_score_in_threadpool(blindtasks, data_source, solution_str, ground_truth, extra_info)
+        # res = blindtasks.compute_score(
+        #     data_source, solution_str, ground_truth, extra_info
+        # )
+    elif isinstance(data_source, str) and data_source.startswith("tool_gym"):
+        from . import toolgym
+        res = await compute_score_in_threadpool(
+            toolgym, 
+            data_source,
+            solution_str,
+            ground_truth,
+            extra_info,
+            **kwargs,
+        )
+        # res = toolgym.compute_score(
+        #     data_source,
+        #     solution_str,
+        #     ground_truth,
+        #     extra_info,
+        #     **kwargs,
+        # )
+    else:
+        raise NotImplementedError(
+            f"Reward function is not implemented for {data_source}"
+        )
+
+    if isinstance(res, dict):
+        return res
+    elif isinstance(res, int | float | bool):
+        return float(res)
+    else:
+        return float(res[0])
+
 
 
 def default_compute_score(
@@ -58,27 +249,7 @@ def default_compute_score(
     Raises:
         NotImplementedError: If the reward function is not implemented for the given data source.
     """
-    if data_source in [
-        "lighteval/MATH",
-        "DigitalLearningGmbH/MATH-lighteval",
-        "HuggingFaceH4/MATH-500",
-        "SynthLabsAI/Big-Math-RL-Verified",
-        "nlile/NuminaMath-1.5-RL-Verifiable",
-        "zwhe99/DeepMath-103K",
-        "deepmath",
-        "deepscaler",
-        "math500",
-        "amc23",
-        "amc2023",
-        "aime2024",
-        "aime2025",
-        "aime2026",
-        "beyondaime",
-        "openai/gsm8k",
-        "gsm8k_boxed",
-        "dapo_en",
-        "hendrycks-math-12k",
-    ]:
+    if data_source in MATH_VERIFY_SOURCES:
         # [Optional] Math-Verify Integration
         # For enhanced accuracy, consider utilizing Math-Verify (https://github.com/huggingface/Math-Verify).
         # Note: Math-Verify needs to be manually installed via pip: `pip install math-verify`.
@@ -89,26 +260,13 @@ def default_compute_score(
         res = math_verify.compute_score(
             solution_str, ground_truth, data_source=data_source
         )
-    elif data_source in [
-        "mmlu",
-        "gpqa_diamond",
-        "gpqa",
-        "Idavidrein/gpqa",
-        "riddle_sense",
-        "lexam_mcq",
-    ]:
+    elif data_source in MULTIPLE_CHOICE_SOURCES:
         from . import multiple_choice
 
         res = multiple_choice.compute_score(
             solution_str, ground_truth, data_source=data_source
         )
-    elif data_source in [
-        "allenai/IF_multi_constraints_upto5",
-        "swiss-ai/if-rl-singleturn-prompts",
-        "swiss-ai/if-rl-singleturn-hard-prompts",
-        "google/IFEval",
-        "allenai/IFBench_test",
-    ]:
+    elif data_source in IF_SOURCES:
         from . import instruction_following
 
         res = instruction_following.compute_score(
@@ -123,16 +281,7 @@ def default_compute_score(
         res = prime_code.compute_score(
             solution_str, ground_truth, continuous=True, data_source=data_source
         )
-    elif data_source in [
-        "taco",
-        "likaixin/TACO-verified",
-        "lighteval/code_generation_lite",
-        "codecontests",
-        "deepmind/code_contests",
-        "code_contests",
-        "apps",
-        "codeforces",
-    ]:
+    elif data_source in CODE_SOURCES:
         # Select code evaluation sandbox backend
         sandbox_backend = _code_sandbox_backend()
         if sandbox_backend == "kubernetes":
@@ -231,7 +380,7 @@ def _default_compute_score(
 
 def get_default_compute_score(reward_name: str | None):
     """Get the default compute_score function based on the reward manager type."""
-    return default_compute_score
+    return async_compute_score
 
 
 __all__ = ["default_compute_score"]

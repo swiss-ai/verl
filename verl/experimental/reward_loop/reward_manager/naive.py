@@ -18,7 +18,7 @@ from verl import DataProto
 from verl.experimental.reward_loop.reward_manager import register
 from verl.experimental.reward_loop.reward_manager.base import RewardManagerBase
 from verl.utils.reward_score import default_compute_score
-
+import traceback
 
 @register("naive")
 class NaiveRewardManager(RewardManagerBase):
@@ -33,15 +33,27 @@ class NaiveRewardManager(RewardManagerBase):
         reward_model_tokenizer=None,
     ):
         super().__init__(config, tokenizer, compute_score)
-        def noexcept_score(*args, **kwargs):
-            fn = compute_score or default_compute_score
-            try:
-                res = fn(*args, **kwargs)
-            except:
-                res = -1.0
-            return res
+        compute_score = compute_score or default_compute_score
+        self.is_async_reward_score = inspect.iscoroutinefunction(compute_score)
+        if self.is_async_reward_score:
+            async def noexcept_score(*args, **kwargs):
+                try:
+                    res = await compute_score(*args, **kwargs)
+                except:
+                    print(f"Rollout from source: {kwargs["data_source"]} had an error")
+                    traceback.print_exc()
+                    res = 0.0
+                return res
+        else:
+            def noexcept_score(*args, **kwargs):
+                try:
+                    res = compute_score(*args, **kwargs)
+                except:
+                    print(f"Rollout from source: {kwargs["data_source"]} had an error")
+                    traceback.print_exc()
+                    res = 0.0
+                return res
         self.compute_score = noexcept_score
-        self.is_async_reward_score = inspect.iscoroutinefunction(self.compute_score)
         self.reward_router_address = reward_router_address
         self.reward_model_tokenizer = reward_model_tokenizer
 

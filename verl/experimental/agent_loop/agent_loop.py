@@ -1324,6 +1324,7 @@ class AgentLoopManager:
         llm_client: LLMServerClient,
         teacher_client: dict[str, LLMServerClient] = None,
         reward_loop_worker_handles: list[ray.actor.ActorHandle] = None,
+        pin_on_rollout: bool = False
     ):
         self.config = config
         self.rollout_config = config.actor_rollout_ref.rollout
@@ -1340,17 +1341,21 @@ class AgentLoopManager:
     async def create(cls, *args, **kwargs):
         """Create agent loop manager."""
         instance = cls(*args, **kwargs)
-        await instance._init_agent_loop_workers()
+        await instance._init_agent_loop_workers(kwargs.get("pin_on_rollout", False))
         return instance
 
-    async def _init_agent_loop_workers(self):
+    async def _init_agent_loop_workers(self, pin_on_rollout: bool):
         self.agent_loop_workers = []
         num_workers = self.rollout_config.agent.num_workers
 
         node_ids = [
             node["NodeID"]
             for node in ray.nodes()
-            if node["Alive"] and node["Resources"].get("CPU", 0) > 0 and "rollout" in node.get("Labels", {})
+            if (
+                node["Alive"] and 
+                node["Resources"].get("CPU", 0) > 0 and 
+                (not pin_on_rollout or "rollout" in node.get("Labels", {})
+                ))
         ]
         for i in range(num_workers):
             # Round-robin scheduling over the all nodes

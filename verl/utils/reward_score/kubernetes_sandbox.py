@@ -47,13 +47,13 @@ def _record_verification_throughput(started_at: float, elapsed_seconds: float, s
         completed = _VERIFICATION_COUNT
         successes = _VERIFICATION_SUCCESS_COUNT
 
-    log_reward_info(
-        logger,
-        "kubernetes_sandbox",
-        f"completed={completed} successes={successes} "
-        f"elapsed_s={total_elapsed_seconds:.2f} "
-        f"throughput={throughput:.2f}/s last_latency_s={elapsed_seconds:.2f}",
-    )
+    # log_reward_info(
+    #     logger,
+    #     "kubernetes_sandbox",
+    #     f"completed={completed} successes={successes} "
+    #     f"elapsed_s={total_elapsed_seconds:.2f} "
+    #     f"throughput={throughput:.2f}/s last_latency_s={elapsed_seconds:.2f}",
+    # )
 
 
 def _normalize_language(language: Any) -> str:

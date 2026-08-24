@@ -12,6 +12,7 @@ RUN cd / && \
     cd Megatron-LM && \
     git checkout apertus && \
     pip install -e . && \
+    cd / && \
     git clone https://github.com/wqwqazwsxedc/Megatron-Bridge.git && \
     cd Megatron-Bridge && \
     git checkout apertus && \
@@ -24,13 +25,16 @@ RUN pip install cupy-cuda13x \
     langdetect \
     immutabledict \
     emoji \
-    syllapy
+    syllapy \
+    pebble
     
 RUN mkdir -p -m 0700 ~/.ssh && ssh-keyscan github.com >> ~/.ssh/known_hosts
-RUN --mount=type=ssh git clone git@github.com:swiss-ai/tool-gym.git && \
+RUN --mount=type=ssh cd / && \
+    git clone git@github.com:swiss-ai/tool-gym.git && \
     cd tool-gym && \
     git checkout fix-verl-packaging-paths && \
     pip install --ignore-installed -e . && \
+    cd / && \
     git clone https://github.com/wqwqazwsxedc/r-gym.git && \
     cd r-gym && \
     git checkout translate && \

@@ -275,7 +275,7 @@ class RewardLoopManager:
     This class will create reward loop workers and manage them.
     """
 
-    def __init__(self, config: DictConfig, rm_resource_pool: RayResourcePool = None):
+    def __init__(self, config: DictConfig, rm_resource_pool: RayResourcePool = None, pin_to_rollout = False):
         self.config = config
         if self.config.reward.reward_model.enable:
             self.reward_model_manager = RewardModelManager(config.reward.reward_model, rm_resource_pool)
@@ -286,7 +286,7 @@ class RewardLoopManager:
 
         self.reward_loop_workers_class = ray.remote(RewardLoopWorker)
         self.reward_manager_cls = resolve_reward_manager_cls(config)
-        self._init_reward_loop_workers()
+        self._init_reward_loop_workers(pin_to_rollout)
 
     @property
     def reward_loop_worker_handles(self) -> list[ActorHandle]:
@@ -300,7 +300,7 @@ class RewardLoopManager:
             return self.reward_loop_workers
         return None
 
-    def _init_reward_loop_workers(self):
+    def _init_reward_loop_workers(self, pin_to_rollout: bool):
         self.reward_loop_workers = []
         num_workers = self.config.reward.num_workers
         node_ids = []
@@ -308,7 +308,7 @@ class RewardLoopManager:
             if (
                 node["Alive"] and 
                 node["Resources"].get("CPU", 0) > 0 and
-                "rollout" in node.get("Labels", {}).keys()
+                (not pin_to_rollout or "rollout" in node.get("Labels", {}).keys())
             ):
                 node_ids.append(node["NodeID"])
         for i in range(num_workers):

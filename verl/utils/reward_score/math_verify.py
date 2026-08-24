@@ -18,6 +18,8 @@ import sys
 import threading
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeoutError
+import pebble
+import asyncio
 
 from .logging_utils import get_reward_logger, log_reward_error
 
@@ -28,7 +30,7 @@ _pool_lock = threading.Lock()
 
 def _pool_init():
     import resource, sys
-    lim = 8 << 30 
+    lim = 8 << 30
     resource.setrlimit(resource.RLIMIT_AS, (lim, lim))
     sys.set_int_max_str_digits(50_000)
 
@@ -99,6 +101,94 @@ def compute_score(
         ret_score = future.result(timeout=timeout)
     except FuturesTimeoutError:
         ret_score = timeout_score
+    except Exception as exc:
+        log_reward_error(
+            logger,
+            "math_verify",
+            "returning 0 reward",
+            data_source=data_source,
+            exc=exc,
+        )
+    return ret_score
+
+_fast_pool = None
+_slow_pool = None
+_fast_pool_lock = threading.Lock()
+_slow_pool_lock = threading.Lock()
+
+def _forkserver_context():
+    # forkserver makes the post-kill worker respawn cheap (~ms fork from a
+    # preloaded process instead of spawn + fresh sympy import), which is what
+    # keeps the fast-tier eviction affordable.
+    context = multiprocessing.get_context("forkserver")
+    context.set_forkserver_preload(["math_verify.grader", "math_verify.parser"])
+    return context
+
+def _get_fast_pool():
+    global _fast_pool
+    if _fast_pool is None:
+        with _fast_pool_lock:
+            if _fast_pool is None:
+                _fast_pool = pebble.ProcessPool(
+                    max_workers=8,
+                    max_tasks=0,
+                    initializer=_pool_init,
+                    context=_forkserver_context()
+                )
+    return _fast_pool
+
+def _get_slow_pool():
+    global _slow_pool
+    if _slow_pool is None:
+        with _slow_pool_lock:
+            if _slow_pool is None:
+                _slow_pool = pebble.ProcessPool(
+                    max_workers=4,
+                    max_tasks=0,
+                    initializer=_pool_init,
+                    context=_forkserver_context()
+                )
+    return _slow_pool
+
+async def compute_score_async(
+    model_output: str,
+    ground_truth: str,
+    timeout_score: float = 0.0,
+    fast_timeout = 3.0,
+    timeout: float = 15.0,
+    data_source: str | None = None,
+) -> float:
+    ret_score = 0.0
+    ground_truth_boxed = "\\boxed{" + ground_truth + "}"
+    future = _get_fast_pool().schedule(
+        _verify_in_subprocess,
+        args=[ground_truth_boxed, model_output],
+        timeout=fast_timeout
+    )
+    retry = False
+    try:
+        ret_score = await asyncio.wrap_future(future)
+    except (TimeoutError, pebble.ProcessExpired):
+        retry = True
+    except Exception as exc:
+        log_reward_error(
+            logger,
+            "math_verify",
+            "returning 0 reward",
+            data_source=data_source,
+            exc=exc,
+        )
+    if not retry:
+        return ret_score
+    slow_future = _get_slow_pool().schedule(
+        _verify_in_subprocess,
+        args=[ground_truth_boxed, model_output],
+        timeout=timeout
+    )
+    try:
+        ret_score = await asyncio.wrap_future(slow_future)
+    except (TimeoutError, pebble.ProcessExpired):
+        return timeout_score
     except Exception as exc:
         log_reward_error(
             logger,
