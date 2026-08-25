@@ -46,6 +46,7 @@ from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, shou
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
 from verl.utils.tracking import Tracking
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -384,10 +385,12 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         2. Worker groups for each role (actor, critic, etc.)
         """
         self._check_checkpoint()
+        self._load_checkpoint_shmem()
         self._init_resource_pools()
         self._create_worker_classes()
         self._init_worker_groups()
         self._init_models()
+        self._cleanup_checkpoint_from_shmem()
 
     async def get_resource_pool(self):
         return self.resource_pool_manager.get_resource_pool(self.train_role)
@@ -771,6 +774,91 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         )
         with open(local_latest_checkpointed_iteration, "w") as f:
             f.write(str(self.current_param_version))
+
+    def _load_checkpoint_shmem(self):
+        if (not self.config.actor_rollout_ref.model.use_model_shm
+            or self.config.actor_rollout_ref.actor.megatron.use_dist_checkpointing
+            or self.config.model_engine != "megatron"):
+            print(f"Incompatible configuration, skipping loading checkpoint into shared memory")
+            return
+
+        @ray.remote(num_cpus=8, label_selector={"actor": "true"})
+        def load_into_shmem(model_root):
+            import shutil
+            from concurrent.futures import ThreadPoolExecutor
+
+            src = Path(model_root)
+            dst = Path(f"/dev/shm/{os.environ['USER']}/model")
+            dst.mkdir(parents=True, exist_ok=True)
+
+            src_files = sorted(src.glob("*.safetensors")) + list(src.glob("*.json")) + list(src.glob("*.jinja"))
+            dst_files = [dst / f.name for f in src_files]
+
+            with ThreadPoolExecutor(max_workers=8) as ex:
+                list(ex.map(
+                    shutil.copyfile, 
+                    src_files, dst_files
+                ))
+            return str(dst)
+
+        actor_nodes = [
+            node["NodeID"] for node in ray.nodes() 
+            if node.get("Labels", {}).get("actor", "false") == "true"
+        ] 
+        model_path = self.config.actor_rollout_ref.model.path
+        print(f"[FullyAsyncTrainer] loading checkpoint {model_path} into shm")
+
+        futures = [
+            load_into_shmem.options(
+                scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
+                    node_id=actor_node_id,
+                    soft=False,
+                )            
+            ).remote(model_path)
+            for actor_node_id in actor_nodes
+        ]
+        shm_paths = ray.get(futures)
+        print(shm_paths)
+        assert all([path == shm_paths[0] and path != None for path in shm_paths])
+
+        # success, change the path so that megatron will load from shmem
+        self.config.actor_rollout_ref.model.path = shm_paths[0]
+        print(f"[FullyAsyncTrainer] shm staging success! Will load from {shm_paths[0]}")
+
+
+    def _cleanup_checkpoint_from_shmem(self):
+        if (not self.config.actor_rollout_ref.model.use_model_shm
+            or self.config.actor_rollout_ref.actor.megatron.use_dist_checkpointing
+            or self.config.model_engine != "megatron"):
+            return
+
+        @ray.remote(num_cpus=8, label_selector={"actor": "true"})
+        def clean_from_shmem():
+            import shutil
+            from pathlib import Path
+        
+            dst = Path(f"/dev/shm/{os.environ['USER']}/model")
+            if not os.path.exists(dst):
+                print(f"{dst} path for checkpoint staging does not exist?")
+                return
+            shutil.rmtree(dst)
+
+        actor_nodes = [
+            node["NodeID"] for node in ray.nodes() 
+            if node.get("Labels", {}).get("actor", "false") == "true"
+        ] 
+
+        futures = [
+            clean_from_shmem.options(
+                scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
+                    node_id=actor_node_id,
+                    soft=False,
+                )            
+            ).remote()
+            for actor_node_id in actor_nodes
+        ]
+        ray.get(futures)
+
 
     def _check_checkpoint(self):
         if (self.use_critic):

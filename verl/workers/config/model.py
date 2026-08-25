@@ -109,6 +109,7 @@ class HFModelConfig(BaseConfig):
     # whether to use shared memory
     use_shm: bool = False
     trust_remote_code: bool = False
+    use_model_shm: bool = False
 
     # custom chat template for the model
     custom_chat_template: Optional[str] = None

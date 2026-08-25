@@ -577,7 +577,6 @@ class MegatronEngine(BaseEngine):
         self.checkpoint_mananager.save_checkpoint(
             local_path=local_path, hdfs_path=hdfs_path, global_step=global_step, max_ckpt_to_keep=max_ckpt_to_keep
         )
-        torch.distributed.barrier()
         if self._is_offload_param:
             offload_megatron_model_to_cpu(self.module)
 
